@@ -46,6 +46,11 @@ func registerRoutes(_ router: Router<BasicRequestContext>, store: SessionStore, 
         return jsonResponse(["ok": true])
     }
 
+    router.post("sessions/:id/clear") { _, context in
+        await store.clear(context.parameters.get("id") ?? "")
+        return jsonResponse(["ok": true])
+    }
+
     router.post("sessions/:id/message") { request, context in
         let id = context.parameters.get("id") ?? ""
         guard let body = try? await decodeBody(SendRequest.self, request) else {

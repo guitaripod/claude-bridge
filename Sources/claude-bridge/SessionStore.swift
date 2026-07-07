@@ -70,6 +70,16 @@ actor SessionStore {
         persist()
     }
 
+    /// Resets a session to a fresh Claude conversation (drops history and the resumable id).
+    func clear(_ id: String) {
+        guard var session = sessions[id] else { return }
+        session.messages = []
+        session.claudeSessionID = nil
+        session.updatedAt = Date()
+        sessions[id] = session
+        persist()
+    }
+
     func broadcaster(for id: String) -> Broadcaster {
         if let existing = broadcasters[id] { return existing }
         let created = Broadcaster()

@@ -44,6 +44,9 @@ struct ClaudeRunner: Sendable {
         process.standardError = Pipe()
 
         emit(.status("running"))
+        emit(
+            .messageUpserted(
+                Message(id: messageID, role: .assistant, parts: [.text("")], createdAt: Date())))
 
         var assembler = Assembler(messageID: messageID)
         let lines = Self.lineStream(from: stdout.fileHandleForReading)
