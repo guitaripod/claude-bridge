@@ -69,6 +69,7 @@ struct Session: Codable, Sendable {
     var messages: [Message]
     var lastCostUSD: Double?
     var lastTokens: Int?
+    var pendingFork: Bool?
 
     var summary: SessionSummary {
         SessionSummary(

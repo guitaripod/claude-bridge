@@ -56,7 +56,29 @@ actor SessionStore {
             claudeSessionID: nil,
             model: request.model ?? defaultModel,
             effort: request.effort ?? defaultEffort,
-            createdAt: now, updatedAt: now, messages: [], lastCostUSD: nil, lastTokens: nil)
+            createdAt: now, updatedAt: now, messages: [], lastCostUSD: nil, lastTokens: nil,
+            pendingFork: nil)
+        sessions[session.id] = session
+        order.insert(session.id, at: 0)
+        persist()
+        return session
+    }
+
+    /// Branches a session: a new session seeded with the source's history and resumable id, flagged
+    /// to run its first turn with `--fork-session` so Claude diverges instead of mutating the parent.
+    func fork(_ id: String) -> Session? {
+        guard let source = sessions[id] else { return nil }
+        let now = Date()
+        let session = Session(
+            id: UUID().uuidString,
+            title: "Fork of \(source.title)",
+            claudeSessionID: source.claudeSessionID,
+            model: source.model,
+            effort: source.effort,
+            createdAt: now, updatedAt: now,
+            messages: source.messages,
+            lastCostUSD: source.lastCostUSD, lastTokens: source.lastTokens,
+            pendingFork: source.claudeSessionID != nil ? true : nil)
         sessions[session.id] = session
         order.insert(session.id, at: 0)
         persist()
@@ -109,10 +131,11 @@ actor SessionStore {
         let model = session.model
         let effort = session.effort
         let text = request.text
+        let fork = session.pendingFork == true
 
         Task {
             let outcome = await runner.run(
-                prompt: text, resume: resume, model: model, effort: effort,
+                prompt: text, resume: resume, model: model, effort: effort, fork: fork,
                 emit: { caster.send($0) })
             await self.finishTurn(id, outcome: outcome)
         }
@@ -122,6 +145,7 @@ actor SessionStore {
         guard var session = sessions[id] else { return }
         session.messages.append(outcome.message)
         session.claudeSessionID = outcome.claudeSessionID
+        session.pendingFork = nil
         if let cost = outcome.costUSD { session.lastCostUSD = cost }
         if let tokens = outcome.tokens { session.lastTokens = tokens }
         session.updatedAt = Date()

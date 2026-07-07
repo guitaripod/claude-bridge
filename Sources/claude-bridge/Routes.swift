@@ -51,6 +51,13 @@ func registerRoutes(_ router: Router<BasicRequestContext>, store: SessionStore, 
         return jsonResponse(["ok": true])
     }
 
+    router.post("sessions/:id/fork") { _, context in
+        guard let session = await store.fork(context.parameters.get("id") ?? "") else {
+            return jsonResponse(["error": "not found"], status: .notFound)
+        }
+        return jsonResponse(session)
+    }
+
     router.post("sessions/:id/message") { request, context in
         let id = context.parameters.get("id") ?? ""
         guard let body = try? await decodeBody(SendRequest.self, request) else {

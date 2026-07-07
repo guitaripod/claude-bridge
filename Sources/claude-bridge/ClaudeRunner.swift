@@ -19,6 +19,7 @@ struct ClaudeRunner: Sendable {
         resume claudeSessionID: String?,
         model: String,
         effort: String,
+        fork: Bool = false,
         emit: @Sendable @escaping (BridgeEvent) -> Void
     ) async -> Outcome {
         let messageID = UUID().uuidString
@@ -35,7 +36,10 @@ struct ClaudeRunner: Sendable {
         if permissionMode == "bypassPermissions" {
             arguments.append("--dangerously-skip-permissions")
         }
-        if let claudeSessionID { arguments += ["--resume", claudeSessionID] }
+        if let claudeSessionID {
+            arguments += ["--resume", claudeSessionID]
+            if fork { arguments.append("--fork-session") }
+        }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: claudePath)
