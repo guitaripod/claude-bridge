@@ -13,12 +13,13 @@ let claudePath = env("BRIDGE_CLAUDE", "\(home)/.local/bin/claude")
 let defaultModel = env("BRIDGE_MODEL", "sonnet")
 let defaultEffort = env("BRIDGE_EFFORT", "medium")
 let storeURL = URL(fileURLWithPath: env("BRIDGE_STORE", "\(home)/.claude-bridge/sessions.json"))
+let permissionMode = env("BRIDGE_PERMISSION", "bypassPermissions")
 
 try? FileManager.default.createDirectory(
     at: URL(fileURLWithPath: workdir), withIntermediateDirectories: true)
 
 let store = SessionStore(
-    runner: ClaudeRunner(claudePath: claudePath, workdir: workdir),
+    runner: ClaudeRunner(claudePath: claudePath, workdir: workdir, permissionMode: permissionMode),
     defaultModel: defaultModel, defaultEffort: defaultEffort, storeURL: storeURL)
 
 let router = Router()

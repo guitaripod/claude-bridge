@@ -5,6 +5,7 @@ import Foundation
 struct ClaudeRunner: Sendable {
     let claudePath: String
     let workdir: String
+    let permissionMode: String
 
     struct Outcome: Sendable {
         var message: Message
@@ -26,9 +27,12 @@ struct ClaudeRunner: Sendable {
             "--verbose",
             "--model", model,
             "--effort", effort,
-            "--permission-mode", "acceptEdits",
+            "--permission-mode", permissionMode,
             "--add-dir", workdir,
         ]
+        if permissionMode == "bypassPermissions" {
+            arguments.append("--dangerously-skip-permissions")
+        }
         if let claudeSessionID { arguments += ["--resume", claudeSessionID] }
 
         let process = Process()
@@ -41,7 +45,7 @@ struct ClaudeRunner: Sendable {
 
         let stdout = Pipe()
         process.standardOutput = stdout
-        process.standardError = Pipe()
+        process.standardError = FileHandle.nullDevice
 
         emit(.status("running"))
         emit(
