@@ -103,6 +103,7 @@ private struct Assembler {
     let messageID: String
     var sessionID: String?
     private var text = ""
+    private var thinking = ""
     private var tools: [String: ToolCall] = [:]
     private var toolOrder: [String] = []
     private var currentBlock: (index: Int, toolID: String?)?
@@ -146,6 +147,8 @@ private struct Assembler {
             if let chunk = delta["text"] as? String {
                 text += chunk
                 emit(.partTextDelta(messageID: messageID, delta: chunk))
+            } else if let chunk = delta["thinking"] as? String {
+                thinking += chunk
             } else if let partial = delta["partial_json"] as? String,
                 let toolID = currentBlock?.toolID
             {
@@ -175,10 +178,11 @@ private struct Assembler {
 
     func finalMessage() -> Message {
         var parts: [Part] = []
-        if !text.isEmpty { parts.append(.text(text)) }
+        if !thinking.isEmpty { parts.append(.reasoning(thinking)) }
         for id in toolOrder {
             if let call = tools[id] { parts.append(.tool(call)) }
         }
+        if !text.isEmpty { parts.append(.text(text)) }
         if parts.isEmpty { parts.append(.text("")) }
         return Message(id: messageID, role: .assistant, parts: parts, createdAt: Date())
     }

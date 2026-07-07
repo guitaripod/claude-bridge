@@ -21,6 +21,7 @@ struct ToolCall: Codable, Sendable {
 
 enum Part: Codable, Sendable {
     case text(String)
+    case reasoning(String)
     case tool(ToolCall)
 
     private enum CodingKeys: String, CodingKey { case kind, text, tool }
@@ -30,6 +31,9 @@ enum Part: Codable, Sendable {
         switch self {
         case .text(let value):
             try c.encode("text", forKey: .kind)
+            try c.encode(value, forKey: .text)
+        case .reasoning(let value):
+            try c.encode("reasoning", forKey: .kind)
             try c.encode(value, forKey: .text)
         case .tool(let call):
             try c.encode("tool", forKey: .kind)
@@ -41,6 +45,7 @@ enum Part: Codable, Sendable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         switch try c.decode(String.self, forKey: .kind) {
         case "tool": self = .tool(try c.decode(ToolCall.self, forKey: .tool))
+        case "reasoning": self = .reasoning(try c.decode(String.self, forKey: .text))
         default: self = .text(try c.decode(String.self, forKey: .text))
         }
     }
