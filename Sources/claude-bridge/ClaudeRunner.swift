@@ -10,6 +10,8 @@ struct ClaudeRunner: Sendable {
     struct Outcome: Sendable {
         var message: Message
         var claudeSessionID: String?
+        var costUSD: Double?
+        var tokens: Int?
     }
 
     func run(
@@ -76,7 +78,9 @@ struct ClaudeRunner: Sendable {
         let message = assembler.finalMessage()
         emit(.messageUpserted(message))
         emit(.status("idle"))
-        return Outcome(message: message, claudeSessionID: assembler.sessionID ?? claudeSessionID)
+        return Outcome(
+            message: message, claudeSessionID: assembler.sessionID ?? claudeSessionID,
+            costUSD: assembler.costUSD, tokens: assembler.tokens)
     }
 
     /// Reads a file handle on a background thread, yielding complete newline-delimited lines.
@@ -106,6 +110,8 @@ struct ClaudeRunner: Sendable {
 private struct Assembler {
     let messageID: String
     var sessionID: String?
+    var costUSD: Double?
+    var tokens: Int?
     private var text = ""
     private var thinking = ""
     private var tools: [String: ToolCall] = [:]
@@ -124,6 +130,13 @@ private struct Assembler {
             ingestStreamEvent(object["event"] as? [String: Any] ?? [:], emit: emit)
         case "user":
             ingestToolResults(from: object, emit: emit)
+        case "result":
+            if let cost = object["total_cost_usd"] as? Double { costUSD = cost }
+            if let usage = object["usage"] as? [String: Any] {
+                let input = usage["input_tokens"] as? Int ?? 0
+                let output = usage["output_tokens"] as? Int ?? 0
+                tokens = input + output
+            }
         default:
             break
         }

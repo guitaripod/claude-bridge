@@ -67,6 +67,8 @@ struct Session: Codable, Sendable {
     var createdAt: Date
     var updatedAt: Date
     var messages: [Message]
+    var lastCostUSD: Double?
+    var lastTokens: Int?
 
     var summary: SessionSummary {
         SessionSummary(

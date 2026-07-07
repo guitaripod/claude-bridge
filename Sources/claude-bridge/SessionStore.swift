@@ -56,7 +56,7 @@ actor SessionStore {
             claudeSessionID: nil,
             model: request.model ?? defaultModel,
             effort: request.effort ?? defaultEffort,
-            createdAt: now, updatedAt: now, messages: [])
+            createdAt: now, updatedAt: now, messages: [], lastCostUSD: nil, lastTokens: nil)
         sessions[session.id] = session
         order.insert(session.id, at: 0)
         persist()
@@ -122,6 +122,8 @@ actor SessionStore {
         guard var session = sessions[id] else { return }
         session.messages.append(outcome.message)
         session.claudeSessionID = outcome.claudeSessionID
+        if let cost = outcome.costUSD { session.lastCostUSD = cost }
+        if let tokens = outcome.tokens { session.lastTokens = tokens }
         session.updatedAt = Date()
         sessions[id] = session
         moveToFront(id)
