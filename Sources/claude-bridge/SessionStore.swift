@@ -197,8 +197,47 @@ actor SessionStore {
                 prompt: text, resume: resume, model: model, effort: effort, fork: fork,
                 directory: directory,
                 onStart: { pid in Task { await self.registerTurnProcess(id, pid: pid) } },
-                emit: { caster.send($0) })
+                emit: { event in
+                    caster.send(event)
+                    Task { await self.mirrorLiveTurn(id, event) }
+                })
             await self.finishTurn(id, outcome: outcome, turnClaudeID: turnClaudeID)
+        }
+    }
+
+    /// Partial assistant message of the in-flight turn, under the same message
+    /// id the event stream uses — so a client that fetches mid-turn sees the
+    /// turn so far and subsequent deltas still land on it.
+    private var liveTurns: [String: Message] = [:]
+
+    func liveTurnMessage(_ id: String) -> Message? { liveTurns[id] }
+
+    private func mirrorLiveTurn(_ id: String, _ event: BridgeEvent) {
+        switch event {
+        case .messageUpserted(let message) where message.role == .assistant:
+            liveTurns[id] = message
+        case .partTextDelta(let messageID, let delta):
+            guard var message = liveTurns[id], message.id == messageID else { return }
+            if case .text(let existing) = message.parts.last {
+                message.parts[message.parts.count - 1] = .text(existing + delta)
+            } else {
+                message.parts.append(.text(delta))
+            }
+            liveTurns[id] = message
+        case .toolUpserted(let messageID, let tool):
+            guard var message = liveTurns[id], message.id == messageID else { return }
+            let index = message.parts.firstIndex { part in
+                if case .tool(let call) = part { return call.id == tool.id }
+                return false
+            }
+            if let index {
+                message.parts[index] = .tool(tool)
+            } else {
+                message.parts.append(.tool(tool))
+            }
+            liveTurns[id] = message
+        default:
+            break
         }
     }
 
@@ -233,6 +272,7 @@ actor SessionStore {
 
     private func finishTurn(_ id: String, outcome: ClaudeRunner.Outcome, turnClaudeID: String) {
         turnProcessIDs[id] = nil
+        liveTurns[id] = nil
         runnerTurnClaudeIDs.remove(turnClaudeID)
         lastRunnerFinish[turnClaudeID] = Date()
         if let newID = outcome.claudeSessionID { lastRunnerFinish[newID] = Date() }

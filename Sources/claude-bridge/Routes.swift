@@ -49,7 +49,9 @@ func registerRoutes(
     router.get("sessions/:id") { _, context in
         let id = context.parameters.get("id") ?? ""
         if var session = await store.get(id) {
-            if let claudeID = session.claudeSessionID,
+            if let partial = await store.liveTurnMessage(id) {
+                session.messages.append(partial)
+            } else if let claudeID = session.claudeSessionID,
                 await !store.hasRunnerTurnInFlight(claudeSessionID: claudeID),
                 let transcriptDate = await index.updatedAt(for: claudeID),
                 transcriptDate > session.updatedAt.addingTimeInterval(2),
