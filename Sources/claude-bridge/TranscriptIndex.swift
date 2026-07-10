@@ -19,6 +19,7 @@ actor TranscriptIndex {
         var size: Int
         var entry: Entry?
         var contentDate: Date?
+        var turnClosed = false
     }
 
     private let root: URL
@@ -36,10 +37,13 @@ actor TranscriptIndex {
     func list(excluding claimed: Set<String>, hidden: Set<String>) -> [SessionSummary] {
         scan()
         return cache.values
-            .compactMap(\.entry)
-            .filter { !claimed.contains($0.id) && !hidden.contains($0.id) }
+            .compactMap { slot -> SessionSummary? in
+                guard let entry = slot.entry, !claimed.contains(entry.id),
+                    !hidden.contains(entry.id)
+                else { return nil }
+                return summary(for: entry, turnClosed: slot.turnClosed)
+            }
             .sorted { $0.updatedAt > $1.updatedAt }
-            .map(summary(for:))
     }
 
     func contains(_ id: String) -> Bool {
@@ -72,7 +76,8 @@ actor TranscriptIndex {
         for (path, slot) in cache {
             guard let entry = slot.entry else { continue }
             let lastContent = slot.contentDate ?? slot.mtime
-            if lastContent > threshold || isSidecarActive(transcriptPath: path, after: threshold) {
+            let turnOpen = !slot.turnClosed && lastContent > threshold
+            if turnOpen || isSidecarActive(transcriptPath: path, after: threshold) {
                 ids.insert(entry.id)
             }
         }
@@ -256,10 +261,10 @@ actor TranscriptIndex {
 
     static let activityWindow: TimeInterval = 180
 
-    private func summary(for entry: Entry) -> SessionSummary {
+    private func summary(for entry: Entry, turnClosed: Bool) -> SessionSummary {
         let threshold = Date().addingTimeInterval(-Self.activityWindow)
         let active =
-            entry.updatedAt > threshold
+            (!turnClosed && entry.updatedAt > threshold)
             || isSidecarActive(transcriptPath: entry.path, after: threshold)
         return SessionSummary(
             id: entry.id,
@@ -314,7 +319,8 @@ actor TranscriptIndex {
         let contentDate = TranscriptParser.lastContentDate(atPath: file.path)
         let entry = TranscriptParser.entry(at: file, id: id, updatedAt: contentDate ?? mtime)
         cache[file.path] = CacheSlot(
-            mtime: mtime, size: size, entry: entry, contentDate: contentDate)
+            mtime: mtime, size: size, entry: entry, contentDate: contentDate,
+            turnClosed: TranscriptParser.isTurnClosed(atPath: file.path))
         if entry != nil { pathByID[id] = file.path }
     }
 }
@@ -395,6 +401,37 @@ enum TranscriptParser {
             return String(trimmed.prefix(80))
         }
         return nil
+    }
+
+    /// Whether the transcript's last meaningful line closes the turn: the CLI
+    /// writes a `system`/`turn_duration` marker when a turn completes, and an
+    /// interruption leaves a "[Request interrupted…" user line. Absence of
+    /// both means a turn is (or may still be) in flight.
+    static func isTurnClosed(atPath path: String) -> Bool {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return false }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
+        let window = min(size, 64 * 1024)
+        try? handle.seek(toOffset: UInt64(size - window))
+        guard let data = try? handle.read(upToCount: window) else { return false }
+        for line in jsonLines(in: data, dropIncompleteTail: false).reversed() {
+            switch line["type"] as? String {
+            case "system":
+                if line["subtype"] as? String == "turn_duration" { return true }
+            case "user":
+                if let content = (line["message"] as? [String: Any])?["content"] as? String,
+                    content.hasPrefix("[Request interrupted")
+                {
+                    return true
+                }
+                return false
+            case "assistant":
+                return false
+            default:
+                continue
+            }
+        }
+        return false
     }
 
     /// Tool-use ids that already have a result recorded in the transcript —

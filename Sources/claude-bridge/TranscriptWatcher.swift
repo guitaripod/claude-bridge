@@ -97,7 +97,10 @@ actor TranscriptWatcher {
             for message in fold.snapshot where changed.contains(message.id) {
                 caster.send(.messageUpserted(message))
             }
-            if !emittedRunning {
+            if TranscriptParser.isTurnClosed(atPath: path) {
+                caster.send(.status("idle"))
+                emittedRunning = false
+            } else if !emittedRunning {
                 caster.send(.status("running"))
                 emittedRunning = true
             }
