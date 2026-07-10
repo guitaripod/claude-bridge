@@ -62,6 +62,15 @@ actor TranscriptWatcher {
                 continue
             }
             guard size > offset else {
+                if let sidecar = TranscriptParser.sidecarActivity(transcriptPath: path),
+                    sidecar > lastGrowth
+                {
+                    lastGrowth = sidecar
+                    if !emittedRunning {
+                        caster.send(.status("running"))
+                        emittedRunning = true
+                    }
+                }
                 if emittedRunning, Date().timeIntervalSince(lastGrowth) > Self.idleAfter {
                     caster.send(.status("idle"))
                     emittedRunning = false

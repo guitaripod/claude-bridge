@@ -59,17 +59,29 @@ actor TranscriptIndex {
         return values?.contentModificationDate ?? cache[path]?.mtime
     }
 
-    /// Session ids whose transcript was written to within the window — "someone
-    /// (this bridge or an interactive CLI) is working in this session right now".
+    /// Session ids whose transcript (or subagent sidecar files) were written to
+    /// within the window — "someone (this bridge or an interactive CLI) is
+    /// working in this session right now". Subagent activity matters: while a
+    /// session fans work out to agents, its main transcript can stay quiet for
+    /// minutes even though it is very much live.
     func activeIDs(within seconds: TimeInterval) -> Set<String> {
         scan()
         let threshold = Date().addingTimeInterval(-seconds)
         var ids = Set<String>()
-        for slot in cache.values {
-            guard let entry = slot.entry, slot.mtime > threshold else { continue }
-            ids.insert(entry.id)
+        for (path, slot) in cache {
+            guard let entry = slot.entry else { continue }
+            if slot.mtime > threshold || isSidecarActive(transcriptPath: path, after: threshold) {
+                ids.insert(entry.id)
+            }
         }
         return ids
+    }
+
+    private func isSidecarActive(transcriptPath: String, after threshold: Date) -> Bool {
+        guard let latest = TranscriptParser.sidecarActivity(transcriptPath: transcriptPath) else {
+            return false
+        }
+        return latest > threshold
     }
 
     /// Fully parses the transcript into a `Session` suitable for display or adoption.
@@ -97,7 +109,11 @@ actor TranscriptIndex {
     static let activityWindow: TimeInterval = 180
 
     private func summary(for entry: Entry) -> SessionSummary {
-        SessionSummary(
+        let threshold = Date().addingTimeInterval(-Self.activityWindow)
+        let active =
+            entry.updatedAt > threshold
+            || isSidecarActive(transcriptPath: entry.path, after: threshold)
+        return SessionSummary(
             id: entry.id,
             title: entry.title,
             directory: entry.directory,
@@ -105,7 +121,7 @@ actor TranscriptIndex {
             effort: defaultEffort,
             createdAt: entry.createdAt,
             updatedAt: entry.updatedAt,
-            active: entry.updatedAt > Date().addingTimeInterval(-Self.activityWindow))
+            active: active)
     }
 
     private func scan() {
@@ -192,6 +208,26 @@ enum TranscriptParser {
         return TranscriptIndex.Entry(
             id: id, title: heading, directory: directory, model: model,
             createdAt: createdAt ?? updatedAt, updatedAt: updatedAt, path: file.path)
+    }
+
+    /// Latest write across the session's subagent sidecar transcripts
+    /// (`<projectDir>/<sessionID>/subagents/*.jsonl`), if any exist.
+    static func sidecarActivity(transcriptPath: String) -> Date? {
+        let dir = URL(fileURLWithPath: transcriptPath)
+            .deletingPathExtension()
+            .appendingPathComponent("subagents")
+        guard
+            let files = try? FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
+                options: .skipsHiddenFiles)
+        else { return nil }
+        return files
+            .filter { $0.pathExtension == "jsonl" }
+            .compactMap {
+                (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate
+            }
+            .max()
     }
 
     /// Full parse: folds transcript lines into the bridge's message model.
