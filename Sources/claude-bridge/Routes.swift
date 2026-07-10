@@ -65,6 +65,20 @@ func registerRoutes(
         return jsonResponse(["error": "not found"], status: .notFound)
     }
 
+    router.patch("sessions/:id") { request, context in
+        let id = context.parameters.get("id") ?? ""
+        guard let body = try? await decodeBody(RenameRequest.self, request),
+            !body.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return jsonResponse(["error": "bad request"], status: .badRequest)
+        }
+        await adoptIfNeeded(id)
+        guard await store.rename(id, title: body.title) else {
+            return jsonResponse(["error": "not found"], status: .notFound)
+        }
+        return jsonResponse(["ok": true])
+    }
+
     router.delete("sessions/:id") { _, context in
         let id = context.parameters.get("id") ?? ""
         await store.delete(id)

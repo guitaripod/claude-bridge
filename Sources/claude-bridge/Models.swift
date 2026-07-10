@@ -90,6 +90,10 @@ struct SessionSummary: Codable, Sendable {
     var active: Bool?
 }
 
+struct RenameRequest: Codable, Sendable {
+    var title: String
+}
+
 struct SendRequest: Codable, Sendable {
     var text: String
     var model: String?

@@ -126,6 +126,14 @@ actor SessionStore {
         return session
     }
 
+    func rename(_ id: String, title: String) -> Bool {
+        guard var session = sessions[id] else { return false }
+        session.title = title
+        sessions[id] = session
+        persist()
+        return true
+    }
+
     func delete(_ id: String) {
         sessions[id] = nil
         order.removeAll { $0 == id }

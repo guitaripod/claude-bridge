@@ -62,7 +62,8 @@ actor TranscriptWatcher {
                 continue
             }
             guard size > offset else {
-                if let sidecar = TranscriptParser.sidecarActivity(transcriptPath: path),
+                if Date() > suppressedUntil,
+                    let sidecar = TranscriptParser.sidecarActivity(transcriptPath: path),
                     sidecar > lastGrowth
                 {
                     lastGrowth = sidecar
