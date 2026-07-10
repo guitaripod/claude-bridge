@@ -77,6 +77,61 @@ actor TranscriptIndex {
         return ids
     }
 
+    /// Subagent sidecars for a session: one summary per
+    /// `<sessionID>/subagents/agent-*.jsonl`, described by the sibling
+    /// `.meta.json` the CLI writes alongside.
+    func subagents(for id: String) -> [SubagentSummary] {
+        guard let transcriptPath = path(for: id) else { return [] }
+        let dir = URL(fileURLWithPath: transcriptPath)
+            .deletingPathExtension()
+            .appendingPathComponent("subagents")
+        guard
+            let files = try? FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
+                options: .skipsHiddenFiles)
+        else { return [] }
+        let threshold = Date().addingTimeInterval(-Self.activityWindow)
+        return files
+            .filter { $0.pathExtension == "jsonl" }
+            .compactMap { file -> SubagentSummary? in
+                let name = file.deletingPathExtension().lastPathComponent
+                guard name.hasPrefix("agent-") else { return nil }
+                let mtime =
+                    (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate ?? .distantPast
+                var title = "Agent"
+                var agentType: String?
+                var toolUseID: String?
+                let metaURL = dir.appendingPathComponent("\(name).meta.json")
+                if let data = try? Data(contentsOf: metaURL),
+                    let meta = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                {
+                    if let description = meta["description"] as? String, !description.isEmpty {
+                        title = description
+                    }
+                    agentType = meta["agentType"] as? String
+                    toolUseID = meta["toolUseId"] as? String
+                }
+                return SubagentSummary(
+                    id: String(name.dropFirst("agent-".count)),
+                    title: title, agentType: agentType, toolUseID: toolUseID,
+                    updatedAt: mtime, active: mtime > threshold)
+            }
+            .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    func subagentMessages(sessionID: String, agentID: String) -> [Message]? {
+        guard let transcriptPath = path(for: sessionID),
+            agentID.allSatisfy({ $0.isLetter || $0.isNumber })
+        else { return nil }
+        let file = URL(fileURLWithPath: transcriptPath)
+            .deletingPathExtension()
+            .appendingPathComponent("subagents")
+            .appendingPathComponent("agent-\(agentID).jsonl")
+        guard FileManager.default.fileExists(atPath: file.path) else { return nil }
+        return TranscriptParser.messages(at: file, includeSidechain: true)
+    }
+
     /// Latest transcript mtime per session id, for freshening stored sessions
     /// whose conversation has since continued elsewhere.
     func transcriptDates() -> [String: Date] {
@@ -252,9 +307,9 @@ enum TranscriptParser {
     }
 
     /// Full parse: folds transcript lines into the bridge's message model.
-    static func messages(at file: URL) -> [Message] {
+    static func messages(at file: URL, includeSidechain: Bool = false) -> [Message] {
         guard let data = try? Data(contentsOf: file) else { return [] }
-        var fold = TranscriptFold()
+        var fold = TranscriptFold(includeSidechain: includeSidechain)
         _ = fold.consume(data)
         return fold.snapshot
     }

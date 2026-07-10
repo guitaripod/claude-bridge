@@ -126,6 +126,23 @@ func registerRoutes(
         return jsonResponse(["ok": true], status: .accepted)
     }
 
+    router.get("sessions/:id/agents") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        let claudeID = (await store.get(id))?.claudeSessionID ?? id
+        return jsonResponse(await index.subagents(for: claudeID))
+    }
+
+    router.get("sessions/:id/agents/:agentID") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        let agentID = context.parameters.get("agentID") ?? ""
+        let claudeID = (await store.get(id))?.claudeSessionID ?? id
+        guard let messages = await index.subagentMessages(sessionID: claudeID, agentID: agentID)
+        else {
+            return jsonResponse(["error": "not found"], status: .notFound)
+        }
+        return jsonResponse(SubagentTranscript(id: agentID, messages: messages))
+    }
+
     router.get("sessions/:id/events") { _, context in
         let id = context.parameters.get("id") ?? ""
         let caster = await store.broadcaster(for: id)

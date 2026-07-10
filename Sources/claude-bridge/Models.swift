@@ -90,6 +90,20 @@ struct SessionSummary: Codable, Sendable {
     var active: Bool?
 }
 
+struct SubagentSummary: Codable, Sendable {
+    var id: String
+    var title: String
+    var agentType: String?
+    var toolUseID: String?
+    var updatedAt: Date
+    var active: Bool
+}
+
+struct SubagentTranscript: Codable, Sendable {
+    var id: String
+    var messages: [Message]
+}
+
 struct RenameRequest: Codable, Sendable {
     var title: String
 }

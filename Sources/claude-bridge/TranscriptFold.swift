@@ -9,6 +9,11 @@ struct TranscriptFold {
     private var turn: Message?
     private var toolLocation: [String: (messageIndex: Int?, partIndex: Int)] = [:]
     private var pending = Data()
+    private let includeSidechain: Bool
+
+    init(includeSidechain: Bool = false) {
+        self.includeSidechain = includeSidechain
+    }
 
     var snapshot: [Message] {
         var all = messages
@@ -35,7 +40,9 @@ struct TranscriptFold {
     }
 
     private mutating func ingest(_ line: [String: Any], changed: inout Set<String>) {
-        guard TranscriptParser.isRealLine(line), let type = line["type"] as? String,
+        guard line["isMeta"] as? Bool != true,
+            includeSidechain || line["isSidechain"] as? Bool != true,
+            let type = line["type"] as? String,
             let message = line["message"] as? [String: Any]
         else { return }
         let uuid = line["uuid"] as? String ?? UUID().uuidString
