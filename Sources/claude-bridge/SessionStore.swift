@@ -30,12 +30,14 @@ actor SessionStore {
     private let defaultModel: String
     private let defaultEffort: String
     private let storeURL: URL
+    private var hiddenTranscripts: Set<String>
 
     init(runner: ClaudeRunner, defaultModel: String, defaultEffort: String, storeURL: URL) {
         self.runner = runner
         self.defaultModel = defaultModel
         self.defaultEffort = defaultEffort
         self.storeURL = storeURL
+        hiddenTranscripts = Self.loadHidden(from: Self.hiddenURL(for: storeURL))
         for session in Self.loadStored(from: storeURL) {
             sessions[session.id] = session
             order.append(session.id)
@@ -47,6 +49,32 @@ actor SessionStore {
     }
 
     func get(_ id: String) -> Session? { sessions[id] }
+
+    /// Claude session ids already represented by a stored session, plus transcripts the user
+    /// deleted — both are excluded from transcript discovery.
+    func excludedTranscriptIDs() -> (claimed: Set<String>, hidden: Set<String>) {
+        var claimed = Set(sessions.keys)
+        for session in sessions.values {
+            if let claudeID = session.claudeSessionID { claimed.insert(claudeID) }
+        }
+        return (claimed, hiddenTranscripts)
+    }
+
+    /// Materializes a discovered transcript as a stored session so it can be resumed, forked,
+    /// or cleared. The session keeps the Claude session id as its own id, so client-held ids
+    /// stay valid across adoption.
+    func adopt(_ session: Session) -> Session {
+        if let existing = sessions[session.id] { return existing }
+        sessions[session.id] = session
+        order.insert(session.id, at: 0)
+        persist()
+        return session
+    }
+
+    func hideTranscript(_ id: String) {
+        hiddenTranscripts.insert(id)
+        persistHidden()
+    }
 
     func create(_ request: CreateRequest) -> Session {
         let now = Date()
@@ -166,6 +194,25 @@ actor SessionStore {
     private static func deriveTitle(_ text: String) -> String {
         let firstLine = text.split(separator: "\n").first.map(String.init) ?? text
         return String(firstLine.prefix(60))
+    }
+
+    private static func hiddenURL(for storeURL: URL) -> URL {
+        storeURL.deletingLastPathComponent().appendingPathComponent("hidden.json")
+    }
+
+    private static func loadHidden(from url: URL) -> Set<String> {
+        guard let data = try? Data(contentsOf: url),
+            let ids = try? JSONCoding.decoder.decode([String].self, from: data)
+        else { return [] }
+        return Set(ids)
+    }
+
+    private func persistHidden() {
+        let url = Self.hiddenURL(for: storeURL)
+        guard let data = try? JSONCoding.encoder.encode(hiddenTranscripts.sorted()) else { return }
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: url, options: .atomic)
     }
 
     private static func loadStored(from url: URL) -> [Session] {

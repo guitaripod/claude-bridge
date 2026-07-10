@@ -17,7 +17,15 @@ private func decodeBody<T: Decodable>(_ type: T.Type, _ request: Request) async 
     return try JSONCoding.decoder.decode(T.self, from: Data(buffer.readableBytesView))
 }
 
-func registerRoutes(_ router: Router<BasicRequestContext>, store: SessionStore, agentModel: String) {
+func registerRoutes(
+    _ router: Router<BasicRequestContext>, store: SessionStore, index: TranscriptIndex,
+    agentModel: String
+) {
+    @Sendable func adoptIfNeeded(_ id: String) async {
+        guard await store.get(id) == nil, let discovered = await index.session(id) else { return }
+        _ = await store.adopt(discovered)
+    }
+
     router.get("health") { _, _ in "ok" }
 
     router.get("status") { _, _ in
@@ -25,7 +33,10 @@ func registerRoutes(_ router: Router<BasicRequestContext>, store: SessionStore, 
     }
 
     router.get("sessions") { _, _ in
-        jsonResponse(await store.list())
+        let stored = await store.list()
+        let (claimed, hidden) = await store.excludedTranscriptIDs()
+        let discovered = await index.list(excluding: claimed, hidden: hidden)
+        return jsonResponse((stored + discovered).sorted { $0.updatedAt > $1.updatedAt })
     }
 
     router.post("sessions") { request, _ in
@@ -35,24 +46,35 @@ func registerRoutes(_ router: Router<BasicRequestContext>, store: SessionStore, 
 
     router.get("sessions/:id") { _, context in
         let id = context.parameters.get("id") ?? ""
-        guard let session = await store.get(id) else {
-            return jsonResponse(["error": "not found"], status: .notFound)
+        if let session = await store.get(id) {
+            return jsonResponse(session)
         }
-        return jsonResponse(session)
+        if let discovered = await index.session(id) {
+            return jsonResponse(discovered)
+        }
+        return jsonResponse(["error": "not found"], status: .notFound)
     }
 
     router.delete("sessions/:id") { _, context in
-        await store.delete(context.parameters.get("id") ?? "")
+        let id = context.parameters.get("id") ?? ""
+        await store.delete(id)
+        if await index.contains(id) {
+            await store.hideTranscript(id)
+        }
         return jsonResponse(["ok": true])
     }
 
     router.post("sessions/:id/clear") { _, context in
-        await store.clear(context.parameters.get("id") ?? "")
+        let id = context.parameters.get("id") ?? ""
+        await adoptIfNeeded(id)
+        await store.clear(id)
         return jsonResponse(["ok": true])
     }
 
     router.post("sessions/:id/fork") { _, context in
-        guard let session = await store.fork(context.parameters.get("id") ?? "") else {
+        let id = context.parameters.get("id") ?? ""
+        await adoptIfNeeded(id)
+        guard let session = await store.fork(id) else {
             return jsonResponse(["error": "not found"], status: .notFound)
         }
         return jsonResponse(session)
@@ -63,6 +85,7 @@ func registerRoutes(_ router: Router<BasicRequestContext>, store: SessionStore, 
         guard let body = try? await decodeBody(SendRequest.self, request) else {
             return jsonResponse(["error": "bad request"], status: .badRequest)
         }
+        await adoptIfNeeded(id)
         await store.send(id, request: body)
         return jsonResponse(["ok": true], status: .accepted)
     }

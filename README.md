@@ -67,6 +67,18 @@ lastCostUSD?, lastTokens?}`. `Message`: `{id, role: "user"|"assistant", parts, c
 `ToolCall`: `{id, name, input, output?, status: "running"|"completed"|"error"}`.
 Dates are ISO 8601. Sessions persist to `BRIDGE_STORE` across restarts.
 
+## Transcript discovery
+
+The bridge also surfaces every local Claude Code CLI session as a first-class bridge session —
+the CLI's transcripts under `~/.claude/projects` (override with `BRIDGE_PROJECTS`) are the
+single source of truth. `GET /sessions` merges them into the list (newest first),
+`GET /sessions/:id` parses the transcript into the message model above, and the first write
+(`message`, `fork`, `clear`) adopts the transcript into the store and resumes the underlying
+Claude session — a chat started in the terminal continues seamlessly from any client, in the
+project directory it was started in. `DELETE` on a discovered session hides it from the list
+(persisted next to `BRIDGE_STORE`) without touching the transcript on disk. Discovery is
+incremental: files are re-parsed only when their mtime/size changes.
+
 ## SSE events
 
 Each event is one `data: <json>\n\n` frame:
@@ -94,6 +106,7 @@ Everything is environment variables. Empty values fall back to the default.
 | `BRIDGE_MODEL` | `sonnet` | Default model for new sessions (overridable per session and per message) |
 | `BRIDGE_EFFORT` | `medium` | Default reasoning effort (overridable per session and per message) |
 | `BRIDGE_STORE` | `~/.claude-bridge/sessions.json` | Session persistence file |
+| `BRIDGE_PROJECTS` | `~/.claude/projects` | Claude Code CLI transcript root scanned for discoverable sessions |
 
 ## Security
 

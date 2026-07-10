@@ -38,6 +38,7 @@ let defaultModel = env("BRIDGE_MODEL", "sonnet")
 let defaultEffort = env("BRIDGE_EFFORT", "medium")
 let storeURL = URL(fileURLWithPath: env("BRIDGE_STORE", "\(home)/.claude-bridge/sessions.json"))
 let permissionMode = env("BRIDGE_PERMISSION", "bypassPermissions")
+let projectsDir = env("BRIDGE_PROJECTS", "\(home)/.claude/projects")
 
 enforceFailClosedStartup(password: password, permissionMode: permissionMode)
 
@@ -52,7 +53,10 @@ let router = Router()
 if !password.isEmpty {
     router.middlewares.add(BasicAuthMiddleware(username: "claude", password: password))
 }
-registerRoutes(router, store: store, agentModel: defaultModel)
+let index = TranscriptIndex(
+    root: URL(fileURLWithPath: projectsDir), defaultModel: defaultModel,
+    defaultEffort: defaultEffort)
+registerRoutes(router, store: store, index: index, agentModel: defaultModel)
 
 let app = Application(
     router: router,
