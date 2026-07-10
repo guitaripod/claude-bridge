@@ -122,9 +122,28 @@ actor TranscriptIndex {
         return ids
     }
 
+    /// Agent ids a workflow run's journal records a result for — the
+    /// completion signal for workflow agents, which have no spawning Task
+    /// tool call in the parent transcript.
+    private func journalCompletedAgentIDs(in dir: URL) -> Set<String> {
+        let journal = dir.appendingPathComponent("journal.jsonl")
+        guard let data = try? Data(contentsOf: journal) else { return [] }
+        var ids = Set<String>()
+        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
+            guard let object = try? JSONSerialization.jsonObject(with: Data(line.utf8))
+                    as? [String: Any],
+                object["type"] as? String == "result",
+                let agentID = object["agentId"] as? String
+            else { continue }
+            ids.insert(agentID)
+        }
+        return ids
+    }
+
     private func subagents(in dir: URL, threshold: Date, resolved: Set<String>)
         -> [SubagentSummary]
     {
+        let journalCompleted = journalCompletedAgentIDs(in: dir)
         guard
             let files = try? FileManager.default.contentsOfDirectory(
                 at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
@@ -157,9 +176,12 @@ actor TranscriptIndex {
                 {
                     title = prompt
                 }
-                let completed = toolUseID.map(resolved.contains) ?? false
+                let agentID = String(name.dropFirst("agent-".count))
+                let completed =
+                    toolUseID.map(resolved.contains) ?? false
+                    || journalCompleted.contains(agentID)
                 return SubagentSummary(
-                    id: String(name.dropFirst("agent-".count)),
+                    id: agentID,
                     title: title, agentType: agentType, toolUseID: toolUseID,
                     updatedAt: lastContent,
                     active: !completed && lastContent > threshold,
