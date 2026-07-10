@@ -20,8 +20,10 @@ struct ClaudeRunner: Sendable {
         model: String,
         effort: String,
         fork: Bool = false,
+        directory: String? = nil,
         emit: @Sendable @escaping (BridgeEvent) -> Void
     ) async -> Outcome {
+        let cwd = directory ?? workdir
         let messageID = UUID().uuidString
         var arguments = [
             "-p", prompt,
@@ -31,7 +33,7 @@ struct ClaudeRunner: Sendable {
             "--model", model,
             "--effort", effort,
             "--permission-mode", permissionMode,
-            "--add-dir", workdir,
+            "--add-dir", cwd,
         ]
         if permissionMode == "bypassPermissions" {
             arguments.append("--dangerously-skip-permissions")
@@ -44,7 +46,7 @@ struct ClaudeRunner: Sendable {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: claudePath)
         process.arguments = arguments
-        process.currentDirectoryURL = URL(fileURLWithPath: workdir)
+        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
         var environment = ProcessInfo.processInfo.environment
         environment["CLAUDE_CODE_ENTRYPOINT"] = "claude-bridge"
         process.environment = environment

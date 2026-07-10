@@ -53,6 +53,7 @@ actor SessionStore {
         let session = Session(
             id: UUID().uuidString,
             title: request.title ?? "New chat",
+            directory: Self.normalizedDirectory(request.directory),
             claudeSessionID: nil,
             model: request.model ?? defaultModel,
             effort: request.effort ?? defaultEffort,
@@ -72,6 +73,7 @@ actor SessionStore {
         let session = Session(
             id: UUID().uuidString,
             title: "Fork of \(source.title)",
+            directory: source.directory,
             claudeSessionID: source.claudeSessionID,
             model: source.model,
             effort: source.effort,
@@ -132,10 +134,12 @@ actor SessionStore {
         let effort = session.effort
         let text = request.text
         let fork = session.pendingFork == true
+        let directory = session.directory
 
         Task {
             let outcome = await runner.run(
                 prompt: text, resume: resume, model: model, effort: effort, fork: fork,
+                directory: directory,
                 emit: { caster.send($0) })
             await self.finishTurn(id, outcome: outcome)
         }
@@ -169,6 +173,22 @@ actor SessionStore {
             let stored = try? JSONCoding.decoder.decode([Session].self, from: data)
         else { return [] }
         return stored
+    }
+
+    /// Expands `~`, requires an existing absolute path; falls back to the
+    /// global workdir (nil) rather than letting the claude process die on a
+    /// bad cwd.
+    private static func normalizedDirectory(_ raw: String?) -> String? {
+        guard var path = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !path.isEmpty
+        else { return nil }
+        if path.hasPrefix("~") {
+            path = NSString(string: path).expandingTildeInPath
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+            isDirectory.boolValue
+        else { return nil }
+        return path
     }
 
     private func persist() {

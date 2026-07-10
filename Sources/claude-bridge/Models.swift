@@ -61,6 +61,7 @@ struct Message: Codable, Sendable {
 struct Session: Codable, Sendable {
     var id: String
     var title: String
+    var directory: String?
     var claudeSessionID: String?
     var model: String
     var effort: String
@@ -73,7 +74,7 @@ struct Session: Codable, Sendable {
 
     var summary: SessionSummary {
         SessionSummary(
-            id: id, title: title, model: model, effort: effort,
+            id: id, title: title, directory: directory, model: model, effort: effort,
             createdAt: createdAt, updatedAt: updatedAt)
     }
 }
@@ -81,6 +82,7 @@ struct Session: Codable, Sendable {
 struct SessionSummary: Codable, Sendable {
     var id: String
     var title: String
+    var directory: String?
     var model: String
     var effort: String
     var createdAt: Date
@@ -95,6 +97,7 @@ struct SendRequest: Codable, Sendable {
 
 struct CreateRequest: Codable, Sendable {
     var title: String?
+    var directory: String?
     var model: String?
     var effort: String?
 }
