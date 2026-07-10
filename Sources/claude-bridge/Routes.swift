@@ -96,6 +96,19 @@ func registerRoutes(
         return jsonResponse(["ok": true])
     }
 
+    router.post("sessions/:id/abort") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        if await store.abortTurn(id) {
+            return jsonResponse(["ok": true])
+        }
+        return jsonResponse(
+            [
+                "error":
+                    "Nothing to stop from here — this session is running on the server, not from this app."
+            ],
+            status: .conflict)
+    }
+
     router.post("sessions/:id/fork") { _, context in
         let id = context.parameters.get("id") ?? ""
         await adoptIfNeeded(id)

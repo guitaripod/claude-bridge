@@ -97,6 +97,7 @@ struct SubagentSummary: Codable, Sendable {
     var toolUseID: String?
     var updatedAt: Date
     var active: Bool
+    var completed: Bool
 }
 
 struct SubagentTranscript: Codable, Sendable {

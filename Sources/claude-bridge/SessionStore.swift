@@ -196,9 +196,24 @@ actor SessionStore {
             let outcome = await runner.run(
                 prompt: text, resume: resume, model: model, effort: effort, fork: fork,
                 directory: directory,
+                onStart: { pid in Task { await self.registerTurnProcess(id, pid: pid) } },
                 emit: { caster.send($0) })
             await self.finishTurn(id, outcome: outcome, turnClaudeID: turnClaudeID)
         }
+    }
+
+    private var turnProcessIDs: [String: Int32] = [:]
+
+    private func registerTurnProcess(_ id: String, pid: Int32) {
+        turnProcessIDs[id] = pid
+    }
+
+    /// Stops a turn this bridge is running by terminating its claude process;
+    /// the runner's stream ends and the partial turn is persisted normally.
+    func abortTurn(_ id: String) -> Bool {
+        guard let pid = turnProcessIDs[id] else { return false }
+        kill(pid, SIGTERM)
+        return true
     }
 
     func hasRunnerTurnInFlight(claudeSessionID: String) -> Bool {
@@ -217,6 +232,7 @@ actor SessionStore {
     private var lastRunnerFinish: [String: Date] = [:]
 
     private func finishTurn(_ id: String, outcome: ClaudeRunner.Outcome, turnClaudeID: String) {
+        turnProcessIDs[id] = nil
         runnerTurnClaudeIDs.remove(turnClaudeID)
         lastRunnerFinish[turnClaudeID] = Date()
         if let newID = outcome.claudeSessionID { lastRunnerFinish[newID] = Date() }

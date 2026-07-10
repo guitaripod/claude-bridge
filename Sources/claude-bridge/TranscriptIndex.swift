@@ -18,6 +18,7 @@ actor TranscriptIndex {
         var mtime: Date
         var size: Int
         var entry: Entry?
+        var contentDate: Date?
     }
 
     private let root: URL
@@ -70,7 +71,8 @@ actor TranscriptIndex {
         var ids = Set<String>()
         for (path, slot) in cache {
             guard let entry = slot.entry else { continue }
-            if slot.mtime > threshold || isSidecarActive(transcriptPath: path, after: threshold) {
+            let lastContent = slot.contentDate ?? slot.mtime
+            if lastContent > threshold || isSidecarActive(transcriptPath: path, after: threshold) {
                 ids.insert(entry.id)
             }
         }
@@ -99,14 +101,30 @@ actor TranscriptIndex {
     /// sibling `.meta.json` the CLI writes alongside.
     func subagents(for id: String) -> [SubagentSummary] {
         guard let transcriptPath = path(for: id) else { return [] }
-        let threshold = Date().addingTimeInterval(-Self.activityWindow)
+        let threshold = Date().addingTimeInterval(-Self.subagentActivityWindow)
+        let resolved = resolvedTools(transcriptPath: transcriptPath)
         return Self.sidecarDirs(transcriptPath: transcriptPath).flatMap { dir in
-            subagents(in: dir, threshold: threshold)
+            subagents(in: dir, threshold: threshold, resolved: resolved)
         }
         .sorted { $0.updatedAt > $1.updatedAt }
     }
 
-    private func subagents(in dir: URL, threshold: Date) -> [SubagentSummary] {
+    static let subagentActivityWindow: TimeInterval = 90
+
+    private var resolvedCache: [String: (size: Int, ids: Set<String>)] = [:]
+
+    private func resolvedTools(transcriptPath: String) -> Set<String> {
+        let size =
+            (try? FileManager.default.attributesOfItem(atPath: transcriptPath))?[.size] as? Int ?? 0
+        if let cached = resolvedCache[transcriptPath], cached.size == size { return cached.ids }
+        let ids = TranscriptParser.resolvedToolIDs(atPath: transcriptPath)
+        resolvedCache[transcriptPath] = (size, ids)
+        return ids
+    }
+
+    private func subagents(in dir: URL, threshold: Date, resolved: Set<String>)
+        -> [SubagentSummary]
+    {
         guard
             let files = try? FileManager.default.contentsOfDirectory(
                 at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
@@ -117,8 +135,9 @@ actor TranscriptIndex {
             .compactMap { file -> SubagentSummary? in
                 let name = file.deletingPathExtension().lastPathComponent
                 guard name.hasPrefix("agent-") else { return nil }
-                let mtime =
-                    (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?
+                let lastContent =
+                    TranscriptParser.lastContentDate(atPath: file.path)
+                    ?? (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?
                     .contentModificationDate ?? .distantPast
                 var title = "Agent"
                 var agentType: String?
@@ -133,10 +152,18 @@ actor TranscriptIndex {
                     agentType = meta["agentType"] as? String
                     toolUseID = meta["toolUseId"] as? String
                 }
+                if title == "Agent",
+                    let prompt = TranscriptParser.firstUserPromptLine(atPath: file.path)
+                {
+                    title = prompt
+                }
+                let completed = toolUseID.map(resolved.contains) ?? false
                 return SubagentSummary(
                     id: String(name.dropFirst("agent-".count)),
                     title: title, agentType: agentType, toolUseID: toolUseID,
-                    updatedAt: mtime, active: mtime > threshold)
+                    updatedAt: lastContent,
+                    active: !completed && lastContent > threshold,
+                    completed: completed)
             }
     }
 
@@ -170,7 +197,9 @@ actor TranscriptIndex {
     func isWriting(_ id: String, within seconds: TimeInterval) -> Bool {
         guard let path = path(for: id) else { return false }
         let threshold = Date().addingTimeInterval(-seconds)
-        if let mtime = updatedAt(for: id), mtime > threshold { return true }
+        if let content = TranscriptParser.lastContentDate(atPath: path), content > threshold {
+            return true
+        }
         return isSidecarActive(transcriptPath: path, after: threshold)
     }
 
@@ -260,8 +289,10 @@ actor TranscriptIndex {
         else { return }
         if let slot = cache[file.path], slot.mtime == mtime, slot.size == size { return }
 
-        let entry = TranscriptParser.entry(at: file, id: id, updatedAt: mtime)
-        cache[file.path] = CacheSlot(mtime: mtime, size: size, entry: entry)
+        let contentDate = TranscriptParser.lastContentDate(atPath: file.path)
+        let entry = TranscriptParser.entry(at: file, id: id, updatedAt: contentDate ?? mtime)
+        cache[file.path] = CacheSlot(
+            mtime: mtime, size: size, entry: entry, contentDate: contentDate)
         if entry != nil { pathByID[id] = file.path }
     }
 }
@@ -305,6 +336,63 @@ enum TranscriptParser {
         return TranscriptIndex.Entry(
             id: id, title: heading, directory: directory, model: model,
             createdAt: createdAt ?? updatedAt, updatedAt: updatedAt, path: file.path)
+    }
+
+    /// Timestamp of the last conversation line in a transcript. An interactive
+    /// CLI left open keeps touching the file (trailing `last-prompt` metadata,
+    /// no timestamp), so file mtime alone reads attached-but-idle sessions as
+    /// active forever.
+    static func lastContentDate(atPath path: String) -> Date? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
+        let window = min(size, 64 * 1024)
+        try? handle.seek(toOffset: UInt64(size - window))
+        guard let data = try? handle.read(upToCount: window) else { return nil }
+        for line in jsonLines(in: data, dropIncompleteTail: false).reversed() {
+            if let stamp = (line["timestamp"] as? String).flatMap(parseTimestamp) {
+                return stamp
+            }
+        }
+        return nil
+    }
+
+    /// First line of the first user prompt in a (sidecar) transcript — the
+    /// task description a subagent was spawned with.
+    static func firstUserPromptLine(atPath path: String) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let data = (try? handle.read(upToCount: 32 * 1024)) ?? Data()
+        for line in jsonLines(in: data, dropIncompleteTail: true) {
+            guard line["type"] as? String == "user",
+                let content = (line["message"] as? [String: Any])?["content"] as? String
+            else { continue }
+            let first = content.split(separator: "\n").first.map(String.init) ?? content
+            let trimmed = first.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("<") else { continue }
+            return String(trimmed.prefix(80))
+        }
+        return nil
+    }
+
+    /// Tool-use ids that already have a result recorded in the transcript —
+    /// a subagent whose spawning Task call is resolved has finished.
+    static func resolvedToolIDs(atPath path: String) -> Set<String> {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+            let text = String(data: data, encoding: .utf8)
+        else { return [] }
+        var ids = Set<String>()
+        var search = text.startIndex
+        while let range = text.range(of: "\"tool_use_id\":\"", range: search..<text.endIndex) {
+            let tail = text[range.upperBound...]
+            if let close = tail.firstIndex(of: "\"") {
+                ids.insert(String(tail[..<close]))
+                search = close
+            } else {
+                break
+            }
+        }
+        return ids
     }
 
     /// Latest write across the session's subagent sidecar transcripts,

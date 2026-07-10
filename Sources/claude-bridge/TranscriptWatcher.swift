@@ -86,7 +86,7 @@ actor TranscriptWatcher {
             let chunk = readChunk(path, from: offset, count: size - offset)
             offset += chunk.count
             let changed = fold.consume(chunk)
-            lastGrowth = Date()
+            if !changed.isEmpty { lastGrowth = Date() }
 
             if await store.hasRunnerTurnInFlight(claudeSessionID: transcriptID) {
                 suppressedUntil = Date().addingTimeInterval(Self.runnerGrace)
