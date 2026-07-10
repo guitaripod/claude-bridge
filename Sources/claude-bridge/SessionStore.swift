@@ -49,11 +49,17 @@ actor SessionStore {
         }
     }
 
-    func list(activeClaudeIDs: Set<String> = []) -> [SessionSummary] {
+    func list(
+        activeClaudeIDs: Set<String> = [], transcriptDates: [String: Date] = [:]
+    ) -> [SessionSummary] {
         order.compactMap { id -> SessionSummary? in
             guard let session = sessions[id] else { return nil }
             var summary = session.summary
-            summary.active = activeClaudeIDs.contains(session.claudeSessionID ?? session.id)
+            let claudeID = session.claudeSessionID ?? session.id
+            summary.active = activeClaudeIDs.contains(claudeID)
+            if let fresh = transcriptDates[claudeID], fresh > summary.updatedAt {
+                summary.updatedAt = fresh
+            }
             return summary
         }
         .sorted { $0.updatedAt > $1.updatedAt }
@@ -171,6 +177,7 @@ actor SessionStore {
         session.updatedAt = Date()
         sessions[id] = session
         moveToFront(id)
+        persist()
 
         let caster = broadcaster(for: id)
         caster.send(.messageUpserted(userMessage))
@@ -198,8 +205,21 @@ actor SessionStore {
         runnerTurnClaudeIDs.contains(claudeSessionID)
     }
 
+    /// True while this bridge's own runner is (or was, within the window)
+    /// writing the session's transcript — used to tell our own transcript
+    /// residue apart from an external process working in the session.
+    func recentRunnerActivity(claudeSessionID: String, within seconds: TimeInterval) -> Bool {
+        if runnerTurnClaudeIDs.contains(claudeSessionID) { return true }
+        guard let finished = lastRunnerFinish[claudeSessionID] else { return false }
+        return Date().timeIntervalSince(finished) < seconds
+    }
+
+    private var lastRunnerFinish: [String: Date] = [:]
+
     private func finishTurn(_ id: String, outcome: ClaudeRunner.Outcome, turnClaudeID: String) {
         runnerTurnClaudeIDs.remove(turnClaudeID)
+        lastRunnerFinish[turnClaudeID] = Date()
+        if let newID = outcome.claudeSessionID { lastRunnerFinish[newID] = Date() }
         guard var session = sessions[id] else { return }
         session.messages.append(outcome.message)
         session.claudeSessionID = outcome.claudeSessionID

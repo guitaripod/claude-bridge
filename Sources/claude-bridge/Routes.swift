@@ -34,7 +34,8 @@ func registerRoutes(
 
     router.get("sessions") { _, _ in
         let active = await index.activeIDs(within: TranscriptIndex.activityWindow)
-        let stored = await store.list(activeClaudeIDs: active)
+        let dates = await index.transcriptDates()
+        let stored = await store.list(activeClaudeIDs: active, transcriptDates: dates)
         let (claimed, hidden) = await store.excludedTranscriptIDs()
         let discovered = await index.list(excluding: claimed, hidden: hidden)
         return jsonResponse((stored + discovered).sorted { $0.updatedAt > $1.updatedAt })
@@ -110,6 +111,17 @@ func registerRoutes(
             return jsonResponse(["error": "bad request"], status: .badRequest)
         }
         await adoptIfNeeded(id)
+        let claudeID = (await store.get(id))?.claudeSessionID ?? id
+        if await !store.recentRunnerActivity(claudeSessionID: claudeID, within: 45),
+            await index.isWriting(claudeID, within: 30)
+        {
+            return jsonResponse(
+                [
+                    "error":
+                        "This session is running on the server right now. Watch it live, or fork to reply without interrupting it."
+                ],
+                status: .conflict)
+        }
         await store.send(id, request: body)
         return jsonResponse(["ok": true], status: .accepted)
     }

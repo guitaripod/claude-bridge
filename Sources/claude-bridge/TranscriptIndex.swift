@@ -77,6 +77,27 @@ actor TranscriptIndex {
         return ids
     }
 
+    /// Latest transcript mtime per session id, for freshening stored sessions
+    /// whose conversation has since continued elsewhere.
+    func transcriptDates() -> [String: Date] {
+        scan()
+        var dates: [String: Date] = [:]
+        for slot in cache.values {
+            guard let entry = slot.entry else { continue }
+            dates[entry.id] = slot.mtime
+        }
+        return dates
+    }
+
+    /// True when the transcript (or its subagent sidecars) was written within
+    /// the window — someone's process is actively working in the session.
+    func isWriting(_ id: String, within seconds: TimeInterval) -> Bool {
+        guard let path = path(for: id) else { return false }
+        let threshold = Date().addingTimeInterval(-seconds)
+        if let mtime = updatedAt(for: id), mtime > threshold { return true }
+        return isSidecarActive(transcriptPath: path, after: threshold)
+    }
+
     private func isSidecarActive(transcriptPath: String, after threshold: Date) -> Bool {
         guard let latest = TranscriptParser.sidecarActivity(transcriptPath: transcriptPath) else {
             return false
