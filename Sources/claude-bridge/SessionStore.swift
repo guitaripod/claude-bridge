@@ -5,6 +5,10 @@ final class Broadcaster: @unchecked Sendable {
     private let lock = NSLock()
     private var continuations: [UUID: AsyncStream<BridgeEvent>.Continuation] = [:]
 
+    var hasSubscribers: Bool {
+        lock.withLock { !continuations.isEmpty }
+    }
+
     func subscribe() -> (id: UUID, stream: AsyncStream<BridgeEvent>) {
         let id = UUID()
         let stream = AsyncStream<BridgeEvent> { continuation in
@@ -31,6 +35,7 @@ actor SessionStore {
     private let defaultEffort: String
     private let storeURL: URL
     private var hiddenTranscripts: Set<String>
+    private var runnerTurnClaudeIDs: Set<String> = []
 
     init(runner: ClaudeRunner, defaultModel: String, defaultEffort: String, storeURL: URL) {
         self.runner = runner
@@ -44,8 +49,14 @@ actor SessionStore {
         }
     }
 
-    func list() -> [SessionSummary] {
-        order.compactMap { sessions[$0]?.summary }.sorted { $0.updatedAt > $1.updatedAt }
+    func list(activeClaudeIDs: Set<String> = []) -> [SessionSummary] {
+        order.compactMap { id -> SessionSummary? in
+            guard let session = sessions[id] else { return nil }
+            var summary = session.summary
+            summary.active = activeClaudeIDs.contains(session.claudeSessionID ?? session.id)
+            return summary
+        }
+        .sorted { $0.updatedAt > $1.updatedAt }
     }
 
     func get(_ id: String) -> Session? { sessions[id] }
@@ -164,16 +175,23 @@ actor SessionStore {
         let fork = session.pendingFork == true
         let directory = session.directory
 
+        let turnClaudeID = resume ?? id
+        runnerTurnClaudeIDs.insert(turnClaudeID)
         Task {
             let outcome = await runner.run(
                 prompt: text, resume: resume, model: model, effort: effort, fork: fork,
                 directory: directory,
                 emit: { caster.send($0) })
-            await self.finishTurn(id, outcome: outcome)
+            await self.finishTurn(id, outcome: outcome, turnClaudeID: turnClaudeID)
         }
     }
 
-    private func finishTurn(_ id: String, outcome: ClaudeRunner.Outcome) {
+    func hasRunnerTurnInFlight(claudeSessionID: String) -> Bool {
+        runnerTurnClaudeIDs.contains(claudeSessionID)
+    }
+
+    private func finishTurn(_ id: String, outcome: ClaudeRunner.Outcome, turnClaudeID: String) {
+        runnerTurnClaudeIDs.remove(turnClaudeID)
         guard var session = sessions[id] else { return }
         session.messages.append(outcome.message)
         session.claudeSessionID = outcome.claudeSessionID

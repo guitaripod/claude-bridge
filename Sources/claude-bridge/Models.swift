@@ -87,6 +87,7 @@ struct SessionSummary: Codable, Sendable {
     var effort: String
     var createdAt: Date
     var updatedAt: Date
+    var active: Bool?
 }
 
 struct SendRequest: Codable, Sendable {

@@ -56,7 +56,8 @@ if !password.isEmpty {
 let index = TranscriptIndex(
     root: URL(fileURLWithPath: projectsDir), defaultModel: defaultModel,
     defaultEffort: defaultEffort)
-registerRoutes(router, store: store, index: index, agentModel: defaultModel)
+let watcher = TranscriptWatcher(index: index, store: store)
+registerRoutes(router, store: store, index: index, watcher: watcher, agentModel: defaultModel)
 
 let app = Application(
     router: router,

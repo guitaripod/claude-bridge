@@ -19,7 +19,7 @@ private func decodeBody<T: Decodable>(_ type: T.Type, _ request: Request) async 
 
 func registerRoutes(
     _ router: Router<BasicRequestContext>, store: SessionStore, index: TranscriptIndex,
-    agentModel: String
+    watcher: TranscriptWatcher, agentModel: String
 ) {
     @Sendable func adoptIfNeeded(_ id: String) async {
         guard await store.get(id) == nil, let discovered = await index.session(id) else { return }
@@ -33,7 +33,8 @@ func registerRoutes(
     }
 
     router.get("sessions") { _, _ in
-        let stored = await store.list()
+        let active = await index.activeIDs(within: TranscriptIndex.activityWindow)
+        let stored = await store.list(activeClaudeIDs: active)
         let (claimed, hidden) = await store.excludedTranscriptIDs()
         let discovered = await index.list(excluding: claimed, hidden: hidden)
         return jsonResponse((stored + discovered).sorted { $0.updatedAt > $1.updatedAt })
@@ -46,7 +47,16 @@ func registerRoutes(
 
     router.get("sessions/:id") { _, context in
         let id = context.parameters.get("id") ?? ""
-        if let session = await store.get(id) {
+        if var session = await store.get(id) {
+            if let claudeID = session.claudeSessionID,
+                await !store.hasRunnerTurnInFlight(claudeSessionID: claudeID),
+                let transcriptDate = await index.updatedAt(for: claudeID),
+                transcriptDate > session.updatedAt.addingTimeInterval(2),
+                let fresh = await index.session(claudeID)
+            {
+                session.messages = fresh.messages
+                session.updatedAt = transcriptDate
+            }
             return jsonResponse(session)
         }
         if let discovered = await index.session(id) {
@@ -93,6 +103,7 @@ func registerRoutes(
     router.get("sessions/:id/events") { _, context in
         let id = context.parameters.get("id") ?? ""
         let caster = await store.broadcaster(for: id)
+        await watcher.ensureTail(sessionID: id)
         let (_, stream) = caster.subscribe()
         let body = ResponseBody { writer in
             for await event in stream {

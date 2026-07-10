@@ -46,6 +46,32 @@ actor TranscriptIndex {
         return pathByID[id] != nil
     }
 
+    func path(for id: String) -> String? {
+        if pathByID[id] == nil { scan() }
+        return pathByID[id]
+    }
+
+    func updatedAt(for id: String) -> Date? {
+        guard let path = path(for: id) else { return nil }
+        let values = try? URL(fileURLWithPath: path).resourceValues(forKeys: [
+            .contentModificationDateKey
+        ])
+        return values?.contentModificationDate ?? cache[path]?.mtime
+    }
+
+    /// Session ids whose transcript was written to within the window — "someone
+    /// (this bridge or an interactive CLI) is working in this session right now".
+    func activeIDs(within seconds: TimeInterval) -> Set<String> {
+        scan()
+        let threshold = Date().addingTimeInterval(-seconds)
+        var ids = Set<String>()
+        for slot in cache.values {
+            guard let entry = slot.entry, slot.mtime > threshold else { continue }
+            ids.insert(entry.id)
+        }
+        return ids
+    }
+
     /// Fully parses the transcript into a `Session` suitable for display or adoption.
     func session(_ id: String) -> Session? {
         if pathByID[id] == nil { scan() }
@@ -68,6 +94,8 @@ actor TranscriptIndex {
             pendingFork: nil)
     }
 
+    static let activityWindow: TimeInterval = 180
+
     private func summary(for entry: Entry) -> SessionSummary {
         SessionSummary(
             id: entry.id,
@@ -76,7 +104,8 @@ actor TranscriptIndex {
             model: entry.model ?? defaultModel,
             effort: defaultEffort,
             createdAt: entry.createdAt,
-            updatedAt: entry.updatedAt)
+            updatedAt: entry.updatedAt,
+            active: entry.updatedAt > Date().addingTimeInterval(-Self.activityWindow))
     }
 
     private func scan() {
@@ -127,7 +156,7 @@ actor TranscriptIndex {
 /// Parses Claude Code CLI transcript files (`.jsonl`, one JSON object per line).
 enum TranscriptParser {
     private static let summaryScanLimit = 512 * 1024
-    private static let toolOutputLimit = 10_000
+    static let toolOutputLimit = 10_000
 
     /// Cheap prefix scan: enough to produce a list row without reading the whole file.
     static func entry(at file: URL, id: String, updatedAt: Date) -> TranscriptIndex.Entry? {
@@ -165,115 +194,12 @@ enum TranscriptParser {
             createdAt: createdAt ?? updatedAt, updatedAt: updatedAt, path: file.path)
     }
 
-    /// Full parse: folds transcript lines into the bridge's message model. Consecutive assistant
-    /// API messages (interleaved with tool results) merge into one turn, mirroring how the
-    /// bridge's own runner assembles a turn.
+    /// Full parse: folds transcript lines into the bridge's message model.
     static func messages(at file: URL) -> [Message] {
         guard let data = try? Data(contentsOf: file) else { return [] }
-
-        var messages: [Message] = []
-        var turn: Message?
-        var toolLocation: [String: (messageIndex: Int?, partIndex: Int)] = [:]
-
-        func flushTurn() {
-            guard let done = turn else { return }
-            messages.append(done)
-            for (toolID, location) in toolLocation where location.messageIndex == nil {
-                toolLocation[toolID] = (messages.count - 1, location.partIndex)
-            }
-            turn = nil
-        }
-        func resolveTool(_ toolID: String, output: String, isError: Bool) {
-            guard let location = toolLocation[toolID] else { return }
-            let update: (inout Message) -> Void = { message in
-                guard case .tool(var call) = message.parts[location.partIndex] else { return }
-                call.output = String(output.prefix(toolOutputLimit))
-                call.status = isError ? .error : .completed
-                message.parts[location.partIndex] = .tool(call)
-            }
-            if let index = location.messageIndex {
-                update(&messages[index])
-            } else if turn != nil {
-                update(&turn!)
-            }
-        }
-
-        for line in jsonLines(in: data, dropIncompleteTail: false) {
-            guard isRealLine(line), let type = line["type"] as? String,
-                let message = line["message"] as? [String: Any]
-            else { continue }
-            let uuid = line["uuid"] as? String ?? UUID().uuidString
-            let stamp = (line["timestamp"] as? String).flatMap(parseTimestamp) ?? Date()
-
-            switch type {
-            case "user":
-                if let content = message["content"] as? String {
-                    guard let text = typedText(content) ?? commandText(content) else { continue }
-                    flushTurn()
-                    messages.append(
-                        Message(id: uuid, role: .user, parts: [.text(text)], createdAt: stamp))
-                } else if let blocks = message["content"] as? [[String: Any]] {
-                    var texts: [String] = []
-                    for block in blocks {
-                        switch block["type"] as? String {
-                        case "tool_result":
-                            guard let toolID = block["tool_use_id"] as? String else { continue }
-                            resolveTool(
-                                toolID, output: flatten(block["content"]),
-                                isError: block["is_error"] as? Bool == true)
-                        case "text":
-                            if let text = (block["text"] as? String).flatMap(typedText) {
-                                texts.append(text)
-                            }
-                        default:
-                            break
-                        }
-                    }
-                    if !texts.isEmpty {
-                        flushTurn()
-                        messages.append(
-                            Message(
-                                id: uuid, role: .user,
-                                parts: [.text(texts.joined(separator: "\n\n"))], createdAt: stamp))
-                    }
-                }
-            case "assistant":
-                guard let blocks = message["content"] as? [[String: Any]] else { continue }
-                if turn == nil {
-                    turn = Message(id: uuid, role: .assistant, parts: [], createdAt: stamp)
-                }
-                for block in blocks {
-                    switch block["type"] as? String {
-                    case "thinking":
-                        if let thinking = block["thinking"] as? String, !thinking.isEmpty {
-                            turn?.parts.append(.reasoning(thinking))
-                        }
-                    case "text":
-                        if let text = block["text"] as? String, !text.isEmpty {
-                            turn?.parts.append(.text(text))
-                        }
-                    case "tool_use":
-                        guard let toolID = block["id"] as? String else { continue }
-                        let input =
-                            (block["input"] as? [String: Any]).flatMap { object in
-                                (try? JSONSerialization.data(withJSONObject: object))
-                                    .flatMap { String(data: $0, encoding: .utf8) }
-                            } ?? ""
-                        let call = ToolCall(
-                            id: toolID, name: block["name"] as? String ?? "tool",
-                            input: input, status: .completed)
-                        turn?.parts.append(.tool(call))
-                        toolLocation[toolID] = (nil, (turn?.parts.count ?? 1) - 1)
-                    default:
-                        break
-                    }
-                }
-            default:
-                continue
-            }
-        }
-        flushTurn()
-        return messages.filter { !$0.parts.isEmpty }
+        var fold = TranscriptFold()
+        _ = fold.consume(data)
+        return fold.snapshot
     }
 
     private static func jsonLines(in data: Data, dropIncompleteTail: Bool) -> [[String: Any]] {
@@ -293,12 +219,12 @@ enum TranscriptParser {
         return lines
     }
 
-    private static func isRealLine(_ line: [String: Any]) -> Bool {
+    static func isRealLine(_ line: [String: Any]) -> Bool {
         line["isMeta"] as? Bool != true && line["isSidechain"] as? Bool != true
     }
 
     /// Human-typed prompt text; nil for command wrappers, caveats, and injected reminders.
-    private static func typedText(_ content: String) -> String? {
+    static func typedText(_ content: String) -> String? {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         for marker in ["<command-", "<local-command", "<system-reminder", "Caveat:"]
@@ -309,7 +235,7 @@ enum TranscriptParser {
     }
 
     /// Renders a slash-command invocation (`<command-name>/foo</command-name>…`) as `/foo args`.
-    private static func commandText(_ content: String) -> String? {
+    static func commandText(_ content: String) -> String? {
         guard let name = tagValue("command-name", in: content) else { return nil }
         let args = tagValue("command-args", in: content) ?? ""
         return args.isEmpty ? name : "\(name) \(args)"
@@ -329,7 +255,7 @@ enum TranscriptParser {
         return String(firstLine.prefix(60))
     }
 
-    private static func flatten(_ content: Any?) -> String {
+    static func flatten(_ content: Any?) -> String {
         if let string = content as? String { return string }
         if let blocks = content as? [[String: Any]] {
             return blocks.compactMap { $0["text"] as? String }.joined(separator: "\n")
@@ -337,10 +263,10 @@ enum TranscriptParser {
         return ""
     }
 
-    private static let fractionalTimestamp = Date.ISO8601FormatStyle(
+    static let fractionalTimestamp = Date.ISO8601FormatStyle(
         includingFractionalSeconds: true)
 
-    private static func parseTimestamp(_ raw: String) -> Date? {
+    static func parseTimestamp(_ raw: String) -> Date? {
         (try? Date(raw, strategy: fractionalTimestamp)) ?? (try? Date(raw, strategy: .iso8601))
     }
 }
