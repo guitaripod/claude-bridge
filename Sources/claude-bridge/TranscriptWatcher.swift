@@ -72,9 +72,13 @@ actor TranscriptWatcher {
                         emittedRunning = true
                     }
                 }
-                if emittedRunning, Date().timeIntervalSince(lastGrowth) > Self.idleAfter {
-                    caster.send(.status("idle"))
-                    emittedRunning = false
+                if emittedRunning {
+                    if Date().timeIntervalSince(lastGrowth) > Self.idleAfter {
+                        caster.send(.status("idle"))
+                        emittedRunning = false
+                    } else {
+                        caster.send(.status("running"))
+                    }
                 }
                 continue
             }

@@ -77,20 +77,41 @@ actor TranscriptIndex {
         return ids
     }
 
-    /// Subagent sidecars for a session: one summary per
-    /// `<sessionID>/subagents/agent-*.jsonl`, described by the sibling
-    /// `.meta.json` the CLI writes alongside.
-    func subagents(for id: String) -> [SubagentSummary] {
-        guard let transcriptPath = path(for: id) else { return [] }
-        let dir = URL(fileURLWithPath: transcriptPath)
+    /// Directories that can hold subagent transcripts: the session's
+    /// `subagents/` dir plus one `workflows/<runID>/` level beneath it.
+    nonisolated static func sidecarDirs(transcriptPath: String) -> [URL] {
+        let root = URL(fileURLWithPath: transcriptPath)
             .deletingPathExtension()
             .appendingPathComponent("subagents")
+        var dirs = [root]
+        let workflows = root.appendingPathComponent("workflows")
+        if let runs = try? FileManager.default.contentsOfDirectory(
+            at: workflows, includingPropertiesForKeys: [.isDirectoryKey],
+            options: .skipsHiddenFiles)
+        {
+            dirs.append(contentsOf: runs)
+        }
+        return dirs
+    }
+
+    /// Subagent sidecars for a session: one summary per `agent-*.jsonl` under
+    /// `<sessionID>/subagents/` (including workflow runs), described by the
+    /// sibling `.meta.json` the CLI writes alongside.
+    func subagents(for id: String) -> [SubagentSummary] {
+        guard let transcriptPath = path(for: id) else { return [] }
+        let threshold = Date().addingTimeInterval(-Self.activityWindow)
+        return Self.sidecarDirs(transcriptPath: transcriptPath).flatMap { dir in
+            subagents(in: dir, threshold: threshold)
+        }
+        .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private func subagents(in dir: URL, threshold: Date) -> [SubagentSummary] {
         guard
             let files = try? FileManager.default.contentsOfDirectory(
                 at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
                 options: .skipsHiddenFiles)
         else { return [] }
-        let threshold = Date().addingTimeInterval(-Self.activityWindow)
         return files
             .filter { $0.pathExtension == "jsonl" }
             .compactMap { file -> SubagentSummary? in
@@ -117,19 +138,19 @@ actor TranscriptIndex {
                     title: title, agentType: agentType, toolUseID: toolUseID,
                     updatedAt: mtime, active: mtime > threshold)
             }
-            .sorted { $0.updatedAt > $1.updatedAt }
     }
 
     func subagentMessages(sessionID: String, agentID: String) -> [Message]? {
         guard let transcriptPath = path(for: sessionID),
             agentID.allSatisfy({ $0.isLetter || $0.isNumber })
         else { return nil }
-        let file = URL(fileURLWithPath: transcriptPath)
-            .deletingPathExtension()
-            .appendingPathComponent("subagents")
-            .appendingPathComponent("agent-\(agentID).jsonl")
-        guard FileManager.default.fileExists(atPath: file.path) else { return nil }
-        return TranscriptParser.messages(at: file, includeSidechain: true)
+        for dir in Self.sidecarDirs(transcriptPath: transcriptPath) {
+            let file = dir.appendingPathComponent("agent-\(agentID).jsonl")
+            if FileManager.default.fileExists(atPath: file.path) {
+                return TranscriptParser.messages(at: file, includeSidechain: true)
+            }
+        }
+        return nil
     }
 
     /// Latest transcript mtime per session id, for freshening stored sessions
@@ -286,22 +307,23 @@ enum TranscriptParser {
             createdAt: createdAt ?? updatedAt, updatedAt: updatedAt, path: file.path)
     }
 
-    /// Latest write across the session's subagent sidecar transcripts
-    /// (`<projectDir>/<sessionID>/subagents/*.jsonl`), if any exist.
+    /// Latest write across the session's subagent sidecar transcripts,
+    /// including workflow-run agents one level deeper.
     static func sidecarActivity(transcriptPath: String) -> Date? {
-        let dir = URL(fileURLWithPath: transcriptPath)
-            .deletingPathExtension()
-            .appendingPathComponent("subagents")
-        guard
-            let files = try? FileManager.default.contentsOfDirectory(
-                at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
-                options: .skipsHiddenFiles)
-        else { return nil }
-        return files
-            .filter { $0.pathExtension == "jsonl" }
-            .compactMap {
-                (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?
-                    .contentModificationDate
+        TranscriptIndex.sidecarDirs(transcriptPath: transcriptPath)
+            .compactMap { dir -> Date? in
+                guard
+                    let files = try? FileManager.default.contentsOfDirectory(
+                        at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
+                        options: .skipsHiddenFiles)
+                else { return nil }
+                return files
+                    .filter { $0.pathExtension == "jsonl" }
+                    .compactMap {
+                        (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?
+                            .contentModificationDate
+                    }
+                    .max()
             }
             .max()
     }
@@ -335,15 +357,48 @@ enum TranscriptParser {
         line["isMeta"] as? Bool != true && line["isSidechain"] as? Bool != true
     }
 
-    /// Human-typed prompt text; nil for command wrappers, caveats, and injected reminders.
+    /// Human-typed prompt text; nil for command wrappers, caveats, and injected
+    /// reminders. Background-task notifications condense to a one-line status
+    /// instead of their raw XML payload.
     static func typedText(_ content: String) -> String? {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        if trimmed.hasPrefix("<task-notification") {
+            return taskNotificationSummary(trimmed)
+        }
         for marker in ["<command-", "<local-command", "<system-reminder", "Caveat:"]
         where trimmed.hasPrefix(marker) {
             return nil
         }
         return trimmed
+    }
+
+    static func taskNotificationSummary(_ content: String) -> String? {
+        var lead = tagValue("summary", in: content)?
+            .split(separator: "\n").first.map(String.init)
+        if lead == nil, tagValue("status", in: content) != nil || tagValue("usage", in: content) != nil {
+            lead = "Background agent finished"
+        }
+        guard var text = lead else { return nil }
+        var stats: [String] = []
+        if let ms = tagValue("duration_ms", in: content).flatMap(Double.init) {
+            stats.append(compactDuration(ms / 1000))
+        }
+        if let tools = tagValue("tool_uses", in: content) {
+            stats.append("\(tools) tools")
+        }
+        if let tokens = tagValue("subagent_tokens", in: content).flatMap(Int.init) {
+            stats.append(tokens >= 1000 ? "\(tokens / 1000)k tokens" : "\(tokens) tokens")
+        }
+        if !stats.isEmpty { text += " · " + stats.joined(separator: " · ") }
+        return text
+    }
+
+    static func compactDuration(_ interval: TimeInterval) -> String {
+        let seconds = Int(interval.rounded())
+        if seconds < 60 { return "\(max(seconds, 1))s" }
+        if seconds < 3600 { return "\(seconds / 60)m \(seconds % 60)s" }
+        return "\(seconds / 3600)h \((seconds % 3600) / 60)m"
     }
 
     /// Renders a slash-command invocation (`<command-name>/foo</command-name>…`) as `/foo args`.
