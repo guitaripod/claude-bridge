@@ -32,6 +32,10 @@ func registerRoutes(
         jsonResponse(["agent": "claude", "model": agentModel])
     }
 
+    router.get("usage") { _, _ in
+        jsonResponse(await ClaudeUsage.snapshot())
+    }
+
     router.get("sessions") { _, _ in
         let active = await index.activeIDs(within: TranscriptIndex.activityWindow)
         let dates = await index.transcriptDates()
