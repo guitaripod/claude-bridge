@@ -47,7 +47,8 @@ try? FileManager.default.createDirectory(
 
 let store = SessionStore(
     runner: ClaudeRunner(claudePath: claudePath, workdir: workdir, permissionMode: permissionMode),
-    defaultModel: defaultModel, defaultEffort: defaultEffort, storeURL: storeURL)
+    defaultModel: defaultModel, defaultEffort: defaultEffort, storeURL: storeURL,
+    projectsDir: projectsDir)
 
 let router = Router()
 if !password.isEmpty {

@@ -34,14 +34,19 @@ actor SessionStore {
     private let defaultModel: String
     private let defaultEffort: String
     private let storeURL: URL
+    private let projectsDir: String
     private var hiddenTranscripts: Set<String>
     private var runnerTurnClaudeIDs: Set<String> = []
 
-    init(runner: ClaudeRunner, defaultModel: String, defaultEffort: String, storeURL: URL) {
+    init(
+        runner: ClaudeRunner, defaultModel: String, defaultEffort: String, storeURL: URL,
+        projectsDir: String = ""
+    ) {
         self.runner = runner
         self.defaultModel = defaultModel
         self.defaultEffort = defaultEffort
         self.storeURL = storeURL
+        self.projectsDir = projectsDir
         hiddenTranscripts = Self.loadHidden(from: Self.hiddenURL(for: storeURL))
         for session in Self.loadStored(from: storeURL) {
             sessions[session.id] = session
@@ -135,6 +140,7 @@ actor SessionStore {
     func rename(_ id: String, title: String) -> Bool {
         guard var session = sessions[id] else { return false }
         session.title = title
+        session.customTitle = true
         sessions[id] = session
         persist()
         return true
@@ -152,6 +158,7 @@ actor SessionStore {
         guard var session = sessions[id] else { return }
         session.messages = []
         session.claudeSessionID = nil
+        session.autoTitled = nil
         session.updatedAt = Date()
         sessions[id] = session
         persist()
@@ -173,7 +180,11 @@ actor SessionStore {
         let userMessage = Message(
             id: UUID().uuidString, role: .user, parts: [.text(request.text)], createdAt: Date())
         session.messages.append(userMessage)
-        if session.title == "New chat" { session.title = Self.deriveTitle(request.text) }
+        if session.title == "New chat"
+            || (session.customTitle != true && session.messages.count <= 1)
+        {
+            session.title = Self.deriveTitle(request.text, fallback: session.title)
+        }
         session.updatedAt = Date()
         sessions[id] = session
         moveToFront(id)
@@ -286,6 +297,44 @@ actor SessionStore {
         sessions[id] = session
         moveToFront(id)
         persist()
+        maybeAutoTitle(id)
+    }
+
+    /// After the first completed turn (and after /clear), replace the
+    /// prompt-derived title with a short LLM-written one. A user rename
+    /// (customTitle) always wins, including against a title call already in
+    /// flight.
+    private func maybeAutoTitle(_ id: String) {
+        guard let session = sessions[id],
+            session.customTitle != true, session.autoTitled != true,
+            let user = session.messages.first(where: { $0.role == .user })
+                .map(Self.plainText), !user.isEmpty,
+            let assistant = session.messages.first(where: { $0.role == .assistant })
+                .map(Self.plainText), !assistant.isEmpty
+        else { return }
+        let binary = runner.claudePath
+        let projects = projectsDir
+        Task.detached { [weak self] in
+            guard let title = await Titler.title(
+                binary: binary, projectsDir: projects, user: user, assistant: assistant)
+            else { return }
+            await self?.applyAutoTitle(id, title: title)
+        }
+    }
+
+    private func applyAutoTitle(_ id: String, title: String) {
+        guard var session = sessions[id], session.customTitle != true else { return }
+        session.title = title
+        session.autoTitled = true
+        sessions[id] = session
+        persist()
+    }
+
+    private static func plainText(_ message: Message) -> String {
+        message.parts.compactMap { part in
+            if case .text(let value) = part { return value }
+            return nil
+        }.joined(separator: "\n")
     }
 
     private func moveToFront(_ id: String) {
@@ -293,9 +342,30 @@ actor SessionStore {
         order.insert(id, at: 0)
     }
 
-    private static func deriveTitle(_ text: String) -> String {
-        let firstLine = text.split(separator: "\n").first.map(String.init) ?? text
-        return String(firstLine.prefix(60))
+    /// A readable list title from a raw prompt: the first real line (slash
+    /// commands and markup skipped), whitespace collapsed, cut at a word
+    /// boundary, sentence-cased. The LLM titler replaces this after the
+    /// first turn; this keeps the list sane in the meantime.
+    static func deriveTitle(_ text: String, fallback: String = "New chat") -> String {
+        let cleaned = text.replacingOccurrences(
+            of: "<[^>]{1,80}>", with: " ", options: .regularExpression)
+        let line = cleaned
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty && !$0.hasPrefix("/") }
+        guard var title = line else { return fallback }
+        title = title.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        if title.count > 48 {
+            let prefix = String(title.prefix(48))
+            if let space = prefix.lastIndex(of: " "), prefix.distance(from: prefix.startIndex, to: space) > 24 {
+                title = String(prefix[..<space]) + "…"
+            } else {
+                title = prefix + "…"
+            }
+        }
+        title = title.trimmingCharacters(in: CharacterSet(charactersIn: " .,:;–—-"))
+        guard !title.isEmpty else { return fallback }
+        return title.prefix(1).uppercased() + title.dropFirst()
     }
 
     private static func hiddenURL(for storeURL: URL) -> URL {
