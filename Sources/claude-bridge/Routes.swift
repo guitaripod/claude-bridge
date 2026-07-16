@@ -36,6 +36,10 @@ func registerRoutes(
         jsonResponse(await ClaudeUsage.snapshot())
     }
 
+    router.get("usage/grok") { _, _ in
+        jsonResponse(await GrokUsage.snapshot())
+    }
+
     router.get("sessions") { _, _ in
         let active = await index.activeIDs(within: TranscriptIndex.activityWindow)
         let dates = await index.transcriptDates()
