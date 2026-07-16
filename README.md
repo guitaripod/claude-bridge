@@ -149,4 +149,4 @@ macOS, use a `launchd` LaunchAgent with the same environment variables instead.
 
 ## License
 
-GPL-3.0. Copyright (c) 2026 Marcus Ziadé. See [LICENSE](LICENSE).
+GPL-3.0. Copyright (c) 2026 Midgar Oy. See [LICENSE](LICENSE).
