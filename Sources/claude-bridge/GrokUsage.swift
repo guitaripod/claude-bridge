@@ -23,10 +23,27 @@ enum GrokUsage {
     private static let clientVersion = "0.2.101"
     private static let userAgent = "claude-bridge (+https://github.com/guitaripod/claude-bridge)"
 
+    private static let cache = UsageSnapshotCache(name: "grok")
+
     static func snapshot() async -> UsageSnapshot {
+        if let fresh = await cache.fresh(within: 60) { return fresh }
+        if await cache.inBackoff {
+            if var stale = await cache.fresh(within: 24 * 3600) {
+                stale.source += " · cached"
+                return stale
+            }
+            return unavailable("rate limited — retrying later")
+        }
         do {
-            return try await loadAndFetch()
+            let snapshot = try await loadAndFetch()
+            await cache.store(snapshot)
+            return snapshot
         } catch {
+            await cache.noteFailure()
+            if var stale = await cache.fresh(within: 24 * 3600) {
+                stale.source += " · cached"
+                return stale
+            }
             return unavailable("\(error)")
         }
     }

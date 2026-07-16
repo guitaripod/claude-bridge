@@ -45,12 +45,34 @@ enum ClaudeUsage {
     private static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     private static let oauthBeta = "oauth-2025-04-20"
 
+    /// Every client surface (home card, usage screen, other apps on the same
+    /// account) polls this; a short TTL keeps us from hammering Anthropic
+    /// into 429s, and a failed fetch serves the last good snapshot instead of
+    /// blanking every gauge.
+    private static let cache = UsageSnapshotCache(name: "claude")
+    private static let staleWindow: TimeInterval = 24 * 3600
+
     static func snapshot() async -> UsageSnapshot {
+        if let fresh = await cache.fresh(within: 60) { return fresh }
+        if await cache.inBackoff {
+            if let stale = await cache.fresh(within: staleWindow) { return cached(stale) }
+            return unavailable("rate limited — retrying later")
+        }
         do {
-            return try await loadAndFetch()
+            let snapshot = try await loadAndFetch()
+            await cache.store(snapshot)
+            return snapshot
         } catch {
+            await cache.noteFailure()
+            if let stale = await cache.fresh(within: staleWindow) { return cached(stale) }
             return unavailable("\(error)")
         }
+    }
+
+    private static func cached(_ snapshot: UsageSnapshot) -> UsageSnapshot {
+        var served = snapshot
+        served.source = "api.anthropic.com · cached"
+        return served
     }
 
     private static func loadAndFetch() async throws -> UsageSnapshot {
@@ -286,6 +308,61 @@ enum ClaudeUsage {
             gauges: [],
             details: [],
             error: error)
+    }
+}
+
+/// Last-good snapshots persist to disk so a bridge restart doesn't blank the
+/// gauges while the account is being rate limited, and a failed fetch backs
+/// off before retrying upstream — the account-wide limit is shared with
+/// every other tool polling the same endpoint.
+actor UsageSnapshotCache {
+    private struct Stored: Codable {
+        var snapshot: UsageSnapshot
+        var at: Date
+    }
+
+    private let name: String
+    private var stored: Stored?
+    private var backoffUntil: Date = .distantPast
+    private var loaded = false
+
+    init(name: String) {
+        self.name = name
+    }
+
+    var inBackoff: Bool { Date() < backoffUntil }
+
+    func noteFailure(backoff seconds: TimeInterval = 300) {
+        backoffUntil = Date().addingTimeInterval(seconds)
+    }
+
+    func fresh(within seconds: TimeInterval) -> UsageSnapshot? {
+        loadIfNeeded()
+        guard let stored, Date().timeIntervalSince(stored.at) < seconds else { return nil }
+        return stored.snapshot
+    }
+
+    func store(_ snapshot: UsageSnapshot) {
+        stored = Stored(snapshot: snapshot, at: Date())
+        backoffUntil = .distantPast
+        if let data = try? JSONCoding.encoder.encode(stored) {
+            try? data.write(to: fileURL(), options: [.atomic])
+        }
+    }
+
+    private func loadIfNeeded() {
+        guard !loaded else { return }
+        loaded = true
+        guard stored == nil,
+            let data = try? Data(contentsOf: fileURL()),
+            let disk = try? JSONCoding.decoder.decode(Stored.self, from: data)
+        else { return }
+        stored = disk
+    }
+
+    private func fileURL() -> URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: ".claude-bridge/usage-cache-\(name).json")
     }
 }
 
