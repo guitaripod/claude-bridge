@@ -72,6 +72,18 @@ func registerRoutes(
         return jsonResponse(["error": "not found"], status: .notFound)
     }
 
+    router.get("sessions/:id/usage") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        if let session = await store.get(id) {
+            return jsonResponse(
+                UsageSummary(costUSD: session.lastCostUSD, tokens: session.lastTokens))
+        }
+        if await index.contains(id) {
+            return jsonResponse(UsageSummary(costUSD: nil, tokens: nil))
+        }
+        return jsonResponse(["error": "not found"], status: .notFound)
+    }
+
     router.patch("sessions/:id") { request, context in
         let id = context.parameters.get("id") ?? ""
         guard let body = try? await decodeBody(RenameRequest.self, request),

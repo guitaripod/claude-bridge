@@ -109,6 +109,11 @@ struct RenameRequest: Codable, Sendable {
     var title: String
 }
 
+struct UsageSummary: Codable, Sendable {
+    var costUSD: Double?
+    var tokens: Int?
+}
+
 struct SendRequest: Codable, Sendable {
     var text: String
     var model: String?
