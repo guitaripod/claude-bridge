@@ -76,6 +76,28 @@ func registerRoutes(
         return jsonResponse(["error": "not found"], status: .notFound)
     }
 
+    router.get("files") { request, _ in
+        let raw = request.uri.queryParameters.get("path").map { String($0) } ?? "."
+        let root = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = FileBrowsing.resolve(raw, home: root)
+        guard let entries = FileBrowsing.list(path) else {
+            return jsonResponse(["error": "not a directory"], status: .notFound)
+        }
+        return jsonResponse(entries)
+    }
+
+    router.get("files/content") { request, _ in
+        guard let raw = request.uri.queryParameters.get("path") else {
+            return jsonResponse(["error": "path required"], status: .badRequest)
+        }
+        let root = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = FileBrowsing.resolve(String(raw), home: root)
+        guard let content = FileBrowsing.content(path) else {
+            return jsonResponse(["error": "not readable"], status: .notFound)
+        }
+        return jsonResponse(FileContent(path: path, content: content))
+    }
+
     router.get("sessions/:id/usage") { _, context in
         let id = context.parameters.get("id") ?? ""
         if let session = await store.get(id) {

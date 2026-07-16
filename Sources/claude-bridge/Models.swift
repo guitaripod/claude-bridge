@@ -71,6 +71,8 @@ struct Session: Codable, Sendable {
     var lastCostUSD: Double?
     var lastTokens: Int?
     var pendingFork: Bool?
+    var customTitle: Bool?
+    var autoTitled: Bool?
 
     var summary: SessionSummary {
         SessionSummary(
@@ -177,5 +179,52 @@ enum BridgeEvent: Codable, Sendable {
         case "status": self = .status(try c.decode(String.self, forKey: .status))
         default: self = .error(try c.decode(String.self, forKey: .error))
         }
+    }
+}
+
+struct FileEntry: Codable, Sendable {
+    var path: String
+    var name: String
+    var isDirectory: Bool
+}
+
+struct FileContent: Codable, Sendable {
+    var path: String
+    var content: String
+}
+
+/// Directory listing for the app's file browser — rooted at the server
+/// user's home, `.` and `~` resolving there.
+enum FileBrowsing {
+    static func resolve(_ raw: String, home: String) -> String {
+        if raw.isEmpty || raw == "." { return home }
+        if raw == "~" { return home }
+        if raw.hasPrefix("~/") { return home + raw.dropFirst(1) }
+        if !raw.hasPrefix("/") { return "\(home)/\(raw)" }
+        return raw
+    }
+
+    static func list(_ path: String) -> [FileEntry]? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+            isDirectory.boolValue,
+            let names = try? FileManager.default.contentsOfDirectory(atPath: path)
+        else { return nil }
+        return names
+            .filter { !$0.hasPrefix(".") }
+            .map { name in
+                let full = path.hasSuffix("/") ? "\(path)\(name)" : "\(path)/\(name)"
+                var childIsDirectory: ObjCBool = false
+                FileManager.default.fileExists(atPath: full, isDirectory: &childIsDirectory)
+                return FileEntry(path: full, name: name, isDirectory: childIsDirectory.boolValue)
+            }
+    }
+
+    static func content(_ path: String, cap: Int = 262_144) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path),
+            let data = try? handle.read(upToCount: cap)
+        else { return nil }
+        try? handle.close()
+        return String(data: data, encoding: .utf8)
     }
 }
