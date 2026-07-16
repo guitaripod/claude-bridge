@@ -35,13 +35,15 @@ actor SessionStore {
     private let defaultEffort: String
     private let storeURL: URL
     private let projectsDir: String
+    let pusher: LiveActivityPusher
     private var hiddenTranscripts: Set<String>
     private var runnerTurnClaudeIDs: Set<String> = []
 
     init(
         runner: ClaudeRunner, defaultModel: String, defaultEffort: String, storeURL: URL,
-        projectsDir: String = ""
+        projectsDir: String = "", pusher: LiveActivityPusher = LiveActivityPusher(config: nil)
     ) {
+        self.pusher = pusher
         self.runner = runner
         self.defaultModel = defaultModel
         self.defaultEffort = defaultEffort
@@ -210,7 +212,10 @@ actor SessionStore {
                 onStart: { pid in Task { await self.registerTurnProcess(id, pid: pid) } },
                 emit: { event in
                     caster.send(event)
-                    Task { await self.mirrorLiveTurn(id, event) }
+                    Task {
+                        await self.mirrorLiveTurn(id, event)
+                        await self.pusher.noteEvent(event, sessionID: id)
+                    }
                 })
             await self.finishTurn(id, outcome: outcome, turnClaudeID: turnClaudeID)
         }
@@ -298,6 +303,11 @@ actor SessionStore {
         moveToFront(id)
         persist()
         maybeAutoTitle(id)
+        let toolCount = outcome.message.parts.count { part in
+            if case .tool = part { return true }
+            return false
+        }
+        Task { await pusher.endTurn(sessionID: id, toolCount: toolCount, failed: false) }
     }
 
     /// After the first completed turn (and after /clear), replace the

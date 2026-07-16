@@ -45,10 +45,22 @@ enforceFailClosedStartup(password: password, permissionMode: permissionMode)
 try? FileManager.default.createDirectory(
     at: URL(fileURLWithPath: workdir), withIntermediateDirectories: true)
 
+let apnsKeyPath = env("BRIDGE_APNS_KEY", "")
+let apnsConfig: LiveActivityPusher.Config? = {
+    guard !apnsKeyPath.isEmpty,
+        let pem = try? String(contentsOfFile: apnsKeyPath, encoding: .utf8)
+    else { return nil }
+    return LiveActivityPusher.Config(
+        keyPEM: pem,
+        keyID: env("BRIDGE_APNS_KEY_ID", ""),
+        teamID: env("BRIDGE_APNS_TEAM_ID", ""),
+        topic: env("BRIDGE_APNS_TOPIC", "com.guitaripod.tailscode.push-type.liveactivity"))
+}()
+
 let store = SessionStore(
     runner: ClaudeRunner(claudePath: claudePath, workdir: workdir, permissionMode: permissionMode),
     defaultModel: defaultModel, defaultEffort: defaultEffort, storeURL: storeURL,
-    projectsDir: projectsDir)
+    projectsDir: projectsDir, pusher: LiveActivityPusher(config: apnsConfig))
 
 let router = Router()
 if !password.isEmpty {

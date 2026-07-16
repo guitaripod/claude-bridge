@@ -98,6 +98,15 @@ func registerRoutes(
         return jsonResponse(FileContent(path: path, content: content))
     }
 
+    router.post("sessions/:id/live-activity") { request, context in
+        let id = context.parameters.get("id") ?? ""
+        guard let body = try? await decodeBody(LiveActivityRegistration.self, request) else {
+            return jsonResponse(["error": "bad request"], status: .badRequest)
+        }
+        await store.pusher.register(body, sessionID: id)
+        return jsonResponse(["ok": true])
+    }
+
     router.get("sessions/:id/usage") { _, context in
         let id = context.parameters.get("id") ?? ""
         if let session = await store.get(id) {
