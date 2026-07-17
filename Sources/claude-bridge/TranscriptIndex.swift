@@ -361,6 +361,9 @@ actor TranscriptIndex {
 
     static let activityWindow: TimeInterval = 180
 
+    /// Discovered transcripts don't record an effort level, so the summary
+    /// carries an empty one rather than presenting the server default as if
+    /// the session actually ran with it.
     private func summary(for entry: Entry, turnClosed: Bool) -> SessionSummary {
         let threshold = Date().addingTimeInterval(-Self.activityWindow)
         let active =
@@ -371,7 +374,7 @@ actor TranscriptIndex {
             title: entry.title,
             directory: entry.directory,
             model: entry.model ?? defaultModel,
-            effort: defaultEffort,
+            effort: "",
             createdAt: entry.createdAt,
             updatedAt: entry.updatedAt,
             active: active)
