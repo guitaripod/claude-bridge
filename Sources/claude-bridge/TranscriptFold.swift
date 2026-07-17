@@ -4,7 +4,7 @@ import Foundation
 /// chunk changed so a live watcher can emit precise upserts. Consecutive assistant API messages
 /// (interleaved with tool results) merge into one turn, mirroring the bridge's own runner; the
 /// open turn is part of ``snapshot`` so an in-flight response is visible mid-turn.
-struct TranscriptFold {
+struct TranscriptFold: Sendable {
     private var messages: [Message] = []
     private var turn: Message?
     private var toolLocation: [String: (messageIndex: Int?, partIndex: Int)] = [:]
@@ -25,17 +25,21 @@ struct TranscriptFold {
         self = TranscriptFold()
     }
 
+    /// Scans with a cursor and trims the consumed prefix once at the end —
+    /// removing each line from the front of a whole-file feed is quadratic.
     mutating func consume(_ data: Data) -> Set<String> {
         pending.append(data)
         var changed = Set<String>()
-        while let newline = pending.firstIndex(of: 0x0A) {
-            let lineData = pending[pending.startIndex..<newline]
-            pending.removeSubrange(pending.startIndex...newline)
+        var start = pending.startIndex
+        while let newline = pending[start...].firstIndex(of: 0x0A) {
+            let lineData = pending[start..<newline]
+            start = pending.index(after: newline)
             guard lineData.count > 1,
                 let line = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any]
             else { continue }
             ingest(line, changed: &changed)
         }
+        pending = Data(pending[start...])
         return changed
     }
 

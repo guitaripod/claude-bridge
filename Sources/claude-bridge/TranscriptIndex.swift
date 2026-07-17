@@ -22,11 +22,21 @@ actor TranscriptIndex {
         var turnClosed = false
     }
 
+    struct FoldState: Sendable {
+        var fold: TranscriptFold
+        var offset: Int
+        var includeSidechain: Bool
+    }
+
     private let root: URL
     private let defaultModel: String
     private let defaultEffort: String
     private var cache: [String: CacheSlot] = [:]
     private var pathByID: [String: String] = [:]
+    private var folds: [String: FoldState] = [:]
+    private var foldOrder: [String] = []
+    private var foldTasks: [String: Task<FoldState?, Never>] = [:]
+    private static let foldCacheLimit = 24
 
     init(root: URL, defaultModel: String, defaultEffort: String) {
         self.root = root
@@ -116,15 +126,25 @@ actor TranscriptIndex {
 
     static let subagentActivityWindow: TimeInterval = 90
 
-    private var resolvedCache: [String: (size: Int, ids: Set<String>)] = [:]
+    private var resolvedCache: [String: (offset: Int, ids: Set<String>)] = [:]
 
+    /// Incremental: only bytes appended since the last call are scanned (with a small
+    /// overlap so a marker split across reads isn't missed). A full-file scan of a
+    /// growing transcript on every poll starves the actor for minutes.
     private func resolvedTools(transcriptPath: String) -> Set<String> {
-        let size =
-            (try? FileManager.default.attributesOfItem(atPath: transcriptPath))?[.size] as? Int ?? 0
-        if let cached = resolvedCache[transcriptPath], cached.size == size { return cached.ids }
-        let ids = TranscriptParser.resolvedToolIDs(atPath: transcriptPath)
-        resolvedCache[transcriptPath] = (size, ids)
-        return ids
+        var cached = resolvedCache[transcriptPath] ?? (0, [])
+        guard let handle = FileHandle(forReadingAtPath: transcriptPath) else { return cached.ids }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
+        if size < cached.offset { cached = (0, []) }
+        guard size > cached.offset else { return cached.ids }
+        let start = max(0, cached.offset - 64)
+        try? handle.seek(toOffset: UInt64(start))
+        guard let data = try? handle.read(upToCount: size - start) else { return cached.ids }
+        cached.ids.formUnion(TranscriptParser.toolUseIDs(in: data))
+        cached.offset = size
+        resolvedCache[transcriptPath] = cached
+        return cached.ids
     }
 
     /// Agent ids a workflow run's journal records a result for — the
@@ -194,14 +214,14 @@ actor TranscriptIndex {
             }
     }
 
-    func subagentMessages(sessionID: String, agentID: String) -> [Message]? {
+    func subagentMessages(sessionID: String, agentID: String) async -> [Message]? {
         guard let transcriptPath = path(for: sessionID),
             agentID.allSatisfy({ $0.isLetter || $0.isNumber })
         else { return nil }
         for dir in Self.sidecarDirs(transcriptPath: transcriptPath) {
             let file = dir.appendingPathComponent("agent-\(agentID).jsonl")
             if FileManager.default.fileExists(atPath: file.path) {
-                return TranscriptParser.messages(at: file, includeSidechain: true)
+                return await foldedMessages(atPath: file.path, includeSidechain: true)
             }
         }
         return nil
@@ -237,13 +257,14 @@ actor TranscriptIndex {
         return latest > threshold
     }
 
-    /// Fully parses the transcript into a `Session` suitable for display or adoption.
-    func session(_ id: String) -> Session? {
+    /// Parses the transcript into a `Session` suitable for display or adoption. Incremental:
+    /// only bytes appended since the last fetch are read and folded.
+    func session(_ id: String) async -> Session? {
         if pathByID[id] == nil { scan() }
         guard let path = pathByID[id], let slot = cache[path], let entry = slot.entry else {
             return nil
         }
-        let messages = TranscriptParser.messages(at: URL(fileURLWithPath: path))
+        let messages = await foldedMessages(atPath: path)
         return Session(
             id: entry.id,
             title: entry.title,
@@ -257,6 +278,85 @@ actor TranscriptIndex {
             lastCostUSD: nil,
             lastTokens: nil,
             pendingFork: nil)
+    }
+
+    /// Messages folded from a transcript, served from a per-path incremental cache: the fold
+    /// state persists between calls and only appended bytes are read and parsed. The read+parse
+    /// runs off the actor, so a large first parse never blocks other index consumers.
+    func foldedMessages(atPath path: String, includeSidechain: Bool = false) async -> [Message] {
+        await advanceFold(atPath: path, includeSidechain: includeSidechain)?.fold.snapshot ?? []
+    }
+
+    /// Fold state advanced to end-of-file, handed to the watcher so tailing continues from the
+    /// bytes history parsing already consumed instead of re-reading the whole file.
+    func foldHandoff(atPath path: String) async -> FoldState? {
+        await advanceFold(atPath: path, includeSidechain: false)
+    }
+
+    /// Serialized per path by chaining onto the previous advance — never by
+    /// polling a shared slot, which can livelock the actor when a waiter
+    /// re-checks faster than the owner's continuation clears it.
+    private func advanceFold(atPath path: String, includeSidechain: Bool) async -> FoldState? {
+        let previous = foldTasks[path]
+        let task = Task<FoldState?, Never> { [weak self] in
+            _ = await previous?.value
+            return await self?.performAdvance(path: path, includeSidechain: includeSidechain)
+        }
+        foldTasks[path] = task
+        return await task.value
+    }
+
+    private func performAdvance(path: String, includeSidechain: Bool) async -> FoldState? {
+        let prior = folds[path].flatMap { $0.includeSidechain == includeSidechain ? $0 : nil }
+        let parse = Task.detached(priority: .userInitiated) {
+            Self.advance(prior, path: path, includeSidechain: includeSidechain)
+        }
+        let state = await parse.value
+        if let state {
+            folds[path] = state
+            touchFold(path)
+        } else {
+            folds[path] = nil
+            foldOrder.removeAll { $0 == path }
+            foldTasks[path] = nil
+        }
+        return state
+    }
+
+    private nonisolated static func advance(
+        _ prior: FoldState?, path: String, includeSidechain: Bool
+    ) -> FoldState? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
+        var state =
+            prior
+            ?? FoldState(
+                fold: TranscriptFold(includeSidechain: includeSidechain), offset: 0,
+                includeSidechain: includeSidechain)
+        if size < state.offset {
+            state = FoldState(
+                fold: TranscriptFold(includeSidechain: includeSidechain), offset: 0,
+                includeSidechain: includeSidechain)
+        }
+        guard size > state.offset else { return state }
+        try? handle.seek(toOffset: UInt64(state.offset))
+        guard let data = try? handle.read(upToCount: size - state.offset), !data.isEmpty else {
+            return state
+        }
+        _ = state.fold.consume(data)
+        state.offset += data.count
+        return state
+    }
+
+    private func touchFold(_ path: String) {
+        foldOrder.removeAll { $0 == path }
+        foldOrder.append(path)
+        while foldOrder.count > Self.foldCacheLimit {
+            let evicted = foldOrder.removeFirst()
+            folds[evicted] = nil
+            foldTasks[evicted] = nil
+        }
     }
 
     static let activityWindow: TimeInterval = 180
@@ -435,21 +535,18 @@ enum TranscriptParser {
     }
 
     /// Tool-use ids that already have a result recorded in the transcript —
-    /// a subagent whose spawning Task call is resolved has finished.
-    static func resolvedToolIDs(atPath path: String) -> Set<String> {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-            let text = String(data: data, encoding: .utf8)
-        else { return [] }
+    /// a subagent whose spawning Task call is resolved has finished. Byte
+    /// scan, never a String walk: grapheme-aware searching of a transcript
+    /// this size takes minutes.
+    static func toolUseIDs(in data: Data) -> Set<String> {
+        let marker = Data("\"tool_use_id\":\"".utf8)
         var ids = Set<String>()
-        var search = text.startIndex
-        while let range = text.range(of: "\"tool_use_id\":\"", range: search..<text.endIndex) {
-            let tail = text[range.upperBound...]
-            if let close = tail.firstIndex(of: "\"") {
-                ids.insert(String(tail[..<close]))
-                search = close
-            } else {
-                break
-            }
+        var search = data.startIndex
+        while let range = data.range(of: marker, in: search..<data.endIndex) {
+            let tail = data[range.upperBound...]
+            guard let close = tail.firstIndex(of: 0x22) else { break }
+            ids.insert(String(decoding: data[range.upperBound..<close], as: UTF8.self))
+            search = close
         }
         return ids
     }

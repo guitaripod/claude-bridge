@@ -37,8 +37,13 @@ actor TranscriptWatcher {
 
     private nonisolated func tail(sessionID: String, transcriptID: String, path: String) async {
         let caster = await store.broadcaster(for: sessionID)
-        var fold = TranscriptFold()
-        var offset = primeSilently(&fold, path: path)
+        var fold: TranscriptFold
+        var offset: Int
+        if let primed = await index.foldHandoff(atPath: path) {
+            (fold, offset) = (primed.fold, primed.offset)
+        } else {
+            (fold, offset) = (TranscriptFold(), 0)
+        }
         var emittedRunning = false
         var lastGrowth = Date()
         var suppressedUntil = Date.distantPast
@@ -57,8 +62,12 @@ actor TranscriptWatcher {
             guard let size = fileSize(path) else { break }
 
             if size < offset {
-                fold.reset()
-                offset = primeSilently(&fold, path: path)
+                if let primed = await index.foldHandoff(atPath: path) {
+                    (fold, offset) = (primed.fold, primed.offset)
+                } else {
+                    fold.reset()
+                    offset = 0
+                }
                 continue
             }
             guard size > offset else {
@@ -105,12 +114,6 @@ actor TranscriptWatcher {
                 emittedRunning = true
             }
         }
-    }
-
-    private nonisolated func primeSilently(_ fold: inout TranscriptFold, path: String) -> Int {
-        guard let data = FileManager.default.contents(atPath: path) else { return 0 }
-        _ = fold.consume(data)
-        return data.count
     }
 
     private nonisolated func fileSize(_ path: String) -> Int? {

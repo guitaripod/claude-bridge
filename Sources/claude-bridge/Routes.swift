@@ -212,16 +212,27 @@ func registerRoutes(
     router.get("sessions/:id/events") { _, context in
         let id = context.parameters.get("id") ?? ""
         let caster = await store.broadcaster(for: id)
-        await watcher.ensureTail(sessionID: id)
         let (_, stream) = caster.subscribe()
+        await watcher.ensureTail(sessionID: id)
+        let claudeID = (await store.get(id))?.claudeSessionID ?? id
+        let running: Bool
+        if await store.hasRunnerTurnInFlight(claudeSessionID: claudeID) {
+            running = true
+        } else {
+            running = await index.isWriting(claudeID, within: 30)
+        }
         let body = ResponseBody { writer in
-            for await event in stream {
+            func write(_ event: BridgeEvent) async throws {
                 let data = (try? JSONCoding.encoder.encode(event)) ?? Data()
                 var buffer = ByteBuffer()
                 buffer.writeString("data: ")
                 buffer.writeBytes(data)
                 buffer.writeString("\n\n")
                 try await writer.write(buffer)
+            }
+            try await write(.status(running ? "running" : "idle"))
+            for await event in stream {
+                try await write(event)
             }
             try await writer.finish(nil)
         }
