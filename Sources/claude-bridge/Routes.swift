@@ -17,9 +17,13 @@ private func decodeBody<T: Decodable>(_ type: T.Type, _ request: Request) async 
     return try JSONCoding.decoder.decode(T.self, from: Data(buffer.readableBytesView))
 }
 
+private func isValidDeviceToken(_ token: String) -> Bool {
+    !token.isEmpty && token.count <= 200 && token.allSatisfy(\.isHexDigit)
+}
+
 func registerRoutes(
     _ router: Router<BasicRequestContext>, store: SessionStore, index: TranscriptIndex,
-    watcher: TranscriptWatcher, agentModel: String
+    watcher: TranscriptWatcher, agentModel: String, hasAuth: Bool
 ) {
     @Sendable func adoptIfNeeded(_ id: String) async {
         guard await store.get(id) == nil, let discovered = await index.session(id) else { return }
@@ -104,6 +108,37 @@ func registerRoutes(
             return jsonResponse(["error": "bad request"], status: .badRequest)
         }
         await store.pusher.register(body, sessionID: id)
+        return jsonResponse(["ok": true])
+    }
+
+    router.post("push/device") { request, _ in
+        guard hasAuth else {
+            return jsonResponse(
+                ["error": "device registration requires BRIDGE_PASSWORD to be set"],
+                status: .forbidden)
+        }
+        guard let body = try? await decodeBody(DeviceRegisterRequest.self, request),
+            isValidDeviceToken(body.token),
+            body.environment == "development" || body.environment == "production"
+        else {
+            return jsonResponse(["error": "bad request"], status: .badRequest)
+        }
+        await store.devicePusher.register(token: body.token, environment: body.environment)
+        return jsonResponse(["ok": true])
+    }
+
+    router.post("push/device/unregister") { request, _ in
+        guard hasAuth else {
+            return jsonResponse(
+                ["error": "device registration requires BRIDGE_PASSWORD to be set"],
+                status: .forbidden)
+        }
+        guard let body = try? await decodeBody(DeviceRegisterRequest.self, request),
+            isValidDeviceToken(body.token)
+        else {
+            return jsonResponse(["error": "bad request"], status: .badRequest)
+        }
+        await store.devicePusher.unregister(token: body.token)
         return jsonResponse(["ok": true])
     }
 

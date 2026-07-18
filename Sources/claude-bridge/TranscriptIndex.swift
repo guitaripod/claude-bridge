@@ -94,6 +94,12 @@ actor TranscriptIndex {
         return ids
     }
 
+    /// Machine-wide "someone is working" signal: any session with an open turn
+    /// or subagent sidecar activity within the window.
+    func anyActivity(within seconds: TimeInterval) -> Bool {
+        !activeIDs(within: seconds).isEmpty
+    }
+
     /// Directories that can hold subagent transcripts: the session's
     /// `subagents/` dir plus one `workflows/<runID>/` level beneath it.
     nonisolated static func sidecarDirs(transcriptPath: String) -> [URL] {

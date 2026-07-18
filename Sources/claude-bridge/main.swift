@@ -28,6 +28,24 @@ func enforceFailClosedStartup(password: String, permissionMode: String) {
     exit(1)
 }
 
+/// Notices external sessions going idle even when no SSE subscriber is attached
+/// (the watcher's in-tail idle detection only runs while someone is streaming):
+/// sweeps transcript activity and, on the active-to-idle edge, triggers the
+/// coalesced silent usage push.
+func startExternalIdleSweep(index: TranscriptIndex, store: SessionStore) {
+    Task {
+        var wasActive = false
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(20))
+            let active = await index.anyActivity(within: 30)
+            if wasActive, !active {
+                await store.devicePusher.noteExternalIdle()
+            }
+            wasActive = active
+        }
+    }
+}
+
 let home = FileManager.default.homeDirectoryForCurrentUser.path
 let port = Int(env("BRIDGE_PORT", "4098")) ?? 4098
 let bindAddress = env("BRIDGE_BIND", "127.0.0.1")
@@ -46,21 +64,24 @@ try? FileManager.default.createDirectory(
     at: URL(fileURLWithPath: workdir), withIntermediateDirectories: true)
 
 let apnsKeyPath = env("BRIDGE_APNS_KEY", "")
-let apnsConfig: LiveActivityPusher.Config? = {
+let apnsClient: APNSClient? = {
     guard !apnsKeyPath.isEmpty,
         let pem = try? String(contentsOfFile: apnsKeyPath, encoding: .utf8)
     else { return nil }
-    return LiveActivityPusher.Config(
+    return APNSClient(config: APNSClient.Config(
         keyPEM: pem,
         keyID: env("BRIDGE_APNS_KEY_ID", ""),
         teamID: env("BRIDGE_APNS_TEAM_ID", ""),
-        topic: env("BRIDGE_APNS_TOPIC", "com.guitaripod.tailscode.push-type.liveactivity"))
+        topic: env("BRIDGE_APNS_TOPIC", "com.guitaripod.tailscode.push-type.liveactivity")))
 }()
 
 let store = SessionStore(
     runner: ClaudeRunner(claudePath: claudePath, workdir: workdir, permissionMode: permissionMode),
     defaultModel: defaultModel, defaultEffort: defaultEffort, storeURL: storeURL,
-    projectsDir: projectsDir, pusher: LiveActivityPusher(config: apnsConfig))
+    projectsDir: projectsDir, pusher: LiveActivityPusher(client: apnsClient),
+    devicePusher: DevicePusher(
+        client: apnsClient,
+        devicesURL: storeURL.deletingLastPathComponent().appendingPathComponent("devices.json")))
 
 let router = Router()
 if !password.isEmpty {
@@ -70,7 +91,10 @@ let index = TranscriptIndex(
     root: URL(fileURLWithPath: projectsDir), defaultModel: defaultModel,
     defaultEffort: defaultEffort)
 let watcher = TranscriptWatcher(index: index, store: store)
-registerRoutes(router, store: store, index: index, watcher: watcher, agentModel: defaultModel)
+registerRoutes(
+    router, store: store, index: index, watcher: watcher, agentModel: defaultModel,
+    hasAuth: !password.isEmpty)
+startExternalIdleSweep(index: index, store: store)
 
 let app = Application(
     router: router,

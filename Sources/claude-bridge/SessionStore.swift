@@ -36,14 +36,17 @@ actor SessionStore {
     private let storeURL: URL
     private let projectsDir: String
     let pusher: LiveActivityPusher
+    let devicePusher: DevicePusher
     private var hiddenTranscripts: Set<String>
     private var runnerTurnClaudeIDs: Set<String> = []
 
     init(
         runner: ClaudeRunner, defaultModel: String, defaultEffort: String, storeURL: URL,
-        projectsDir: String = "", pusher: LiveActivityPusher = LiveActivityPusher(config: nil)
+        projectsDir: String = "", pusher: LiveActivityPusher = LiveActivityPusher(client: nil),
+        devicePusher: DevicePusher = DevicePusher(client: nil, devicesURL: nil)
     ) {
         self.pusher = pusher
+        self.devicePusher = devicePusher
         self.runner = runner
         self.defaultModel = defaultModel
         self.defaultEffort = defaultEffort
@@ -206,6 +209,7 @@ actor SessionStore {
         let turnClaudeID = resume ?? id
         runnerTurnClaudeIDs.insert(turnClaudeID)
         Task {
+            let turnStart = Date()
             let outcome = await runner.run(
                 prompt: text, resume: resume, model: model, effort: effort, fork: fork,
                 directory: directory,
@@ -217,7 +221,8 @@ actor SessionStore {
                         await self.pusher.noteEvent(event, sessionID: id)
                     }
                 })
-            await self.finishTurn(id, outcome: outcome, turnClaudeID: turnClaudeID)
+            await self.finishTurn(
+                id, outcome: outcome, turnClaudeID: turnClaudeID, startedAt: turnStart)
         }
     }
 
@@ -286,7 +291,10 @@ actor SessionStore {
 
     private var lastRunnerFinish: [String: Date] = [:]
 
-    private func finishTurn(_ id: String, outcome: ClaudeRunner.Outcome, turnClaudeID: String) {
+    private func finishTurn(
+        _ id: String, outcome: ClaudeRunner.Outcome, turnClaudeID: String, startedAt: Date
+    ) {
+        let turnDuration = Date().timeIntervalSince(startedAt)
         turnProcessIDs[id] = nil
         liveTurns[id] = nil
         runnerTurnClaudeIDs.remove(turnClaudeID)
@@ -307,7 +315,13 @@ actor SessionStore {
             if case .tool = part { return true }
             return false
         }
-        Task { await pusher.endTurn(sessionID: id, toolCount: toolCount, failed: false) }
+        let title = session.title
+        Task {
+            await pusher.endTurn(sessionID: id, toolCount: toolCount, failed: false)
+            await devicePusher.pushTurnEnd(
+                sessionID: id, title: title, toolCount: toolCount, failed: false,
+                duration: turnDuration)
+        }
     }
 
     /// After the first completed turn (and after /clear), replace the

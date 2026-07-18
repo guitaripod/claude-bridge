@@ -85,6 +85,7 @@ actor TranscriptWatcher {
                     if Date().timeIntervalSince(lastGrowth) > Self.idleAfter {
                         caster.send(.status("idle"))
                         emittedRunning = false
+                        await store.devicePusher.noteExternalIdle()
                     } else {
                         caster.send(.status("running"))
                     }
@@ -109,6 +110,7 @@ actor TranscriptWatcher {
             if TranscriptParser.isTurnClosed(atPath: path) {
                 caster.send(.status("idle"))
                 emittedRunning = false
+                await store.devicePusher.noteExternalIdle()
             } else if !emittedRunning {
                 caster.send(.status("running"))
                 emittedRunning = true
