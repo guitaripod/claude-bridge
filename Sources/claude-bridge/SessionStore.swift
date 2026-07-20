@@ -216,7 +216,7 @@ actor SessionStore {
         let runner = self.runner
         let resume = session.claudeSessionID
         let model = session.model
-        let effort = session.effort
+        let effort = session.effort.isEmpty ? defaultEffort : session.effort
         let text = request.text
         let fork = session.pendingFork == true
         let directory = session.directory

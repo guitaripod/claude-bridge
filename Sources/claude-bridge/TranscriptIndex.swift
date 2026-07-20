@@ -277,7 +277,7 @@ actor TranscriptIndex {
             directory: entry.directory,
             claudeSessionID: entry.id,
             model: entry.model ?? defaultModel,
-            effort: defaultEffort,
+            effort: "",
             createdAt: entry.createdAt,
             updatedAt: entry.updatedAt,
             messages: messages,
@@ -457,7 +457,9 @@ enum TranscriptParser {
                 createdAt = parseTimestamp(stamp)
             }
             let message = line["message"] as? [String: Any]
-            if model == nil, let value = message?["model"] as? String { model = value }
+            if model == nil, let value = message?["model"] as? String, value != "<synthetic>" {
+                model = value
+            }
             guard title == nil, isRealLine(line), line["type"] as? String == "user",
                 let content = message?["content"] as? String
             else { continue }
