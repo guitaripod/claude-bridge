@@ -159,6 +159,19 @@ actor SessionStore {
         persist()
     }
 
+    /// Every transcript id a session has owned — its current and prior Claude
+    /// ids, plus its own id when that is itself a transcript. Deleting a session
+    /// hides all of them so a rotated or compacted transcript can't resurface as
+    /// a "discovered" card once its owner is gone.
+    func ownedTranscriptIDs(_ id: String) -> Set<String> {
+        var ids: Set<String> = [id]
+        if let session = sessions[id] {
+            if let claude = session.claudeSessionID { ids.insert(claude) }
+            if let priors = session.priorClaudeSessionIDs { ids.formUnion(priors) }
+        }
+        return ids
+    }
+
     /// Resets a session to a fresh Claude conversation (drops history and the resumable id).
     func clear(_ id: String) {
         guard var session = sessions[id] else { return }

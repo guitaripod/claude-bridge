@@ -170,9 +170,10 @@ func registerRoutes(
 
     router.delete("sessions/:id") { _, context in
         let id = context.parameters.get("id") ?? ""
+        let transcripts = await store.ownedTranscriptIDs(id)
         await store.delete(id)
-        if await index.contains(id) {
-            await store.hideTranscript(id)
+        for transcript in transcripts where await index.contains(transcript) {
+            await store.hideTranscript(transcript)
         }
         return jsonResponse(["ok": true])
     }
