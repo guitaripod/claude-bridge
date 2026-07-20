@@ -22,6 +22,7 @@ struct ClaudeRunner: Sendable {
         fork: Bool = false,
         directory: String? = nil,
         onStart: (@Sendable (Int32) -> Void)? = nil,
+        onSessionID: (@Sendable (String) -> Void)? = nil,
         emit: @Sendable @escaping (BridgeEvent) -> Void
     ) async -> Outcome {
         let cwd = directory ?? workdir
@@ -75,11 +76,16 @@ struct ClaudeRunner: Sendable {
         }
 
         onStart?(process.processIdentifier)
+        var reportedSessionID: String?
         for await line in lines {
             guard let data = line.data(using: .utf8),
                 let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { continue }
             assembler.ingest(object, emit: emit)
+            if let sid = assembler.sessionID, sid != reportedSessionID {
+                reportedSessionID = sid
+                onSessionID?(sid)
+            }
         }
         process.waitUntilExit()
 

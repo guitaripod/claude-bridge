@@ -83,6 +83,7 @@ actor SessionStore {
         var claimed = Set(sessions.keys)
         for session in sessions.values {
             if let claudeID = session.claudeSessionID { claimed.insert(claudeID) }
+            if let priors = session.priorClaudeSessionIDs { claimed.formUnion(priors) }
         }
         return (claimed, hiddenTranscripts)
     }
@@ -163,6 +164,7 @@ actor SessionStore {
         guard var session = sessions[id] else { return }
         session.messages = []
         session.claudeSessionID = nil
+        session.priorClaudeSessionIDs = nil
         session.autoTitled = nil
         session.updatedAt = Date()
         sessions[id] = session
@@ -214,6 +216,7 @@ actor SessionStore {
                 prompt: text, resume: resume, model: model, effort: effort, fork: fork,
                 directory: directory,
                 onStart: { pid in Task { await self.registerTurnProcess(id, pid: pid) } },
+                onSessionID: { sid in Task { await self.linkClaudeSession(id, claudeSessionID: sid) } },
                 emit: { event in
                     caster.send(event)
                     Task {
@@ -268,6 +271,32 @@ actor SessionStore {
         turnProcessIDs[id] = pid
     }
 
+    /// Links the real Claude session id onto a stored session as soon as the runner reports it
+    /// (the stream's `init` event), so the session's own live transcript counts as claimed for the
+    /// whole first turn instead of surfacing as a second, effort-less "discovered" card alongside it.
+    /// Handles mid-conversation id rotation (compaction/resume mints a fresh transcript id): the
+    /// superseded id is retained via ``setClaudeSessionID(_:on:)`` so its transcript stays claimed.
+    private func linkClaudeSession(_ id: String, claudeSessionID sid: String) {
+        guard var session = sessions[id], session.claudeSessionID != sid else { return }
+        let supersededTurnID = session.claudeSessionID ?? id
+        if runnerTurnClaudeIDs.remove(supersededTurnID) != nil { runnerTurnClaudeIDs.insert(sid) }
+        setClaudeSessionID(sid, on: &session)
+        sessions[id] = session
+        persist()
+    }
+
+    /// Repoints a session at a new resumable Claude id, preserving any id it
+    /// replaces so the superseded (rotated/compacted) transcript stays claimed
+    /// and never resurfaces as a duplicate discovered session.
+    private func setClaudeSessionID(_ new: String?, on session: inout Session) {
+        if let old = session.claudeSessionID, old != new {
+            var priors = session.priorClaudeSessionIDs ?? []
+            if !priors.contains(old) { priors.append(old) }
+            session.priorClaudeSessionIDs = priors
+        }
+        session.claudeSessionID = new
+    }
+
     /// Stops a turn this bridge is running by terminating its claude process;
     /// the runner's stream ends and the partial turn is persisted normally.
     func abortTurn(_ id: String) -> Bool {
@@ -299,10 +328,13 @@ actor SessionStore {
         liveTurns[id] = nil
         runnerTurnClaudeIDs.remove(turnClaudeID)
         lastRunnerFinish[turnClaudeID] = Date()
-        if let newID = outcome.claudeSessionID { lastRunnerFinish[newID] = Date() }
+        if let newID = outcome.claudeSessionID {
+            runnerTurnClaudeIDs.remove(newID)
+            lastRunnerFinish[newID] = Date()
+        }
         guard var session = sessions[id] else { return }
         session.messages.append(outcome.message)
-        session.claudeSessionID = outcome.claudeSessionID
+        setClaudeSessionID(outcome.claudeSessionID, on: &session)
         session.pendingFork = nil
         if let cost = outcome.costUSD { session.lastCostUSD = cost }
         if let tokens = outcome.tokens { session.lastTokens = tokens }

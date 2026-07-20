@@ -63,6 +63,10 @@ struct Session: Codable, Sendable {
     var title: String
     var directory: String?
     var claudeSessionID: String?
+    /// Claude session ids this conversation resumed away from — kept so a
+    /// rotated or compacted transcript stays claimed and never resurfaces as a
+    /// duplicate "discovered" session alongside the live one.
+    var priorClaudeSessionIDs: [String]?
     var model: String
     var effort: String
     var createdAt: Date
