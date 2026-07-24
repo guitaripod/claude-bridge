@@ -12,8 +12,10 @@ private func jsonResponse<T: Encodable>(_ value: T, status: HTTPResponse.Status 
     return Response(status: status, headers: headers, body: .init(byteBuffer: buffer))
 }
 
-private func decodeBody<T: Decodable>(_ type: T.Type, _ request: Request) async throws -> T {
-    let buffer = try await request.body.collect(upTo: 1 << 20)
+private func decodeBody<T: Decodable>(
+    _ type: T.Type, _ request: Request, limit: Int = 1 << 20
+) async throws -> T {
+    let buffer = try await request.body.collect(upTo: limit)
     return try JSONCoding.decoder.decode(T.self, from: Data(buffer.readableBytesView))
 }
 
@@ -209,7 +211,7 @@ func registerRoutes(
 
     router.post("sessions/:id/message") { request, context in
         let id = context.parameters.get("id") ?? ""
-        guard let body = try? await decodeBody(SendRequest.self, request) else {
+        guard let body = try? await decodeBody(SendRequest.self, request, limit: 32 << 20) else {
             return jsonResponse(["error": "bad request"], status: .badRequest)
         }
         await adoptIfNeeded(id)

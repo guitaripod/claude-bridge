@@ -124,6 +124,16 @@ struct SendRequest: Codable, Sendable {
     var text: String
     var model: String?
     var effort: String?
+    var attachments: [SendAttachment]?
+}
+
+/// An uploaded file accompanying a prompt. The bridge writes it to disk and
+/// references its path in the prompt so headless Claude can `Read` it — the
+/// Read tool renders images natively, which gives true vision input.
+struct SendAttachment: Codable, Sendable {
+    var mime: String
+    var filename: String?
+    var dataBase64: String
 }
 
 struct CreateRequest: Codable, Sendable {

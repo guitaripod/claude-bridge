@@ -217,7 +217,7 @@ actor SessionStore {
         let resume = session.claudeSessionID
         let model = session.model
         let effort = session.effort.isEmpty ? defaultEffort : session.effort
-        let text = request.text
+        let text = promptText(for: request, sessionID: id)
         let fork = session.pendingFork == true
         let directory = session.directory
 
@@ -239,6 +239,72 @@ actor SessionStore {
                 })
             await self.finishTurn(
                 id, outcome: outcome, turnClaudeID: turnClaudeID, startedAt: turnStart)
+        }
+    }
+
+    /// Writes uploaded attachments to disk and appends their paths to the
+    /// prompt so headless Claude reads them with the Read tool (which renders
+    /// images natively — real vision input without touching the CLI's input
+    /// format). The stored user message keeps the clean original text; only
+    /// the runner sees the augmented prompt.
+    private func promptText(for request: SendRequest, sessionID: String) -> String {
+        let attachments = request.attachments ?? []
+        guard !attachments.isEmpty else { return request.text }
+        let dir = storeURL.deletingLastPathComponent()
+            .appendingPathComponent("attachments", isDirectory: true)
+            .appendingPathComponent(Self.safeFileComponent(sessionID), isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        var references: [String] = []
+        for attachment in attachments {
+            guard let data = Data(base64Encoded: attachment.dataBase64), !data.isEmpty else {
+                continue
+            }
+            let name = "\(UUID().uuidString.prefix(8))-\(Self.attachmentName(attachment))"
+            let url = dir.appendingPathComponent(name)
+            guard (try? data.write(to: url)) != nil else { continue }
+            let kind = attachment.mime.hasPrefix("image/") ? "image" : "file"
+            references.append("Attached \(kind) (use the Read tool to view it): \(url.path)")
+        }
+        Self.pruneAttachments(in: dir)
+        guard !references.isEmpty else { return request.text }
+        return request.text + "\n\n" + references.joined(separator: "\n")
+    }
+
+    private static func attachmentName(_ attachment: SendAttachment) -> String {
+        if let filename = attachment.filename {
+            let base = safeFileComponent((filename as NSString).lastPathComponent)
+            if !base.isEmpty { return String(base.suffix(64)) }
+        }
+        let ext = extensionForMime[attachment.mime] ?? "bin"
+        return "attachment.\(ext)"
+    }
+
+    private static let extensionForMime: [String: String] = [
+        "image/jpeg": "jpg", "image/png": "png", "image/heic": "heic", "image/gif": "gif",
+        "image/webp": "webp", "application/pdf": "pdf", "text/plain": "txt",
+    ]
+
+    private static func safeFileComponent(_ raw: String) -> String {
+        String(
+            raw.map {
+                $0.isLetter || $0.isNumber || $0 == "-" || $0 == "_" || $0 == "." ? $0 : "_"
+            })
+    }
+
+    /// Keeps a session's attachment directory bounded: oldest files beyond the
+    /// cap are deleted (they were only needed for the turn that referenced them).
+    private static func pruneAttachments(in dir: URL, cap: Int = 32) {
+        guard
+            let files = try? FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: [.contentModificationDateKey])
+        else { return }
+        guard files.count > cap else { return }
+        let dated = files.map { url in
+            (url, (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate ?? .distantPast)
+        }
+        for (url, _) in dated.sorted(by: { $0.1 < $1.1 }).prefix(files.count - cap) {
+            try? FileManager.default.removeItem(at: url)
         }
     }
 
