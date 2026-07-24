@@ -412,7 +412,11 @@ actor SessionStore {
             lastRunnerFinish[newID] = Date()
         }
         guard var session = sessions[id] else { return }
-        session.messages.append(outcome.message)
+        if let existing = session.messages.firstIndex(where: { $0.id == outcome.message.id }) {
+            session.messages[existing] = outcome.message
+        } else {
+            session.messages.append(outcome.message)
+        }
         setClaudeSessionID(outcome.claudeSessionID, on: &session)
         session.pendingFork = nil
         if let cost = outcome.costUSD { session.lastCostUSD = cost }
@@ -526,7 +530,22 @@ actor SessionStore {
         guard let data = try? Data(contentsOf: url),
             let stored = try? JSONCoding.decoder.decode([Session].self, from: data)
         else { return [] }
-        return stored
+        return stored.map { session in
+            var healed = session
+            healed.messages = dedupedByID(session.messages)
+            return healed
+        }
+    }
+
+    /// A concurrent-turn race once persisted the same assembled message twice;
+    /// heal any such duplicates on load, keeping the newest occurrence in place.
+    private static func dedupedByID(_ messages: [Message]) -> [Message] {
+        var lastIndexByID: [String: Int] = [:]
+        for (index, message) in messages.enumerated() { lastIndexByID[message.id] = index }
+        guard lastIndexByID.count != messages.count else { return messages }
+        return messages.enumerated().compactMap { index, message in
+            lastIndexByID[message.id] == index ? message : nil
+        }
     }
 
     /// Expands `~`, requires an existing absolute path; falls back to the

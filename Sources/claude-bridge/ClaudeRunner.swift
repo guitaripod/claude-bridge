@@ -121,16 +121,22 @@ struct ClaudeRunner: Sendable {
 }
 
 /// Folds Claude's stream-json events into a single assistant message, emitting incremental events.
+/// Parts keep stream order — narration text stays interleaved with the tool calls it describes
+/// instead of collapsing into one trailing blob.
 private struct Assembler {
     let messageID: String
     var sessionID: String?
     var costUSD: Double?
     var tokens: Int?
-    private var text = ""
-    private var thinking = ""
+    private enum Segment {
+        case text(String)
+        case thinking(String)
+        case tool(String)
+    }
+    private var segments: [Segment] = []
     private var tools: [String: ToolCall] = [:]
-    private var toolOrder: [String] = []
     private var currentBlock: (index: Int, toolID: String?)?
+    private var blockBoundary = true
 
     init(messageID: String) { self.messageID = messageID }
 
@@ -167,19 +173,31 @@ private struct Assembler {
                 let call = ToolCall(
                     id: id, name: block["name"] as? String ?? "tool", input: "", status: .running)
                 tools[id] = call
-                toolOrder.append(id)
+                segments.append(.tool(id))
                 currentBlock = (index, id)
+                blockBoundary = true
                 emit(.toolUpserted(messageID: messageID, call))
             } else {
                 currentBlock = (index, nil)
+                blockBoundary = true
             }
         case "content_block_delta":
             guard let delta = event["delta"] as? [String: Any] else { return }
             if let chunk = delta["text"] as? String {
-                text += chunk
+                if !blockBoundary, case .text(let existing) = segments.last {
+                    segments[segments.count - 1] = .text(existing + chunk)
+                } else {
+                    segments.append(.text(chunk))
+                    blockBoundary = false
+                }
                 emit(.partTextDelta(messageID: messageID, delta: chunk))
             } else if let chunk = delta["thinking"] as? String {
-                thinking += chunk
+                if !blockBoundary, case .thinking(let existing) = segments.last {
+                    segments[segments.count - 1] = .thinking(existing + chunk)
+                } else {
+                    segments.append(.thinking(chunk))
+                    blockBoundary = false
+                }
             } else if let partial = delta["partial_json"] as? String,
                 let toolID = currentBlock?.toolID
             {
@@ -209,11 +227,18 @@ private struct Assembler {
 
     func finalMessage() -> Message {
         var parts: [Part] = []
-        if !thinking.isEmpty { parts.append(.reasoning(thinking)) }
-        for id in toolOrder {
-            if let call = tools[id] { parts.append(.tool(call)) }
+        for segment in segments {
+            switch segment {
+            case .text(let value):
+                guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                parts.append(.text(value))
+            case .thinking(let value):
+                guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+                parts.append(.reasoning(value))
+            case .tool(let id):
+                if let call = tools[id] { parts.append(.tool(call)) }
+            }
         }
-        if !text.isEmpty { parts.append(.text(text)) }
         if parts.isEmpty { parts.append(.text("")) }
         return Message(id: messageID, role: .assistant, parts: parts, createdAt: Date())
     }
