@@ -254,6 +254,10 @@ func registerRoutes(
         let running: Bool
         if await store.hasRunnerTurnInFlight(claudeSessionID: claudeID) {
             running = true
+        } else if let path = await index.path(for: claudeID),
+            TranscriptParser.isTurnClosed(atPath: path)
+        {
+            running = false
         } else {
             running = await index.isWriting(claudeID, within: 30)
         }

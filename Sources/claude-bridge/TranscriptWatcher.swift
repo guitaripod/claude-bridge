@@ -48,7 +48,9 @@ actor TranscriptWatcher {
         var lastGrowth = Date()
         var suppressedUntil = Date.distantPast
 
-        if let mtime = mtime(path), Date().timeIntervalSince(mtime) < Self.idleAfter {
+        if let mtime = mtime(path), Date().timeIntervalSince(mtime) < Self.idleAfter,
+            !TranscriptParser.isTurnClosed(atPath: path)
+        {
             caster.send(.status("running"))
             emittedRunning = true
             if let open = fold.snapshot.last, open.role == .assistant {
@@ -71,6 +73,10 @@ actor TranscriptWatcher {
                 continue
             }
             guard size > offset else {
+                if await store.hasRunnerTurnInFlight(claudeSessionID: transcriptID) {
+                    suppressedUntil = Date().addingTimeInterval(Self.runnerGrace)
+                    continue
+                }
                 if Date() > suppressedUntil,
                     let sidecar = TranscriptParser.sidecarActivity(transcriptPath: path),
                     sidecar > lastGrowth
@@ -82,7 +88,9 @@ actor TranscriptWatcher {
                     }
                 }
                 if emittedRunning {
-                    if Date().timeIntervalSince(lastGrowth) > Self.idleAfter {
+                    if Date().timeIntervalSince(lastGrowth) > Self.idleAfter
+                        || TranscriptParser.isTurnClosed(atPath: path)
+                    {
                         caster.send(.status("idle"))
                         emittedRunning = false
                         await store.devicePusher.noteExternalIdle()
