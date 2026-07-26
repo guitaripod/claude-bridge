@@ -57,6 +57,9 @@ struct ClaudeRunner: Sendable {
         process.standardOutput = stdout
         process.standardError = FileHandle.nullDevice
 
+        let exit = ExitLatch()
+        process.terminationHandler = { _ in exit.signal() }
+
         emit(.status("running"))
         emit(
             .messageUpserted(
@@ -87,7 +90,7 @@ struct ClaudeRunner: Sendable {
                 onSessionID?(sid)
             }
         }
-        process.waitUntilExit()
+        await Self.awaitExit(of: process, latch: exit)
 
         let message = assembler.finalMessage()
         emit(.messageUpserted(message))
@@ -95,6 +98,34 @@ struct ClaudeRunner: Sendable {
         return Outcome(
             message: message, claudeSessionID: assembler.sessionID ?? claudeSessionID,
             costUSD: assembler.costUSD, tokens: assembler.tokens)
+    }
+
+    /// Waits for the child to die without ever calling `waitUntilExit()`.
+    /// That call spins the *calling* thread's run loop, but a Swift-concurrency
+    /// task resumes on whatever cooperative thread is free after an await — not
+    /// necessarily the one that launched the process — and the death
+    /// notification is then delivered to a run loop nobody is spinning. The
+    /// wait never returns: the turn never finishes, the session never leaves
+    /// "running", and the blocked cooperative thread is gone for good. The
+    /// termination handler fires on a Foundation-owned queue instead, with a
+    /// bounded fallback in case it is never called at all — stdout is already
+    /// at EOF by the time we get here, so the child is done in every normal case.
+    private static func awaitExit(of process: Process, latch: ExitLatch) async {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await latch.wait() }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(15))
+            }
+            await group.next()
+            group.cancelAll()
+        }
+        guard process.isRunning else { return }
+        log("child \(process.processIdentifier) outlived its output; terminating")
+        process.terminate()
+    }
+
+    private static func log(_ message: String) {
+        FileHandle.standardError.write(Data("[runner] \(message)\n".utf8))
     }
 
     /// Reads a file handle on a background thread, yielding complete newline-delimited lines.
@@ -114,8 +145,44 @@ struct ClaudeRunner: Sendable {
                         }
                     }
                 }
+                try? handle.close()
                 continuation.finish()
             }
+        }
+    }
+}
+
+/// One-shot exit signal: resumes whoever is awaiting the child, whether the
+/// termination handler fires before or after the wait begins, and lets a
+/// cancelled wait fall through instead of stranding the task.
+private final class ExitLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var signalled = false
+
+    func signal() {
+        lock.lock()
+        signalled = true
+        let waiter = continuation
+        continuation = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    func wait() async {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                if signalled {
+                    lock.unlock()
+                    continuation.resume()
+                    return
+                }
+                self.continuation = continuation
+                lock.unlock()
+            }
+        } onCancel: {
+            signal()
         }
     }
 }
