@@ -11,6 +11,11 @@ struct LiveActivityRegistration: Codable, Sendable {
     var title: String
 }
 
+private struct StoredActivity: Codable, Sendable {
+    var sessionID: String
+    var registration: LiveActivityRegistration
+}
+
 /// Drives the app's Live Activities over APNs while the phone is suspended:
 /// the app registers each activity's push token, and turn events push the
 /// same content-state shape the app renders locally. ActivityKit decodes the
@@ -26,17 +31,42 @@ actor LiveActivityPusher {
     }
 
     private let client: APNSClient?
-    private var entries: [String: Entry] = [:]
+    private let activitiesURL: URL?
+    private var entries: [String: Entry]
 
-    init(client: APNSClient?) {
+    init(client: APNSClient?, activitiesURL: URL? = nil) {
         self.client = client
+        self.activitiesURL = activitiesURL
+        entries = Self.load(from: activitiesURL)
     }
 
     var enabled: Bool { client != nil }
 
     func register(_ registration: LiveActivityRegistration, sessionID: String) {
         entries[sessionID] = Entry(registration: registration)
+        persist()
         log("live-activity token registered for \(sessionID) (\(registration.environment))")
+    }
+
+    /// Ends every activity left registered by a previous process. A turn cannot
+    /// survive the bridge dying, so anything still on a Lock Screen at startup
+    /// is a turn nobody will ever report the end of — the phone would otherwise
+    /// hold it until its stale date with no way for this process to reach it,
+    /// because the update token only ever lived in the dead process's memory.
+    func endOrphans() {
+        guard client != nil, !entries.isEmpty else {
+            entries = [:]
+            persist()
+            return
+        }
+        log("ending \(entries.count) live-activity(s) orphaned by a restart")
+        for (sessionID, entry) in entries {
+            push(
+                sessionID: sessionID, entry: entry, event: "end", phase: "done",
+                statusText: "Reconnect to see how it ended", endedAt: Date(), dismissAfter: 0)
+        }
+        entries = [:]
+        persist()
     }
 
     func noteEvent(_ event: BridgeEvent, sessionID: String) {
@@ -73,6 +103,7 @@ actor LiveActivityPusher {
 
     func endTurn(sessionID: String, toolCount: Int?, failed: Bool) {
         guard client != nil, let entry = entries.removeValue(forKey: sessionID) else { return }
+        persist()
         let tools = max(entry.toolCount, toolCount ?? 0)
         let duration = Date().timeIntervalSince(entry.registration.startedAt)
         let summary: String
@@ -96,7 +127,7 @@ actor LiveActivityPusher {
 
     private func push(
         sessionID: String, entry: Entry, event: String,
-        phase: String, statusText: String, endedAt: Date?
+        phase: String, statusText: String, endedAt: Date?, dismissAfter: TimeInterval = 30
     ) {
         guard let client else { return }
         var contentState: [String: Any] = [
@@ -114,7 +145,7 @@ actor LiveActivityPusher {
             "content-state": contentState,
         ]
         if event == "end" {
-            aps["dismissal-date"] = Int(Date().addingTimeInterval(30).timeIntervalSince1970)
+            aps["dismissal-date"] = Int(Date().addingTimeInterval(dismissAfter).timeIntervalSince1970)
         }
         let registration = entry.registration
         guard let body = try? JSONSerialization.data(withJSONObject: ["aps": aps]) else { return }
@@ -134,6 +165,26 @@ actor LiveActivityPusher {
         } else {
             log("live-activity push failed \(status): \(reason ?? "no reason")")
         }
+    }
+
+    private static func load(from url: URL?) -> [String: Entry] {
+        guard let url, let data = try? Data(contentsOf: url),
+            let stored = try? JSONCoding.decoder.decode([StoredActivity].self, from: data)
+        else { return [:] }
+        return Dictionary(
+            stored.map { ($0.sessionID, Entry(registration: $0.registration)) },
+            uniquingKeysWith: { _, new in new })
+    }
+
+    private func persist() {
+        guard let activitiesURL else { return }
+        let snapshot = entries
+            .map { StoredActivity(sessionID: $0.key, registration: $0.value.registration) }
+            .sorted { $0.sessionID < $1.sessionID }
+        guard let data = try? JSONCoding.encoder.encode(snapshot) else { return }
+        try? FileManager.default.createDirectory(
+            at: activitiesURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: activitiesURL, options: .atomic)
     }
 
     private func log(_ message: String) {

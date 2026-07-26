@@ -78,7 +78,11 @@ let apnsClient: APNSClient? = {
 let store = SessionStore(
     runner: ClaudeRunner(claudePath: claudePath, workdir: workdir, permissionMode: permissionMode),
     defaultModel: defaultModel, defaultEffort: defaultEffort, storeURL: storeURL,
-    projectsDir: projectsDir, pusher: LiveActivityPusher(client: apnsClient),
+    projectsDir: projectsDir,
+    pusher: LiveActivityPusher(
+        client: apnsClient,
+        activitiesURL: storeURL.deletingLastPathComponent()
+            .appendingPathComponent("live-activities.json")),
     devicePusher: DevicePusher(
         client: apnsClient,
         devicesURL: storeURL.deletingLastPathComponent().appendingPathComponent("devices.json")))
@@ -92,6 +96,7 @@ let index = TranscriptIndex(
     defaultEffort: defaultEffort)
 let watcher = TranscriptWatcher(index: index, store: store)
 await store.attach(index: index)
+await store.pusher.endOrphans()
 registerRoutes(
     router, store: store, index: index, watcher: watcher, agentModel: defaultModel,
     hasAuth: !password.isEmpty)
