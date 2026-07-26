@@ -212,8 +212,10 @@ actor SessionStore {
         if let model = request.model { session.model = model }
         if let effort = request.effort { session.effort = effort }
 
+        let upload = storeAttachments(for: request, sessionID: id)
         let userMessage = Message(
-            id: UUID().uuidString, role: .user, parts: [.text(request.text)], createdAt: Date())
+            id: UUID().uuidString, role: .user,
+            parts: upload.files.map { Part.file($0) } + [.text(request.text)], createdAt: Date())
         session.messages.append(userMessage)
         if session.title == "New chat"
             || (session.customTitle != true && session.messages.count <= 1)
@@ -232,7 +234,7 @@ actor SessionStore {
         let resume = session.claudeSessionID
         let model = session.model
         let effort = session.effort.isEmpty ? defaultEffort : session.effort
-        let text = promptText(for: request, sessionID: id)
+        let text = upload.prompt
         let fork = session.pendingFork == true
         let directory = session.directory
 
@@ -260,16 +262,22 @@ actor SessionStore {
     /// Writes uploaded attachments to disk and appends their paths to the
     /// prompt so headless Claude reads them with the Read tool (which renders
     /// images natively — real vision input without touching the CLI's input
-    /// format). The stored user message keeps the clean original text; only
-    /// the runner sees the augmented prompt.
-    private func promptText(for request: SendRequest, sessionID: String) -> String {
+    /// format). The stored user message keeps the clean original text plus a
+    /// file part per attachment, so a client can render what it sent — and can
+    /// still render it after a reload, on another device, from the bytes the
+    /// bridge kept. Only the runner sees the augmented prompt.
+    private func storeAttachments(
+        for request: SendRequest, sessionID: String
+    ) -> (prompt: String, files: [FileRef]) {
         let attachments = request.attachments ?? []
-        guard !attachments.isEmpty else { return request.text }
+        guard !attachments.isEmpty else { return (request.text, []) }
+        let session = Self.safeFileComponent(sessionID)
         let dir = storeURL.deletingLastPathComponent()
             .appendingPathComponent("attachments", isDirectory: true)
-            .appendingPathComponent(Self.safeFileComponent(sessionID), isDirectory: true)
+            .appendingPathComponent(session, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         var references: [String] = []
+        var files: [FileRef] = []
         for attachment in attachments {
             guard let data = Data(base64Encoded: attachment.dataBase64), !data.isEmpty else {
                 continue
@@ -279,10 +287,29 @@ actor SessionStore {
             guard (try? data.write(to: url)) != nil else { continue }
             let kind = attachment.mime.hasPrefix("image/") ? "image" : "file"
             references.append("Attached \(kind) (use the Read tool to view it): \(url.path)")
+            files.append(
+                FileRef(
+                    path: url.path, mime: attachment.mime,
+                    filename: attachment.filename ?? name,
+                    url: "/attachments/\(session)/\(name)"))
         }
         Self.pruneAttachments(in: dir)
-        guard !references.isEmpty else { return request.text }
-        return request.text + "\n\n" + references.joined(separator: "\n")
+        guard !references.isEmpty else { return (request.text, files) }
+        return (request.text + "\n\n" + references.joined(separator: "\n"), files)
+    }
+
+    /// Absolute path of a stored attachment, or nil if the name escapes the
+    /// session's own directory — the only paths this bridge will hand back.
+    nonisolated func attachmentURL(session: String, name: String) -> URL? {
+        let root = storeURL.deletingLastPathComponent()
+            .appendingPathComponent("attachments", isDirectory: true)
+            .resolvingSymlinksInPath()
+        let file = root
+            .appendingPathComponent(Self.safeFileComponent(session), isDirectory: true)
+            .appendingPathComponent(Self.safeFileComponent(name))
+            .resolvingSymlinksInPath()
+        guard file.path.hasPrefix(root.path + "/") else { return nil }
+        return file
     }
 
     private static func attachmentName(_ attachment: SendAttachment) -> String {

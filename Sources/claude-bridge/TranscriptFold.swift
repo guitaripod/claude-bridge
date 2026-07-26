@@ -74,7 +74,8 @@ struct TranscriptFold: Sendable {
                 else { return }
                 flushTurn()
                 messages.append(
-                    Message(id: uuid, role: .user, parts: [.text(text)], createdAt: stamp))
+                    Message(
+                        id: uuid, role: .user, parts: Self.userParts(text), createdAt: stamp))
                 changed.insert(uuid)
             } else if let blocks = message["content"] as? [[String: Any]] {
                 var texts: [String] = []
@@ -100,7 +101,8 @@ struct TranscriptFold: Sendable {
                     messages.append(
                         Message(
                             id: uuid, role: .user,
-                            parts: [.text(texts.joined(separator: "\n\n"))], createdAt: stamp))
+                            parts: Self.userParts(texts.joined(separator: "\n\n")),
+                            createdAt: stamp))
                     changed.insert(uuid)
                 }
             }
@@ -140,6 +142,63 @@ struct TranscriptFold: Sendable {
             }
         default:
             return
+        }
+    }
+
+    /// Splits the attachment markers the bridge appends to a prompt back out of
+    /// the text they were glued onto. The transcript is the only record a
+    /// reloaded (or CLI-started) session has, so parsing them here is what makes
+    /// an image the user sent still render as an image tomorrow — and keeps the
+    /// machine-facing "use the Read tool" line out of the chat bubble.
+    static func userParts(_ text: String) -> [Part] {
+        guard text.contains(Self.attachmentMarker) else { return [.text(text)] }
+        var prose: [String] = []
+        var files: [FileRef] = []
+        for line in text.components(separatedBy: "\n") {
+            guard let path = Self.attachmentPath(in: line) else {
+                prose.append(line)
+                continue
+            }
+            files.append(
+                FileRef(
+                    path: path, mime: Self.mime(forPath: path),
+                    filename: (path as NSString).lastPathComponent,
+                    url: Self.attachmentURL(forPath: path)))
+        }
+        guard !files.isEmpty else { return [.text(text)] }
+        let remainder = prose.joined(separator: "\n").trimmingCharacters(
+            in: .whitespacesAndNewlines)
+        return files.map { Part.file($0) } + (remainder.isEmpty ? [] : [.text(remainder)])
+    }
+
+    private static let attachmentMarker = "(use the Read tool to view it): "
+
+    private static func attachmentPath(in line: String) -> String? {
+        guard line.hasPrefix("Attached "), let range = line.range(of: Self.attachmentMarker)
+        else { return nil }
+        let path = String(line[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+        return path.hasPrefix("/") ? path : nil
+    }
+
+    /// Only files the bridge itself stored are fetchable; anything else the CLI
+    /// was pointed at stays a path with no bytes behind it.
+    private static func attachmentURL(forPath path: String) -> String? {
+        let parts = path.components(separatedBy: "/")
+        guard let root = parts.firstIndex(of: "attachments"), parts.count == root + 3 else {
+            return nil
+        }
+        return "/attachments/\(parts[root + 1])/\(parts[root + 2])"
+    }
+
+    private static func mime(forPath path: String) -> String {
+        switch (path as NSString).pathExtension.lowercased() {
+        case "jpg", "jpeg": return "image/jpeg"
+        case "png": return "image/png"
+        case "gif": return "image/gif"
+        case "heic": return "image/heic"
+        case "webp": return "image/webp"
+        case "pdf": return "application/pdf"
+        default: return "application/octet-stream"
         }
     }
 

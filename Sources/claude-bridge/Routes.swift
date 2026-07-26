@@ -4,6 +4,22 @@ import Hummingbird
 import NIOCore
 import ServiceLifecycle
 
+/// Enough of a type map to make attachments render inline in a client; the
+/// bytes are whatever the client uploaded, so anything unrecognized is opaque.
+private func mimeType(forExtension ext: String) -> String {
+    switch ext.lowercased() {
+    case "jpg", "jpeg": return "image/jpeg"
+    case "png": return "image/png"
+    case "gif": return "image/gif"
+    case "heic": return "image/heic"
+    case "webp": return "image/webp"
+    case "pdf": return "application/pdf"
+    case "txt", "log", "md": return "text/plain; charset=utf-8"
+    case "json": return "application/json"
+    default: return "application/octet-stream"
+    }
+}
+
 private func jsonResponse<T: Encodable>(_ value: T, status: HTTPResponse.Status = .ok) -> Response {
     let data = (try? JSONCoding.encoder.encode(value)) ?? Data("{}".utf8)
     var buffer = ByteBuffer()
@@ -111,6 +127,22 @@ func registerRoutes(
             return jsonResponse(["error": "not readable"], status: .notFound)
         }
         return jsonResponse(FileContent(path: path, content: content))
+    }
+
+    router.get("attachments/:session/:name") { _, context in
+        let session = context.parameters.get("session") ?? ""
+        let name = context.parameters.get("name") ?? ""
+        guard let url = store.attachmentURL(session: session, name: name),
+            let data = try? Data(contentsOf: url)
+        else {
+            return jsonResponse(["error": "not found"], status: .notFound)
+        }
+        var headers = HTTPFields()
+        headers[.contentType] = mimeType(forExtension: url.pathExtension)
+        headers[.cacheControl] = "private, max-age=31536000, immutable"
+        var buffer = ByteBuffer()
+        buffer.writeBytes(data)
+        return Response(status: .ok, headers: headers, body: .init(byteBuffer: buffer))
     }
 
     router.post("sessions/:id/live-activity") { request, context in

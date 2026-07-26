@@ -19,12 +19,23 @@ struct ToolCall: Codable, Sendable {
     var status: ToolStatus
 }
 
+/// A file that travelled with a prompt. `url` is relative to the bridge root so
+/// a client can fetch the bytes it already sent (or that a CLI turn attached)
+/// without knowing where on the host they landed.
+struct FileRef: Codable, Sendable {
+    var path: String
+    var mime: String
+    var filename: String?
+    var url: String?
+}
+
 enum Part: Codable, Sendable {
     case text(String)
     case reasoning(String)
     case tool(ToolCall)
+    case file(FileRef)
 
-    private enum CodingKeys: String, CodingKey { case kind, text, tool }
+    private enum CodingKeys: String, CodingKey { case kind, text, tool, file }
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -38,6 +49,9 @@ enum Part: Codable, Sendable {
         case .tool(let call):
             try c.encode("tool", forKey: .kind)
             try c.encode(call, forKey: .tool)
+        case .file(let file):
+            try c.encode("file", forKey: .kind)
+            try c.encode(file, forKey: .file)
         }
     }
 
@@ -46,6 +60,7 @@ enum Part: Codable, Sendable {
         switch try c.decode(String.self, forKey: .kind) {
         case "tool": self = .tool(try c.decode(ToolCall.self, forKey: .tool))
         case "reasoning": self = .reasoning(try c.decode(String.self, forKey: .text))
+        case "file": self = .file(try c.decode(FileRef.self, forKey: .file))
         default: self = .text(try c.decode(String.self, forKey: .text))
         }
     }
