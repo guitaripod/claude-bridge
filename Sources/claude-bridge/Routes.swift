@@ -2,6 +2,7 @@ import Foundation
 import HTTPTypes
 import Hummingbird
 import NIOCore
+import ServiceLifecycle
 
 private func jsonResponse<T: Encodable>(_ value: T, status: HTTPResponse.Status = .ok) -> Response {
     let data = (try? JSONCoding.encoder.encode(value)) ?? Data("{}".utf8)
@@ -250,7 +251,7 @@ func registerRoutes(
     router.get("sessions/:id/events") { _, context in
         let id = context.parameters.get("id") ?? ""
         let caster = await store.broadcaster(for: id)
-        let (_, stream) = caster.subscribe()
+        let (subscriberID, stream) = caster.subscribe()
         await watcher.ensureTail(sessionID: id)
         let claudeID = (await store.get(id))?.claudeSessionID ?? id
         let running: Bool
@@ -273,8 +274,12 @@ func registerRoutes(
                 try await writer.write(buffer)
             }
             try await write(.status(running ? "running" : "idle"))
-            for await event in stream {
-                try await write(event)
+            try await withGracefulShutdownHandler {
+                for await event in stream {
+                    try await write(event)
+                }
+            } onGracefulShutdown: {
+                caster.close(subscriberID)
             }
             try await writer.finish(nil)
         }

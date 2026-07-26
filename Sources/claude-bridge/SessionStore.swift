@@ -24,6 +24,14 @@ final class Broadcaster: @unchecked Sendable {
         let targets = lock.withLock { Array(continuations.values) }
         for continuation in targets { continuation.yield(event) }
     }
+
+    /// Ends one subscriber's stream. An SSE response otherwise never completes,
+    /// so a graceful shutdown waits on it forever: the process ignores SIGTERM,
+    /// survives its own restart, and a second bridge ends up sharing the store.
+    func close(_ id: UUID) {
+        let continuation = lock.withLock { continuations.removeValue(forKey: id) }
+        continuation?.finish()
+    }
 }
 
 actor SessionStore {
