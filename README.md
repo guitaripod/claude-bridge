@@ -60,6 +60,7 @@ All request/response bodies are JSON. When `BRIDGE_PASSWORD` is set, every route
 | POST | `/sessions/:id/clear` | — | `{"ok": true}`; drops history and the resumable Claude session id |
 | POST | `/sessions/:id/fork` | — | new `Session` (404 if unknown) seeded with the source's history; its first turn runs `--fork-session` so it diverges instead of mutating the parent |
 | GET | `/sessions/:id/events` | — | `text/event-stream` of bridge events (below) |
+| GET | `/commands` | `?directory=` | `[AgentCommand]` — slash commands a headless turn will resolve |
 
 `Session`: `{id, title, claudeSessionID?, model, effort, createdAt, updatedAt, messages,
 lastCostUSD?, lastTokens?}`. `Message`: `{id, role: "user"|"assistant", parts, createdAt}`.

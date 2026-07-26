@@ -61,6 +61,12 @@ func registerRoutes(
         return jsonResponse(await store.create(body ?? CreateRequest(title: nil, model: nil, effort: nil)))
     }
 
+    router.get("commands") { request, _ in
+        let directory = request.uri.queryParameters.get("directory").map { String($0) }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return jsonResponse(CommandCatalog.all(home: home, directory: directory))
+    }
+
     router.get("sessions/:id") { _, context in
         let id = context.parameters.get("id") ?? ""
         if var session = await store.get(id) {
