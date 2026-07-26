@@ -150,14 +150,16 @@ actor DevicePusher {
     }
 
     func pushTurnEnd(
-        sessionID: String, title: String, toolCount: Int, failed: Bool, duration: TimeInterval
+        sessionID: String, title: String, toolCount: Int, failed: Bool, duration: TimeInterval,
+        goal: GoalStatus? = nil
     ) async {
         guard let client, !devices.isEmpty else { return }
         var payload: [String: Any] = [
             "aps": [
                 "alert": [
                     "title": title.isEmpty ? "Agent" : title,
-                    "body": Self.turnEndSummary(toolCount: toolCount, failed: failed, duration: duration),
+                    "body": Self.turnEndSummary(
+                        toolCount: toolCount, failed: failed, duration: duration, goal: goal),
                 ],
                 "sound": "default",
                 "mutable-content": 1,
@@ -235,10 +237,16 @@ actor DevicePusher {
         snapshot.live && !snapshot.gauges.isEmpty ? snapshot : nil
     }
 
+    /// A goal is the reason the user walked away from the phone, so it outranks the tool count:
+    /// reaching it is the news, and still pursuing it means this turn was not the end.
     private static func turnEndSummary(
-        toolCount: Int, failed: Bool, duration: TimeInterval
+        toolCount: Int, failed: Bool, duration: TimeInterval, goal: GoalStatus?
     ) -> String {
         if failed { return "Something went wrong" }
+        if let goal {
+            if goal.isActive { return "Still working toward: \(goal.condition)" }
+            if goal.met { return "Goal reached: \(goal.condition)" }
+        }
         var parts = ["Done in \(PushFormatting.compactDuration(duration))"]
         if toolCount > 0 { parts.append("\(toolCount) tool\(toolCount == 1 ? "" : "s")") }
         return parts.joined(separator: " · ")

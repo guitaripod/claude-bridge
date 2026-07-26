@@ -91,6 +91,7 @@ let index = TranscriptIndex(
     root: URL(fileURLWithPath: projectsDir), defaultModel: defaultModel,
     defaultEffort: defaultEffort)
 let watcher = TranscriptWatcher(index: index, store: store)
+await store.attach(index: index)
 registerRoutes(
     router, store: store, index: index, watcher: watcher, agentModel: defaultModel,
     hasAuth: !password.isEmpty)

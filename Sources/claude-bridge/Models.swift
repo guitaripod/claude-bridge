@@ -77,6 +77,8 @@ struct Session: Codable, Sendable {
     var pendingFork: Bool?
     var customTitle: Bool?
     var autoTitled: Bool?
+    /// Derived from the transcript when a session is served, never stored — the CLI owns goal state.
+    var goal: GoalStatus?
 
     var summary: SessionSummary {
         SessionSummary(
@@ -150,9 +152,11 @@ enum BridgeEvent: Codable, Sendable {
     case toolUpserted(messageID: String, ToolCall)
     case status(String)
     case error(String)
+    /// The session's `/goal` changed; `nil` once nothing is being pursued.
+    case goal(GoalStatus?)
 
     private enum CodingKeys: String, CodingKey {
-        case type, message, messageID, delta, tool, status, error
+        case type, message, messageID, delta, tool, status, error, goal
     }
 
     func encode(to encoder: Encoder) throws {
@@ -175,6 +179,9 @@ enum BridgeEvent: Codable, Sendable {
         case .error(let value):
             try c.encode("error", forKey: .type)
             try c.encode(value, forKey: .error)
+        case .goal(let status):
+            try c.encode("goal", forKey: .type)
+            try c.encodeIfPresent(status, forKey: .goal)
         }
     }
 
@@ -191,6 +198,7 @@ enum BridgeEvent: Codable, Sendable {
                 messageID: try c.decode(String.self, forKey: .messageID),
                 try c.decode(ToolCall.self, forKey: .tool))
         case "status": self = .status(try c.decode(String.self, forKey: .status))
+        case "goal": self = .goal(try c.decodeIfPresent(GoalStatus.self, forKey: .goal))
         default: self = .error(try c.decode(String.self, forKey: .error))
         }
     }

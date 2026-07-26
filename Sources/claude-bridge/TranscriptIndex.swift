@@ -299,6 +299,13 @@ actor TranscriptIndex {
         await advanceFold(atPath: path, includeSidechain: false)
     }
 
+    /// The session's current `/goal`, read from the same incremental fold that serves its messages.
+    func goal(for id: String) async -> GoalStatus? {
+        if pathByID[id] == nil { scan() }
+        guard let path = pathByID[id] else { return nil }
+        return await advanceFold(atPath: path, includeSidechain: false)?.fold.goal
+    }
+
     /// Serialized per path by chaining onto the previous advance — never by
     /// polling a shared slot, which can livelock the actor when a waiter
     /// re-checks faster than the owner's continuation clears it.

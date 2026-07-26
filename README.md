@@ -63,7 +63,7 @@ All request/response bodies are JSON. When `BRIDGE_PASSWORD` is set, every route
 | GET | `/commands` | `?directory=` | `[AgentCommand]` — slash commands a headless turn will resolve |
 
 `Session`: `{id, title, claudeSessionID?, model, effort, createdAt, updatedAt, messages,
-lastCostUSD?, lastTokens?}`. `Message`: `{id, role: "user"|"assistant", parts, createdAt}`.
+lastCostUSD?, lastTokens?, goal?}`. `Message`: `{id, role: "user"|"assistant", parts, createdAt}`.
 `Part` is `{kind: "text"|"reasoning", text}` or `{kind: "tool", tool: ToolCall}`.
 `ToolCall`: `{id, name, input, output?, status: "running"|"completed"|"error"}`.
 Dates are ISO 8601. Sessions persist to `BRIDGE_STORE` across restarts.
@@ -90,7 +90,27 @@ Each event is one `data: <json>\n\n` frame:
 | `delta` | `messageID`, `delta` | Incremental assistant text chunk; append to the message's text |
 | `tool` | `messageID`, `tool` | Tool call upsert — first with `status: "running"`, again with `output` and `completed`/`error` |
 | `status` | `status` | `"running"` when a turn starts, `"idle"` when it ends |
+| `goal` | `goal?` | The session's `/goal` changed; the field is absent once nothing is being pursued |
 | `error` | `error` | Turn-level failure (e.g. the `claude` binary could not be launched) |
+
+## Commands and goals
+
+`GET /commands` lists what a `claude -p` turn will actually resolve: the built-ins worth running
+from a client (`goal`, `recap`, `compact`, `context`, `usage`, `init`, `review` — the CLI's other
+commands either need an interactive terminal or duplicate controls a client already has), plus
+every command file on the machine — `~/.claude/commands`, `<directory>/.claude/commands`, and each
+installed plugin's, namespaced `plugin:command`. `AgentCommand`:
+`{name, description, argumentHint?, source: "builtin"|"user"|"project"|"plugin", scope?}`.
+Running one is just sending `/name args` as a message; there is no separate route.
+
+`/goal <condition>` makes the agent keep working until the condition holds, which is the one piece
+of state worth setting from a phone and then walking away from. The CLI records it in the
+transcript as `goal_status` attachments, so the bridge reads goal state from the same incremental
+fold that serves messages and reports it as `Session.goal`, as a `goal` SSE event when it changes,
+and in the turn-end push (`Goal reached: …` rather than `Done in 2m · 6 tools`). A goal survives
+the bridge respawning `claude -p --resume` per message: the CLI restores it from the last
+`goal_status` record unless that record is met or failed.
+`GoalStatus`: `{condition, met, failed?, reason?, iterations?, durationMs?, tokens?, updatedAt?}`.
 
 ## Configuration
 

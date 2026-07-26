@@ -47,6 +47,17 @@ actor TranscriptWatcher {
         var emittedRunning = false
         var lastGrowth = Date()
         var suppressedUntil = Date.distantPast
+        var emittedGoal = fold.goal
+
+        /// Goal changes are emitted even while message emission is suppressed for the bridge's own
+        /// runner: the runner streams messages but knows nothing about goals, so there is no
+        /// duplicate to guard against — and suppressing here would strand the chip on a goal the
+        /// user set from the app.
+        func emitGoalIfChanged() {
+            guard fold.goal != emittedGoal else { return }
+            emittedGoal = fold.goal
+            caster.send(.goal(fold.goal))
+        }
 
         if let mtime = mtime(path), Date().timeIntervalSince(mtime) < Self.idleAfter,
             !TranscriptParser.isTurnClosed(atPath: path)
@@ -105,6 +116,7 @@ actor TranscriptWatcher {
             offset += chunk.count
             let changed = fold.consume(chunk)
             if !changed.isEmpty { lastGrowth = Date() }
+            emitGoalIfChanged()
 
             if await store.hasRunnerTurnInFlight(claudeSessionID: transcriptID) {
                 suppressedUntil = Date().addingTimeInterval(Self.runnerGrace)

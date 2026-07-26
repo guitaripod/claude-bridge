@@ -81,9 +81,11 @@ func registerRoutes(
                 session.messages = fresh.messages
                 session.updatedAt = transcriptDate
             }
+            session.goal = await index.goal(for: session.claudeSessionID ?? id)
             return jsonResponse(session)
         }
-        if let discovered = await index.session(id) {
+        if var discovered = await index.session(id) {
+            discovered.goal = await index.goal(for: id)
             return jsonResponse(discovered)
         }
         return jsonResponse(["error": "not found"], status: .notFound)

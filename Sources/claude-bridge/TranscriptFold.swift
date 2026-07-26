@@ -10,6 +10,9 @@ struct TranscriptFold: Sendable {
     private var toolLocation: [String: (messageIndex: Int?, partIndex: Int)] = [:]
     private var pending = Data()
     private let includeSidechain: Bool
+    /// Latest `/goal` record seen. Folded here rather than scanned separately because these bytes
+    /// are already being read and parsed — goal tracking costs nothing on top of it.
+    private(set) var goal: GoalStatus?
 
     init(includeSidechain: Bool = false) {
         self.includeSidechain = includeSidechain
@@ -44,6 +47,16 @@ struct TranscriptFold: Sendable {
     }
 
     private mutating func ingest(_ line: [String: Any], changed: inout Set<String>) {
+        if line["type"] as? String == "attachment" {
+            guard let attachment = line["attachment"] as? [String: Any],
+                let status = GoalStatus(
+                    attachment: attachment,
+                    timestamp: (line["timestamp"] as? String).flatMap(
+                        TranscriptParser.parseTimestamp))
+            else { return }
+            goal = status
+            return
+        }
         guard line["isMeta"] as? Bool != true,
             includeSidechain || line["isSidechain"] as? Bool != true,
             let type = line["type"] as? String,

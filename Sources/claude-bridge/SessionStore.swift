@@ -47,6 +47,13 @@ actor SessionStore {
     let devicePusher: DevicePusher
     private var hiddenTranscripts: Set<String>
     private var runnerTurnClaudeIDs: Set<String> = []
+    /// Attached after construction (the index is built from the same config, but later), so a
+    /// finished turn can report *why* it ended when a goal drove it.
+    private weak var index: TranscriptIndex?
+
+    func attach(index: TranscriptIndex) {
+        self.index = index
+    }
 
     init(
         runner: ClaudeRunner, defaultModel: String, defaultEffort: String, storeURL: URL,
@@ -439,11 +446,14 @@ actor SessionStore {
             return false
         }
         let title = session.title
+        let claudeID = session.claudeSessionID ?? id
+        let index = self.index
         Task {
             await pusher.endTurn(sessionID: id, toolCount: toolCount, failed: false)
+            let goal = await index?.goal(for: claudeID)
             await devicePusher.pushTurnEnd(
                 sessionID: id, title: title, toolCount: toolCount, failed: false,
-                duration: turnDuration)
+                duration: turnDuration, goal: goal)
         }
     }
 
