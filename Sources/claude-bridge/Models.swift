@@ -3,6 +3,8 @@ import Foundation
 enum Role: String, Codable, Sendable {
     case user
     case assistant
+    /// Neither side of the conversation — a boundary the CLI recorded in it, such as a compaction.
+    case system
 }
 
 enum ToolStatus: String, Codable, Sendable {
@@ -29,13 +31,27 @@ struct FileRef: Codable, Sendable {
     var url: String?
 }
 
+/// The seam left where the CLI replaced the conversation so far with a summary of it. The numbers
+/// come straight off the transcript's `compact_boundary` record; ``summary`` is the
+/// `isCompactSummary` message that follows it, which is a 16k-word artifact no client should ever
+/// render as a chat bubble.
+struct Compaction: Codable, Sendable {
+    var trigger: String?
+    var tokensBefore: Int?
+    var tokensAfter: Int?
+    var durationMs: Double?
+    var preservedMessages: Int?
+    var summary: String?
+}
+
 enum Part: Codable, Sendable {
     case text(String)
     case reasoning(String)
     case tool(ToolCall)
     case file(FileRef)
+    case compaction(Compaction)
 
-    private enum CodingKeys: String, CodingKey { case kind, text, tool, file }
+    private enum CodingKeys: String, CodingKey { case kind, text, tool, file, compaction }
 
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
@@ -52,6 +68,9 @@ enum Part: Codable, Sendable {
         case .file(let file):
             try c.encode("file", forKey: .kind)
             try c.encode(file, forKey: .file)
+        case .compaction(let value):
+            try c.encode("compaction", forKey: .kind)
+            try c.encode(value, forKey: .compaction)
         }
     }
 
@@ -61,6 +80,8 @@ enum Part: Codable, Sendable {
         case "tool": self = .tool(try c.decode(ToolCall.self, forKey: .tool))
         case "reasoning": self = .reasoning(try c.decode(String.self, forKey: .text))
         case "file": self = .file(try c.decode(FileRef.self, forKey: .file))
+        case "compaction":
+            self = .compaction(try c.decode(Compaction.self, forKey: .compaction))
         default: self = .text(try c.decode(String.self, forKey: .text))
         }
     }
@@ -169,9 +190,13 @@ enum BridgeEvent: Codable, Sendable {
     case error(String)
     /// The session's `/goal` changed; `nil` once nothing is being pursued.
     case goal(GoalStatus?)
+    /// A compaction started, finished, or failed. Separate from ``status`` because the turn is
+    /// still running throughout — it just spends minutes re-reading the conversation instead of
+    /// answering, and a client that can't say so looks hung.
+    case compaction(phase: String, error: String?)
 
     private enum CodingKeys: String, CodingKey {
-        case type, message, messageID, delta, tool, status, error, goal
+        case type, message, messageID, delta, tool, status, error, goal, phase
     }
 
     func encode(to encoder: Encoder) throws {
@@ -197,6 +222,10 @@ enum BridgeEvent: Codable, Sendable {
         case .goal(let status):
             try c.encode("goal", forKey: .type)
             try c.encodeIfPresent(status, forKey: .goal)
+        case .compaction(let phase, let error):
+            try c.encode("compaction", forKey: .type)
+            try c.encode(phase, forKey: .phase)
+            try c.encodeIfPresent(error, forKey: .error)
         }
     }
 
@@ -214,6 +243,10 @@ enum BridgeEvent: Codable, Sendable {
                 try c.decode(ToolCall.self, forKey: .tool))
         case "status": self = .status(try c.decode(String.self, forKey: .status))
         case "goal": self = .goal(try c.decodeIfPresent(GoalStatus.self, forKey: .goal))
+        case "compaction":
+            self = .compaction(
+                phase: try c.decode(String.self, forKey: .phase),
+                error: try c.decodeIfPresent(String.self, forKey: .error))
         default: self = .error(try c.decode(String.self, forKey: .error))
         }
     }

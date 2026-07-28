@@ -1,5 +1,48 @@
 import Foundation
 
+extension Compaction {
+    /// The last compaction the CLI recorded in a transcript, read off the tail of the file.
+    ///
+    /// Only the transcript carries a compaction's numbers and its summary — the `-p` event stream
+    /// says nothing but "compacting" and "done" — so a turn that compacted has to come back here
+    /// for them. Reads a bounded tail: transcripts run to hundreds of megabytes, and the record we
+    /// want was written seconds ago.
+    static func lastRecorded(atPath path: String) -> Compaction? {
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return nil
+        }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()) ?? 0
+        let window: UInt64 = 8 * 1024 * 1024
+        try? handle.seek(toOffset: size > window ? size - window : 0)
+        guard let data = try? handle.readToEnd() else { return nil }
+
+        var compaction: Compaction?
+        for line in data.split(separator: 0x0A) {
+            guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any]
+            else { continue }
+            if object["subtype"] as? String == "compact_boundary",
+                let metadata = object["compactMetadata"] as? [String: Any]
+            {
+                let preserved = (metadata["preservedMessages"] as? [String: Any])?["uuids"] as? [Any]
+                compaction = Compaction(
+                    trigger: metadata["trigger"] as? String,
+                    tokensBefore: metadata["preTokens"] as? Int,
+                    tokensAfter: metadata["postTokens"] as? Int,
+                    durationMs: metadata["durationMs"] as? Double,
+                    preservedMessages: preserved?.count,
+                    summary: nil)
+            } else if object["isCompactSummary"] as? Bool == true, compaction != nil,
+                let message = object["message"] as? [String: Any]
+            {
+                let text = TranscriptParser.flatten(message["content"])
+                if !text.isEmpty { compaction?.summary = text }
+            }
+        }
+        return compaction
+    }
+}
+
 /// Incrementally folds transcript bytes into bridge messages, reporting which message ids each
 /// chunk changed so a live watcher can emit precise upserts. Consecutive assistant API messages
 /// (interleaved with tool results) merge into one turn, mirroring the bridge's own runner; the
@@ -9,6 +52,8 @@ struct TranscriptFold: Sendable {
     private var turn: Message?
     private var toolLocation: [String: (messageIndex: Int?, partIndex: Int)] = [:]
     private var pending = Data()
+    /// The compaction boundary still waiting for the summary record that always follows it.
+    private var openCompactionIndex: Int?
     private let includeSidechain: Bool
     /// Latest `/goal` record seen. Folded here rather than scanned separately because these bytes
     /// are already being read and parsed — goal tracking costs nothing on top of it.
@@ -47,6 +92,14 @@ struct TranscriptFold: Sendable {
     }
 
     private mutating func ingest(_ line: [String: Any], changed: inout Set<String>) {
+        if line["type"] as? String == "system" {
+            ingestCompactBoundary(line, changed: &changed)
+            return
+        }
+        if line["isCompactSummary"] as? Bool == true {
+            ingestCompactSummary(line, changed: &changed)
+            return
+        }
         if line["type"] as? String == "attachment" {
             guard let attachment = line["attachment"] as? [String: Any],
                 let status = GoalStatus(
@@ -66,6 +119,7 @@ struct TranscriptFold: Sendable {
         let stamp =
             (line["timestamp"] as? String).flatMap(TranscriptParser.parseTimestamp) ?? Date()
 
+        openCompactionIndex = nil
         switch type {
         case "user":
             if let content = message["content"] as? String {
@@ -143,6 +197,60 @@ struct TranscriptFold: Sendable {
         default:
             return
         }
+    }
+
+    /// Turns the CLI's `compact_boundary` record into a message of its own. Everything above it is
+    /// still readable but no longer in the model's context, so it has to be a visible seam in the
+    /// conversation rather than a silent gap between two unrelated-looking turns.
+    private mutating func ingestCompactBoundary(_ line: [String: Any], changed: inout Set<String>) {
+        guard line["subtype"] as? String == "compact_boundary",
+            let metadata = line["compactMetadata"] as? [String: Any]
+        else { return }
+        let uuid = line["uuid"] as? String ?? UUID().uuidString
+        let stamp =
+            (line["timestamp"] as? String).flatMap(TranscriptParser.parseTimestamp) ?? Date()
+        let preserved = (metadata["preservedMessages"] as? [String: Any])?["uuids"] as? [Any]
+        let compaction = Compaction(
+            trigger: metadata["trigger"] as? String,
+            tokensBefore: metadata["preTokens"] as? Int,
+            tokensAfter: metadata["postTokens"] as? Int,
+            durationMs: metadata["durationMs"] as? Double,
+            preservedMessages: preserved?.count,
+            summary: nil)
+        flushTurn()
+        messages.append(
+            Message(
+                id: uuid, role: .system, parts: [.compaction(compaction)], createdAt: stamp))
+        openCompactionIndex = messages.count - 1
+        changed.insert(uuid)
+    }
+
+    /// Folds the summary the CLI wrote into the boundary that precedes it. It is a machine-facing
+    /// artifact tens of thousands of words long — as a user bubble it buries the conversation, so
+    /// it belongs behind the compaction row, on demand.
+    private mutating func ingestCompactSummary(_ line: [String: Any], changed: inout Set<String>) {
+        guard let message = line["message"] as? [String: Any],
+            case let text = TranscriptParser.flatten(message["content"]),
+            !text.isEmpty
+        else { return }
+        if let index = openCompactionIndex,
+            case .compaction(var compaction) = messages[index].parts.first
+        {
+            compaction.summary = text
+            messages[index].parts = [.compaction(compaction)]
+            changed.insert(messages[index].id)
+            openCompactionIndex = nil
+            return
+        }
+        let uuid = line["uuid"] as? String ?? UUID().uuidString
+        let stamp =
+            (line["timestamp"] as? String).flatMap(TranscriptParser.parseTimestamp) ?? Date()
+        flushTurn()
+        messages.append(
+            Message(
+                id: uuid, role: .system,
+                parts: [.compaction(Compaction(summary: text))], createdAt: stamp))
+        changed.insert(uuid)
     }
 
     /// Splits the attachment markers the bridge appends to a prompt back out of

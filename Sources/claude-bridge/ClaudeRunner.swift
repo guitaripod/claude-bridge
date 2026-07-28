@@ -12,6 +12,9 @@ struct ClaudeRunner: Sendable {
         var claudeSessionID: String?
         var costUSD: Double?
         var tokens: Int?
+        /// The turn compacted. The message carries a placeholder ``Part/compaction(_:)`` in stream
+        /// order whose numbers only the transcript knows — see `SessionStore.fillCompaction`.
+        var didCompact = false
     }
 
     func run(
@@ -97,7 +100,8 @@ struct ClaudeRunner: Sendable {
         emit(.status("idle"))
         return Outcome(
             message: message, claudeSessionID: assembler.sessionID ?? claudeSessionID,
-            costUSD: assembler.costUSD, tokens: assembler.tokens)
+            costUSD: assembler.costUSD, tokens: assembler.tokens,
+            didCompact: assembler.didCompact)
     }
 
     /// Waits for the child to die without ever calling `waitUntilExit()`.
@@ -195,10 +199,12 @@ private struct Assembler {
     var sessionID: String?
     var costUSD: Double?
     var tokens: Int?
+    private(set) var didCompact = false
     private enum Segment {
         case text(String)
         case thinking(String)
         case tool(String)
+        case compaction
     }
     private var segments: [Segment] = []
     private var tools: [String: ToolCall] = [:]
@@ -210,8 +216,13 @@ private struct Assembler {
     mutating func ingest(_ object: [String: Any], emit: (BridgeEvent) -> Void) {
         switch object["type"] as? String {
         case "system":
-            if object["subtype"] as? String == "init", let sid = object["session_id"] as? String {
-                sessionID = sid
+            switch object["subtype"] as? String {
+            case "init":
+                if let sid = object["session_id"] as? String { sessionID = sid }
+            case "status":
+                ingestCompactionStatus(object, emit: emit)
+            default:
+                break
             }
         case "stream_event":
             ingestStreamEvent(object["event"] as? [String: Any] ?? [:], emit: emit)
@@ -226,6 +237,24 @@ private struct Assembler {
             }
         default:
             break
+        }
+    }
+
+    /// Compaction is a turn that spends minutes reading instead of answering, and the CLI is the
+    /// only thing that knows it started. Forwarding those markers is what lets a client say
+    /// "compacting" instead of showing a stalled response.
+    private mutating func ingestCompactionStatus(
+        _ object: [String: Any], emit: (BridgeEvent) -> Void
+    ) {
+        if let error = object["compact_error"] as? String {
+            emit(.compaction(phase: "failed", error: error))
+        } else if object["compact_result"] as? String != nil {
+            didCompact = true
+            segments.append(.compaction)
+            blockBoundary = true
+            emit(.compaction(phase: "finished", error: nil))
+        } else if object["status"] as? String == "compacting" {
+            emit(.compaction(phase: "started", error: nil))
         }
     }
 
@@ -304,6 +333,8 @@ private struct Assembler {
                 parts.append(.reasoning(value))
             case .tool(let id):
                 if let call = tools[id] { parts.append(.tool(call)) }
+            case .compaction:
+                parts.append(.compaction(Compaction()))
             }
         }
         if parts.isEmpty { parts.append(.text("")) }

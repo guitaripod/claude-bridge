@@ -354,12 +354,18 @@ actor SessionStore {
     /// id the event stream uses — so a client that fetches mid-turn sees the
     /// turn so far and subsequent deltas still land on it.
     private var liveTurns: [String: Message] = [:]
+    /// Turns already settled by ``finishTurn``. Mirroring runs in a detached task, so the final
+    /// `messageUpserted` can arrive after the turn was persisted — without this it would re-open a
+    /// live turn nothing will ever close, and every later fetch would serve the last assistant
+    /// message twice.
+    private var settledTurnMessageIDs: [String: String] = [:]
 
     func liveTurnMessage(_ id: String) -> Message? { liveTurns[id] }
 
     private func mirrorLiveTurn(_ id: String, _ event: BridgeEvent) {
         switch event {
         case .messageUpserted(let message) where message.role == .assistant:
+            guard settledTurnMessageIDs[id] != message.id else { return }
             liveTurns[id] = message
         case .partTextDelta(let messageID, let delta):
             guard var message = liveTurns[id], message.id == messageID else { return }
@@ -441,12 +447,43 @@ actor SessionStore {
 
     private var lastRunnerFinish: [String: Date] = [:]
 
+    /// Backfills a compacted turn's numbers and summary from the transcript. The runner leaves an
+    /// empty ``Compaction`` in stream order so the seam renders the moment the turn ends; this
+    /// replaces it once the CLI has flushed the boundary record it never streams.
+    private func fillCompaction(
+        _ id: String, messageID: String, claudeSessionID: String?
+    ) async {
+        guard let claudeSessionID, let index else { return }
+        for attempt in 0..<Self.compactionFillAttempts {
+            if attempt > 0 { try? await Task.sleep(for: .milliseconds(700)) }
+            guard let path = await index.path(for: claudeSessionID),
+                let compaction = Compaction.lastRecorded(atPath: path), compaction.summary != nil
+            else { continue }
+            guard var session = sessions[id],
+                let messageIndex = session.messages.firstIndex(where: { $0.id == messageID }),
+                let partIndex = session.messages[messageIndex].parts.firstIndex(where: { part in
+                    if case .compaction = part { return true }
+                    return false
+                })
+            else { return }
+            session.messages[messageIndex].parts[partIndex] = .compaction(compaction)
+            sessions[id] = session
+            persist()
+            broadcaster(for: id).send(.messageUpserted(session.messages[messageIndex]))
+            return
+        }
+    }
+
+    /// The boundary record lands in the transcript around the time the turn ends, not before it.
+    private static let compactionFillAttempts = 6
+
     private func finishTurn(
         _ id: String, outcome: ClaudeRunner.Outcome, turnClaudeID: String, startedAt: Date
     ) {
         let turnDuration = Date().timeIntervalSince(startedAt)
         turnProcessIDs[id] = nil
         liveTurns[id] = nil
+        settledTurnMessageIDs[id] = outcome.message.id
         runnerTurnClaudeIDs.remove(turnClaudeID)
         lastRunnerFinish[turnClaudeID] = Date()
         if let newID = outcome.claudeSessionID {
@@ -468,6 +505,10 @@ actor SessionStore {
         moveToFront(id)
         persist()
         maybeAutoTitle(id)
+        if outcome.didCompact {
+            let claudeID = session.claudeSessionID
+            Task { await self.fillCompaction(id, messageID: outcome.message.id, claudeSessionID: claudeID) }
+        }
         let toolCount = outcome.message.parts.count { part in
             if case .tool = part { return true }
             return false
