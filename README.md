@@ -10,6 +10,12 @@ its stream-JSON output into clean REST + SSE: persistent multi-session chat, tok
 streaming, structured tool calls, reasoning blocks, per-turn cost/token accounting, session
 resume, clear, and fork.
 
+It also serves the parts of a Claude Code session that aren't messages: the subagents a turn
+spawned and their own transcripts, context compactions as events rather than a wall of summary
+text, the attachments a prompt carried, plan rate-limit gauges, the slash commands that machine
+will actually resolve, `/goal` state — and, with an APNs key configured, Live Activity and
+turn-end pushes so a phone can watch a turn it isn't looking at.
+
 It uses the logged-in CLI (your Claude subscription), not an API key.
 
 Known consumers:
@@ -52,19 +58,33 @@ All request/response bodies are JSON. When `BRIDGE_PASSWORD` is set, every route
 |---|---|---|---|
 | GET | `/health` | — | `ok` |
 | GET | `/status` | — | `{"agent": "claude", "model": "<default model>"}` |
-| GET | `/sessions` | — | `[SessionSummary]`, newest first |
+| GET | `/sessions` | — | `[SessionSummary]`, newest first, store + discovered transcripts merged |
 | POST | `/sessions` | `{title?, model?, effort?}` | the created `Session` |
-| GET | `/sessions/:id` | — | `Session` (404 if unknown) |
+| GET | `/sessions/:id` | — | `Session` (404 if unknown), including the turn in flight |
+| PATCH | `/sessions/:id` | `{title}` | the renamed `Session` |
 | DELETE | `/sessions/:id` | — | `{"ok": true}` |
-| POST | `/sessions/:id/message` | `{text, model?, effort?}` | `202 {"ok": true}`; the turn runs async, watch `/events` |
+| POST | `/sessions/:id/message` | `{text, model?, effort?, attachments?}` | `202 {"ok": true}`; the turn runs async, watch `/events`. `409` when the session is already being written by a turn on the machine itself |
+| POST | `/sessions/:id/abort` | — | `{"ok": true}`; stops the turn in flight |
 | POST | `/sessions/:id/clear` | — | `{"ok": true}`; drops history and the resumable Claude session id |
 | POST | `/sessions/:id/fork` | — | new `Session` (404 if unknown) seeded with the source's history; its first turn runs `--fork-session` so it diverges instead of mutating the parent |
 | GET | `/sessions/:id/events` | — | `text/event-stream` of bridge events (below) |
+| GET | `/sessions/:id/usage` | — | `{costUSD?, tokens?}` for the session's last turn |
+| GET | `/sessions/:id/agents` | — | `[SubagentSummary]` — the subagents this session spawned |
+| GET | `/sessions/:id/agents/:agentID` | — | `SubagentTranscript` — that subagent's own messages |
 | GET | `/commands` | `?directory=` | `[AgentCommand]` — slash commands a headless turn will resolve |
+| GET | `/usage` | — | Claude plan rate-limit gauges (session / week / Opus) read from the CLI's own accounting |
+| GET | `/usage/grok` | — | Grok quota gauges, when a Grok key is configured |
+| GET | `/files` | `?path=` | `[FileNode]` — directory listing for the project picker |
+| GET | `/files/content` | `?path=` | `{path, content}` |
+| GET | `/attachments/:session/:name` | — | the bytes a prompt carried, served back with its MIME type |
+| POST | `/sessions/:id/live-activity` | `LiveActivityRegistration` | registers an ActivityKit push token for this session |
+| POST | `/push/device` | `{token, environment}` | registers a device token for turn-end pushes (requires `BRIDGE_PASSWORD`) |
+| POST | `/push/device/unregister` | `{token}` | forgets it |
 
 `Session`: `{id, title, claudeSessionID?, model, effort, createdAt, updatedAt, messages,
 lastCostUSD?, lastTokens?, goal?}`. `Message`: `{id, role: "user"|"assistant", parts, createdAt}`.
-`Part` is `{kind: "text"|"reasoning", text}` or `{kind: "tool", tool: ToolCall}`.
+`Part` is `{kind: "text"|"reasoning", text}`, `{kind: "tool", tool: ToolCall}`,
+`{kind: "file", file: FileRef}` or `{kind: "compaction", compaction: Compaction}`.
 `ToolCall`: `{id, name, input, output?, status: "running"|"completed"|"error"}`.
 Dates are ISO 8601. Sessions persist to `BRIDGE_STORE` across restarts.
 
@@ -91,7 +111,11 @@ Each event is one `data: <json>\n\n` frame:
 | `tool` | `messageID`, `tool` | Tool call upsert — first with `status: "running"`, again with `output` and `completed`/`error` |
 | `status` | `status` | `"running"` when a turn starts, `"idle"` when it ends |
 | `goal` | `goal?` | The session's `/goal` changed; the field is absent once nothing is being pursued |
+| `compaction` | `compaction` | The context was compacted: tokens before/after, duration, how many messages carried over, and the CLI's summary |
 | `error` | `error` | Turn-level failure (e.g. the `claude` binary could not be launched) |
+
+A subscriber gets a `status` frame immediately on connect, so a client that attaches mid-turn
+knows the session is running without waiting for the next token.
 
 ## Commands and goals
 
@@ -128,6 +152,10 @@ Everything is environment variables. Empty values fall back to the default.
 | `BRIDGE_EFFORT` | `medium` | Default reasoning effort (overridable per session and per message) |
 | `BRIDGE_STORE` | `~/.claude-bridge/sessions.json` | Session persistence file |
 | `BRIDGE_PROJECTS` | `~/.claude/projects` | Claude Code CLI transcript root scanned for discoverable sessions |
+| `BRIDGE_APNS_KEY` | empty | Path to an APNs `.p8` auth key. Set all four `BRIDGE_APNS_*` values to enable Live Activity and turn-end pushes; leave them empty and the bridge simply never pushes |
+| `BRIDGE_APNS_KEY_ID` | empty | Key id of that `.p8` |
+| `BRIDGE_APNS_TEAM_ID` | empty | Apple developer team id |
+| `BRIDGE_APNS_TOPIC` | `com.guitaripod.tailscode.push-type.liveactivity` | Live Activity push topic; set it to your own bundle id + `.push-type.liveactivity` if you ship a different client |
 
 ## Security
 
