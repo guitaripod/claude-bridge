@@ -100,6 +100,44 @@ actor TranscriptIndex {
         !activeIDs(within: seconds).isEmpty
     }
 
+    /// What the agents of each fanned-out session are doing right now, keyed by
+    /// session id. Only sessions whose sidecars were written to recently are
+    /// described: a client needs this to say *why* a session with a silent
+    /// transcript is live, and reading meta files for quiet sessions would cost
+    /// a directory walk per session per poll for nothing.
+    func agentActivity() -> [String: AgentActivity] {
+        scan()
+        let threshold = Date().addingTimeInterval(-Self.subagentActivityWindow)
+        var activity: [String: AgentActivity] = [:]
+        for (path, slot) in cache {
+            guard let entry = slot.entry,
+                isSidecarActive(transcriptPath: path, after: threshold),
+                let detail = agentActivity(transcriptPath: path)
+            else { continue }
+            activity[entry.id] = detail
+        }
+        return activity
+    }
+
+    /// Whether a session has agents working for it right now.
+    func hasWorkingAgents(_ id: String) -> Bool {
+        guard let path = path(for: id) else { return false }
+        return isSidecarActive(
+            transcriptPath: path, after: Date().addingTimeInterval(-Self.subagentActivityWindow))
+    }
+
+    private func agentActivity(transcriptPath: String) -> AgentActivity? {
+        let threshold = Date().addingTimeInterval(-Self.subagentActivityWindow)
+        let resolved = resolvedTools(transcriptPath: transcriptPath)
+        let working = Self.sidecarDirs(transcriptPath: transcriptPath)
+            .flatMap { subagents(in: $0, threshold: threshold, resolved: resolved) }
+            .filter(\.active)
+        guard !working.isEmpty else { return nil }
+        return AgentActivity(
+            count: working.count,
+            task: working.count == 1 ? working[0].title : nil)
+    }
+
     /// Directories that can hold subagent transcripts: the session's
     /// `subagents/` dir plus one `workflows/<runID>/` level beneath it.
     nonisolated static func sidecarDirs(transcriptPath: String) -> [URL] {
@@ -382,6 +420,7 @@ actor TranscriptIndex {
         let active =
             (!turnClosed && entry.updatedAt > threshold)
             || isSidecarActive(transcriptPath: entry.path, after: threshold)
+        let agents = active ? agentActivity(transcriptPath: entry.path) : nil
         return SessionSummary(
             id: entry.id,
             title: entry.title,
@@ -390,7 +429,9 @@ actor TranscriptIndex {
             effort: "",
             createdAt: entry.createdAt,
             updatedAt: entry.updatedAt,
-            active: active)
+            active: active,
+            agents: agents?.count,
+            agentTask: agents?.task)
     }
 
     private func scan() {

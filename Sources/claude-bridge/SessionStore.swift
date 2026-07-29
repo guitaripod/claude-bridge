@@ -75,13 +75,18 @@ actor SessionStore {
     }
 
     func list(
-        activeClaudeIDs: Set<String> = [], transcriptDates: [String: Date] = [:]
+        activeClaudeIDs: Set<String> = [], transcriptDates: [String: Date] = [:],
+        agents: [String: AgentActivity] = [:]
     ) -> [SessionSummary] {
         order.compactMap { id -> SessionSummary? in
             guard let session = sessions[id] else { return nil }
             var summary = session.summary
             let claudeID = session.claudeSessionID ?? session.id
             summary.active = activeClaudeIDs.contains(claudeID)
+            if let working = agents[claudeID] {
+                summary.agents = working.count
+                summary.agentTask = working.task
+            }
             if let fresh = transcriptDates[claudeID], fresh > summary.updatedAt {
                 summary.updatedAt = fresh
             }

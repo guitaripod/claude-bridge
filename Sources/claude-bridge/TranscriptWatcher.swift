@@ -44,7 +44,7 @@ actor TranscriptWatcher {
         } else {
             (fold, offset) = (TranscriptFold(), 0)
         }
-        var emittedRunning = false
+        var emittedRunning: Bool? = nil
         var lastGrowth = Date()
         var suppressedUntil = Date.distantPast
         var emittedGoal = fold.goal
@@ -59,14 +59,26 @@ actor TranscriptWatcher {
             caster.send(.goal(fold.goal))
         }
 
+        /// Status is emitted only on change: a client re-rendering a conversation
+        /// once a second for a value that never moved is pure noise, and a
+        /// `running`/`idle` pair every tick reads as a turn ending over and over.
+        func report(_ running: Bool) async {
+            if !running, emittedRunning != true { return }
+            guard emittedRunning != running else { return }
+            emittedRunning = running
+            caster.send(.status(running ? "running" : "idle"))
+            if !running { await store.devicePusher.noteExternalIdle() }
+        }
+
         if let mtime = mtime(path), Date().timeIntervalSince(mtime) < Self.idleAfter,
             !TranscriptParser.isTurnClosed(atPath: path)
         {
-            caster.send(.status("running"))
-            emittedRunning = true
+            await report(true)
             if let open = fold.snapshot.last, open.role == .assistant {
                 caster.send(.messageUpserted(open))
             }
+        } else if Self.agentsWorking(transcriptPath: path) {
+            await report(true)
         }
 
         while !Task.isCancelled {
@@ -88,26 +100,14 @@ actor TranscriptWatcher {
                     suppressedUntil = Date().addingTimeInterval(Self.runnerGrace)
                     continue
                 }
-                if Date() > suppressedUntil,
-                    let sidecar = TranscriptParser.sidecarActivity(transcriptPath: path),
-                    sidecar > lastGrowth
+                guard Date() > suppressedUntil else { continue }
+                if Self.agentsWorking(transcriptPath: path) {
+                    lastGrowth = Date()
+                    await report(true)
+                } else if Date().timeIntervalSince(lastGrowth) > Self.idleAfter
+                    || TranscriptParser.isTurnClosed(atPath: path)
                 {
-                    lastGrowth = sidecar
-                    if !emittedRunning {
-                        caster.send(.status("running"))
-                        emittedRunning = true
-                    }
-                }
-                if emittedRunning {
-                    if Date().timeIntervalSince(lastGrowth) > Self.idleAfter
-                        || TranscriptParser.isTurnClosed(atPath: path)
-                    {
-                        caster.send(.status("idle"))
-                        emittedRunning = false
-                        await store.devicePusher.noteExternalIdle()
-                    } else {
-                        caster.send(.status("running"))
-                    }
+                    await report(false)
                 }
                 continue
             }
@@ -127,15 +127,25 @@ actor TranscriptWatcher {
             for message in fold.snapshot where changed.contains(message.id) {
                 caster.send(.messageUpserted(message))
             }
-            if TranscriptParser.isTurnClosed(atPath: path) {
-                caster.send(.status("idle"))
-                emittedRunning = false
-                await store.devicePusher.noteExternalIdle()
-            } else if !emittedRunning {
-                caster.send(.status("running"))
-                emittedRunning = true
+            if TranscriptParser.isTurnClosed(atPath: path),
+                !Self.agentsWorking(transcriptPath: path)
+            {
+                await report(false)
+            } else {
+                await report(true)
             }
         }
+    }
+
+    /// Whether agents spawned by this session are still writing. A turn that
+    /// hands its work to background agents closes in the parent transcript
+    /// while the real work runs on in the sidecars — reading only the parent
+    /// would call that session finished the moment it delegated.
+    private nonisolated static func agentsWorking(transcriptPath: String) -> Bool {
+        guard let latest = TranscriptParser.sidecarActivity(transcriptPath: transcriptPath) else {
+            return false
+        }
+        return Date().timeIntervalSince(latest) < TranscriptIndex.subagentActivityWindow
     }
 
     private nonisolated func fileSize(_ path: String) -> Int? {

@@ -66,7 +66,9 @@ func registerRoutes(
     router.get("sessions") { _, _ in
         let active = await index.activeIDs(within: TranscriptIndex.activityWindow)
         let dates = await index.transcriptDates()
-        let stored = await store.list(activeClaudeIDs: active, transcriptDates: dates)
+        let agents = await index.agentActivity()
+        let stored = await store.list(
+            activeClaudeIDs: active, transcriptDates: dates, agents: agents)
         let (claimed, hidden) = await store.excludedTranscriptIDs()
         let discovered = await index.list(excluding: claimed, hidden: hidden)
         return jsonResponse((stored + discovered).sorted { $0.updatedAt > $1.updatedAt })
@@ -296,6 +298,8 @@ func registerRoutes(
         let claudeID = (await store.get(id))?.claudeSessionID ?? id
         let running: Bool
         if await store.hasRunnerTurnInFlight(claudeSessionID: claudeID) {
+            running = true
+        } else if await index.hasWorkingAgents(claudeID) {
             running = true
         } else if let path = await index.path(for: claudeID),
             TranscriptParser.isTurnClosed(atPath: path)

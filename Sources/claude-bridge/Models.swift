@@ -132,6 +132,18 @@ struct SessionSummary: Codable, Sendable {
     var createdAt: Date
     var updatedAt: Date
     var active: Bool?
+    /// How many agents are working for this session right now, and — when a
+    /// single one is — what it was sent to do. A session deep in fan-out is
+    /// live without a word appearing in its own transcript, so this is the only
+    /// thing a list can say about it.
+    var agents: Int?
+    var agentTask: String?
+}
+
+/// The agents working for one session, as a list row can describe them.
+struct AgentActivity: Sendable {
+    var count: Int
+    var task: String?
 }
 
 struct SubagentSummary: Codable, Sendable {
