@@ -29,6 +29,17 @@ private func jsonResponse<T: Encodable>(_ value: T, status: HTTPResponse.Status 
     return Response(status: status, headers: headers, body: .init(byteBuffer: buffer))
 }
 
+private func rawResponse(
+    _ data: Data, mime: String?, cacheControl: String = "private, max-age=60"
+) -> Response {
+    var headers = HTTPFields()
+    headers[.contentType] = mime
+    headers[.cacheControl] = cacheControl
+    var buffer = ByteBuffer()
+    buffer.writeBytes(data)
+    return Response(status: .ok, headers: headers, body: .init(byteBuffer: buffer))
+}
+
 private func decodeBody<T: Decodable>(
     _ type: T.Type, _ request: Request, limit: Int = 1 << 20
 ) async throws -> T {
@@ -129,6 +140,34 @@ func registerRoutes(
             return jsonResponse(["error": "not readable"], status: .notFound)
         }
         return jsonResponse(FileContent(path: path, content: content))
+    }
+
+    /// Bytes of a file the agent worked with, so an image it looked at renders
+    /// in the client that cannot reach the host's disk. Same reach as
+    /// `/files/content`, which already serves any path this user can read.
+    ///
+    /// A picture outlives its file: agents write screenshots to `/tmp` and clean
+    /// them up, and the conversation still has to show what it was talking
+    /// about, so a missing file falls back to the copy the transcript kept for
+    /// that tool call. Disk wins when both exist — it holds the picture at full
+    /// size, while the transcript keeps the downscaled one the model was sent.
+    router.get("files/raw") { request, _ in
+        guard let raw = request.uri.queryParameters.get("path") else {
+            return jsonResponse(["error": "path required"], status: .badRequest)
+        }
+        let root = FileManager.default.homeDirectoryForCurrentUser.path
+        let path = FileBrowsing.resolve(String(raw), home: root)
+        if let data = FileBrowsing.bytes(path) {
+            return rawResponse(
+                data, mime: mimeType(forExtension: (path as NSString).pathExtension))
+        }
+        if let tool = request.uri.queryParameters.get("tool"),
+            let session = request.uri.queryParameters.get("session"),
+            let recovered = await index.imageBytes(session: String(session), toolID: String(tool))
+        {
+            return rawResponse(recovered.data, mime: recovered.mime)
+        }
+        return jsonResponse(["error": "not readable"], status: .notFound)
     }
 
     router.get("attachments/:session/:name") { _, context in

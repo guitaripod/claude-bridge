@@ -42,7 +42,7 @@ actor TranscriptWatcher {
         if let primed = await index.foldHandoff(atPath: path) {
             (fold, offset) = (primed.fold, primed.offset)
         } else {
-            (fold, offset) = (TranscriptFold(), 0)
+            (fold, offset) = (TranscriptFold(sessionID: transcriptID), 0)
         }
         var emittedRunning: Bool? = nil
         var lastGrowth = Date()

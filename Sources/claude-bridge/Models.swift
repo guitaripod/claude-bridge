@@ -21,9 +21,9 @@ struct ToolCall: Codable, Sendable {
     var status: ToolStatus
 }
 
-/// A file that travelled with a prompt. `url` is relative to the bridge root so
-/// a client can fetch the bytes it already sent (or that a CLI turn attached)
-/// without knowing where on the host they landed.
+/// A file in a conversation: one that travelled with a prompt, or one the agent
+/// read and is therefore showing. `url` is relative to the bridge root so a
+/// client can fetch the bytes without knowing where on the host they landed.
 struct FileRef: Codable, Sendable {
     var path: String
     var mime: String
@@ -308,5 +308,17 @@ enum FileBrowsing {
         else { return nil }
         try? handle.close()
         return String(data: data, encoding: .utf8)
+    }
+
+    /// Raw bytes of a regular file, refusing directories and anything past the
+    /// cap — this feeds an inline image in a phone client, not a file transfer.
+    static func bytes(_ path: String, cap: Int = 40 * 1024 * 1024) -> Data? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+            !isDirectory.boolValue,
+            let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size]) as? Int,
+            size <= cap
+        else { return nil }
+        return try? Data(contentsOf: URL(fileURLWithPath: path))
     }
 }

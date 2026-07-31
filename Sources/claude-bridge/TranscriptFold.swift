@@ -55,12 +55,16 @@ struct TranscriptFold: Sendable {
     /// The compaction boundary still waiting for the summary record that always follows it.
     private var openCompactionIndex: Int?
     private let includeSidechain: Bool
+    /// The session whose transcript this is, carried into image URLs so the
+    /// bytes can be recovered from the transcript when the file is gone.
+    private let sessionID: String?
     /// Latest `/goal` record seen. Folded here rather than scanned separately because these bytes
     /// are already being read and parsed — goal tracking costs nothing on top of it.
     private(set) var goal: GoalStatus?
 
-    init(includeSidechain: Bool = false) {
+    init(includeSidechain: Bool = false, sessionID: String? = nil) {
         self.includeSidechain = includeSidechain
+        self.sessionID = sessionID
     }
 
     var snapshot: [Message] {
@@ -70,7 +74,7 @@ struct TranscriptFold: Sendable {
     }
 
     mutating func reset() {
-        self = TranscriptFold()
+        self = TranscriptFold(includeSidechain: includeSidechain, sessionID: sessionID)
     }
 
     /// Scans with a cursor and trims the consumed prefix once at the end —
@@ -140,6 +144,10 @@ struct TranscriptFold: Sendable {
                         resolveTool(
                             toolID, output: TranscriptParser.flatten(block["content"]),
                             isError: block["is_error"] as? Bool == true, changed: &changed)
+                        attachImage(
+                            toolID,
+                            mime: ImageResult.mime(block: block, result: line["toolUseResult"]),
+                            changed: &changed)
                     case "text":
                         if let text = (block["text"] as? String)
                             .flatMap(TranscriptParser.typedText)
@@ -307,6 +315,56 @@ struct TranscriptFold: Sendable {
         case "webp": return "image/webp"
         case "pdf": return "application/pdf"
         default: return "application/octet-stream"
+        }
+    }
+
+    /// Docks a picture at the tool call that read it, so an image the agent
+    /// looked at is an image the person reading along sees too. The bytes stay
+    /// on the host and the part carries a bridge URL: a transcript keeps a
+    /// base64 copy of every image ever read, and streaming those to a phone
+    /// costs megabytes per scrollback.
+    private mutating func attachImage(_ toolID: String, mime: String?, changed: inout Set<String>) {
+        guard let mime, let location = toolLocation[toolID],
+            let file = imageRef(at: location, mime: mime, toolID: toolID)
+        else { return }
+        let insertAt = location.partIndex + 1
+        if let index = location.messageIndex {
+            guard !isAttached(file, to: messages[index], at: insertAt) else { return }
+            messages[index].parts.insert(.file(file), at: insertAt)
+            changed.insert(messages[index].id)
+            shiftToolLocations(inMessage: index, from: insertAt)
+        } else if var open = turn {
+            guard !isAttached(file, to: open, at: insertAt) else { return }
+            open.parts.insert(.file(file), at: insertAt)
+            turn = open
+            markTurnChanged(&changed)
+            shiftToolLocations(inMessage: nil, from: insertAt)
+        }
+    }
+
+    private func imageRef(
+        at location: (messageIndex: Int?, partIndex: Int), mime: String, toolID: String
+    ) -> FileRef? {
+        guard let parts = location.messageIndex.map({ messages[$0].parts }) ?? turn?.parts,
+            parts.indices.contains(location.partIndex),
+            case .tool(let call) = parts[location.partIndex],
+            let path = ImageResult.path(toolInput: call.input)
+        else { return nil }
+        return FileRef(
+            path: path, mime: mime, filename: (path as NSString).lastPathComponent,
+            url: ImageResult.url(path: path, toolID: toolID, session: sessionID))
+    }
+
+    private func isAttached(_ file: FileRef, to message: Message, at index: Int) -> Bool {
+        guard message.parts.indices.contains(index), case .file(let existing) = message.parts[index]
+        else { return false }
+        return existing.path == file.path
+    }
+
+    private mutating func shiftToolLocations(inMessage messageIndex: Int?, from index: Int) {
+        for (id, location) in toolLocation
+        where location.messageIndex == messageIndex && location.partIndex >= index {
+            toolLocation[id] = (location.messageIndex, location.partIndex + 1)
         }
     }
 

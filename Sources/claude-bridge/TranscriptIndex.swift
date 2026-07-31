@@ -140,6 +140,17 @@ actor TranscriptIndex {
 
     /// Directories that can hold subagent transcripts: the session's
     /// `subagents/` dir plus one `workflows/<runID>/` level beneath it.
+    /// The session a transcript belongs to: its own file name, or — for a
+    /// subagent sidecar under `<sessionID>/subagents/` — the session that spawned it.
+    nonisolated static func sessionID(forTranscriptPath path: String) -> String {
+        let url = URL(fileURLWithPath: path)
+        let components = url.pathComponents
+        if let index = components.lastIndex(of: "subagents"), index > 0 {
+            return components[index - 1]
+        }
+        return url.deletingPathExtension().lastPathComponent
+    }
+
     nonisolated static func sidecarDirs(transcriptPath: String) -> [URL] {
         let root = URL(fileURLWithPath: transcriptPath)
             .deletingPathExtension()
@@ -271,6 +282,34 @@ actor TranscriptIndex {
         return nil
     }
 
+    /// The picture a tool call handed the model, recovered from the transcript when the file it
+    /// read no longer exists — a screenshot written to `/tmp` rarely outlives the turn, and a
+    /// conversation has to keep showing what it was talking about. Searches the session's own
+    /// transcript first, then its subagent sidecars: a picture a subagent looked at is docked in
+    /// the conversation that spawned it.
+    func imageBytes(session: String, toolID: String) async -> (data: Data, mime: String)? {
+        if pathByID[session] == nil { scan() }
+        guard let path = pathByID[session] else { return nil }
+        let sidecars = Self.sidecarDirs(transcriptPath: path)
+        return await Task.detached(priority: .userInitiated) {
+            if let found = TranscriptImage.bytes(transcriptPath: path, toolID: toolID) {
+                return found
+            }
+            for dir in sidecars {
+                let files =
+                    (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+                for name in files where name.hasPrefix("agent-") && name.hasSuffix(".jsonl") {
+                    if let found = TranscriptImage.bytes(
+                        transcriptPath: dir.appendingPathComponent(name).path, toolID: toolID)
+                    {
+                        return found
+                    }
+                }
+            }
+            return nil
+        }.value
+    }
+
     /// Latest transcript mtime per session id, for freshening stored sessions
     /// whose conversation has since continued elsewhere.
     func transcriptDates() -> [String: Date] {
@@ -380,14 +419,17 @@ actor TranscriptIndex {
         guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
+        let session = sessionID(forTranscriptPath: path)
         var state =
             prior
             ?? FoldState(
-                fold: TranscriptFold(includeSidechain: includeSidechain), offset: 0,
+                fold: TranscriptFold(includeSidechain: includeSidechain, sessionID: session),
+                offset: 0,
                 includeSidechain: includeSidechain)
         if size < state.offset {
             state = FoldState(
-                fold: TranscriptFold(includeSidechain: includeSidechain), offset: 0,
+                fold: TranscriptFold(includeSidechain: includeSidechain, sessionID: session),
+                offset: 0,
                 includeSidechain: includeSidechain)
         }
         guard size > state.offset else { return state }
@@ -634,7 +676,9 @@ enum TranscriptParser {
     /// Full parse: folds transcript lines into the bridge's message model.
     static func messages(at file: URL, includeSidechain: Bool = false) -> [Message] {
         guard let data = try? Data(contentsOf: file) else { return [] }
-        var fold = TranscriptFold(includeSidechain: includeSidechain)
+        var fold = TranscriptFold(
+            includeSidechain: includeSidechain,
+            sessionID: TranscriptIndex.sessionID(forTranscriptPath: file.path))
         _ = fold.consume(data)
         return fold.snapshot
     }

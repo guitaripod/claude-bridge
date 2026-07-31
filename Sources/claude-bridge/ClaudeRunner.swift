@@ -204,6 +204,7 @@ private struct Assembler {
         case text(String)
         case thinking(String)
         case tool(String)
+        case file(FileRef)
         case compaction
     }
     private var segments: [Segment] = []
@@ -318,7 +319,25 @@ private struct Assembler {
             call.status = (block["is_error"] as? Bool == true) ? .error : .completed
             tools[toolID] = call
             emit(.toolUpserted(messageID: messageID, call))
+            appendImage(
+                from: block, result: object["toolUseResult"], toolID: toolID, call: call)
         }
+    }
+
+    /// A picture the agent just looked at joins the turn where it looked, so the
+    /// answer that follows arrives with the thing it is talking about.
+    private mutating func appendImage(
+        from block: [String: Any], result: Any?, toolID: String, call: ToolCall
+    ) {
+        guard let mime = ImageResult.mime(block: block, result: result),
+            let path = ImageResult.path(toolInput: call.input)
+        else { return }
+        segments.append(
+            .file(
+                FileRef(
+                    path: path, mime: mime, filename: (path as NSString).lastPathComponent,
+                    url: ImageResult.url(path: path, toolID: toolID, session: sessionID))))
+        blockBoundary = true
     }
 
     func finalMessage() -> Message {
@@ -333,6 +352,8 @@ private struct Assembler {
                 parts.append(.reasoning(value))
             case .tool(let id):
                 if let call = tools[id] { parts.append(.tool(call)) }
+            case .file(let file):
+                parts.append(.file(file))
             case .compaction:
                 parts.append(.compaction(Compaction()))
             }

@@ -76,6 +76,7 @@ All request/response bodies are JSON. When `BRIDGE_PASSWORD` is set, every route
 | GET | `/usage/grok` | — | Grok quota gauges, when a Grok key is configured |
 | GET | `/files` | `?path=` | `[FileNode]` — directory listing for the project picker |
 | GET | `/files/content` | `?path=` | `{path, content}` |
+| GET | `/files/raw` | `?path=`, `?tool=`, `?session=` | the file's bytes with its MIME type — what an image part points at; a deleted file falls back to the copy that session's transcript kept for that tool call |
 | GET | `/attachments/:session/:name` | — | the bytes a prompt carried, served back with its MIME type |
 | POST | `/sessions/:id/live-activity` | `LiveActivityRegistration` | registers an ActivityKit push token for this session |
 | POST | `/push/device` | `{token, environment}` | registers a device token for turn-end pushes (requires `BRIDGE_PASSWORD`) |
@@ -87,6 +88,13 @@ lastCostUSD?, lastTokens?, goal?}`. `Message`: `{id, role: "user"|"assistant", p
 `{kind: "file", file: FileRef}` or `{kind: "compaction", compaction: Compaction}`.
 `ToolCall`: `{id, name, input, output?, status: "running"|"completed"|"error"}`.
 Dates are ISO 8601. Sessions persist to `BRIDGE_STORE` across restarts.
+
+A `file` part on a **user** message is an attachment that prompt carried; on an **assistant**
+message it is a picture the agent looked at — every tool result that hands Claude an image becomes
+one, docked at the tool call that read it, with `url` pointing at `/files/raw` so a client renders
+the same picture without the base64 the transcript keeps. The picture outlives the file: agents
+write screenshots to `/tmp` and clean them up, so `/files/raw` falls back to the transcript's own
+copy when the path is gone.
 
 ## Transcript discovery
 
