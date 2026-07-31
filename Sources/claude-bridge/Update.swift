@@ -403,14 +403,33 @@ actor UpdateService {
         return String(tail.suffix(characters)).trimmedOrNil()
     }
 
+    /// Whether something will start this process again if it exits — the whole restart strategy
+    /// rests on it, so the question is asked of the supervisor this process actually runs under,
+    /// not of a unit name someone hoped for. On Linux that is our own cgroup and its `Restart=`;
+    /// on macOS, the launch agent the installer writes, whose `KeepAlive` we know.
     static let serviceManager: String = {
         #if os(macOS)
             return Shell.run("launchctl", ["list"], timeout: 10)
                 .contains("com.guitaripod.claude-bridge") ? "launchd" : "manual"
         #else
-            let unit = Shell.run(
-                "systemctl", ["--user", "is-enabled", "claude-bridge.service"], timeout: 10)
-            return unit.contains("enabled") || unit.contains("static") ? "systemd" : "manual"
+            guard let unit = systemdUnit() else { return "manual" }
+            let restart = Shell.run(
+                "systemctl", ["--user", "show", unit, "-p", "Restart", "--value"], timeout: 10
+            ).trimmedOrNil()
+            return restart == "always" || restart == "on-success" ? "systemd" : "manual"
         #endif
     }()
+
+    /// The systemd unit this process belongs to, read off its own cgroup: the last path component
+    /// that names a service, since the user manager itself (`user@1000.service`) is one too.
+    private static func systemdUnit() -> String? {
+        guard let cgroup = try? String(contentsOfFile: "/proc/self/cgroup", encoding: .utf8) else {
+            return nil
+        }
+        for line in cgroup.split(separator: "\n") {
+            let units = line.split(separator: "/").filter { $0.hasSuffix(".service") }
+            if let unit = units.last, !unit.hasPrefix("user@") { return String(unit) }
+        }
+        return nil
+    }
 }

@@ -18,8 +18,9 @@ CONFIG="$STATE_DIR/config.env"
 RUNNER="$STATE_DIR/run.sh"
 LOG="$STATE_DIR/update.log"
 STATE_FILE="$STATE_DIR/update.state.json"
-LABEL="com.guitaripod.claude-bridge"
-UNIT="claude-bridge.service"
+LABEL="${BRIDGE_LABEL:-com.guitaripod.claude-bridge}"
+UNIT="${BRIDGE_UNIT:-claude-bridge.service}"
+PORT="${BRIDGE_PORT:-4098}"
 MODE="install"
 MANAGED=""
 for argument in "$@"; do
@@ -104,7 +105,7 @@ write_config() {
   cat >"$CONFIG" <<EOF
 # claude-bridge configuration. Edit, then restart the service.
 export BRIDGE_PASSWORD="$password"
-export BRIDGE_PORT=4098
+export BRIDGE_PORT=$PORT
 # 0.0.0.0 so a phone on your tailnet can reach it; the password is what keeps it yours.
 export BRIDGE_BIND=0.0.0.0
 export BRIDGE_MODEL=sonnet
@@ -204,13 +205,13 @@ report() {
 
 claude-bridge is running.
 
-  Address   http://$address:4098
+  Address   http://$address:$PORT
   Username  claude
   Password  $password
 
 Put that address and password into Tailscode (Settings → Servers → Add), or:
 
-  curl -u claude:$password http://$address:4098/health
+  curl -u claude:$password http://$address:$PORT/health
 
 Config    $CONFIG
 Source    $SRC
