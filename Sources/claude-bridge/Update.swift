@@ -88,6 +88,23 @@ enum Shell {
         return String(data: output.data, encoding: .utf8) ?? ""
     }
 
+    /// Starts a command and walks away: no pipe to read, no exit to wait for. Backgrounding
+    /// through a shell instead leaves this process holding the child's output, which turns a
+    /// hand-off into a wait for the whole job.
+    static func spawn(_ executable: String, _ arguments: [String], environment: [String: String]) {
+        guard let url = which(executable) else { return }
+        let process = Process()
+        process.executableURL = url
+        process.arguments = arguments
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        var merged = ProcessInfo.processInfo.environment
+        for (key, value) in environment { merged[key] = value }
+        process.environment = merged
+        try? process.run()
+    }
+
     static func which(_ executable: String) -> URL? {
         if executable.hasPrefix("/") {
             return FileManager.default.isExecutableFile(atPath: executable)
@@ -240,16 +257,8 @@ actor UpdateService {
             "BRIDGE_SRC": source,
             "BRIDGE_STATE_DIR": stateDirectory.path,
         ]
-        environment["PATH"] = ProcessInfo.processInfo.environment["PATH"]
         environment["HOME"] = FileManager.default.homeDirectoryForCurrentUser.path
-        Shell.run(
-            "/bin/sh",
-            [
-                "-c",
-                "\(exports(environment)) nohup /bin/bash \(script) --update --managed "
-                    + ">/dev/null 2>&1 &",
-            ],
-            timeout: 15)
+        Shell.spawn("/bin/bash", [script, "--update", "--managed"], environment: environment)
     }
 
     /// Reconciles a process that just started with the update that may have been running when it
