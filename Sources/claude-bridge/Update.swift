@@ -252,13 +252,20 @@ actor UpdateService {
             timeout: 15)
     }
 
-    /// Picks up an update that was already building when this process started — a bridge that was
-    /// restarted for another reason mid-update still has to load the binary that lands.
-    func resumeIfWorking() {
-        guard let phase = readState()?.phase, phase == "running" || phase == "building" else {
-            return
+    /// Reconciles a process that just started with the update that may have been running when it
+    /// did: a phase of `restarting` means this process *is* that restart, and a build still in
+    /// flight has to be watched again, because the binary it produces still needs loading.
+    func resume() {
+        guard let state = readState() else { return }
+        switch state.phase {
+        case "restarting":
+            write(
+                UpdateState(phase: "succeeded", startedAt: state.startedAt, finishedAt: Date()))
+        case "running", "building":
+            watch()
+        default:
+            break
         }
-        watch()
     }
 
     /// Restarting is the bridge's own move, not the script's.
