@@ -276,14 +276,25 @@ actor UpdateService {
 
     /// The script is copied out of the checkout before it runs: bash reads a script as it executes,
     /// and the update rewrites that file underneath it.
+    ///
+    /// A checkout old enough to predate the installer has no script to copy, which is exactly the
+    /// checkout most in need of an update — so it is taken from the commit being updated to
+    /// instead, straight out of the object database the fetch already filled.
     private func stagedScript(source: String) -> String? {
-        let origin = "\(source)/install.sh"
-        guard FileManager.default.fileExists(atPath: origin) else { return nil }
         let staged = NSTemporaryDirectory() + "claude-bridge-update.sh"
         try? FileManager.default.removeItem(atPath: staged)
-        guard (try? FileManager.default.copyItem(atPath: origin, toPath: staged)) != nil else {
-            return nil
+        let local = "\(source)/install.sh"
+        if FileManager.default.fileExists(atPath: local),
+            (try? FileManager.default.copyItem(atPath: local, toPath: staged)) != nil
+        {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: staged)
+            return staged
         }
+        guard let head = remoteHead(source) else { return nil }
+        let script = Shell.run("git", ["show", "\(head):install.sh"], cwd: source)
+        guard script.contains("#!"),
+            (try? script.write(toFile: staged, atomically: true, encoding: .utf8)) != nil
+        else { return nil }
         try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: staged)
         return staged
     }
