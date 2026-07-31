@@ -98,6 +98,7 @@ let watcher = TranscriptWatcher(index: index, store: store)
 await store.attach(index: index)
 await store.pusher.endOrphans()
 let updater = UpdateService(stateDirectory: storeURL.deletingLastPathComponent())
+await updater.resumeIfWorking()
 registerRoutes(
     router, store: store, index: index, watcher: watcher, updater: updater,
     agentModel: defaultModel, hasAuth: !password.isEmpty)

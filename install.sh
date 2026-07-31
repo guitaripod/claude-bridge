@@ -21,7 +21,15 @@ STATE_FILE="$STATE_DIR/update.state.json"
 LABEL="com.guitaripod.claude-bridge"
 UNIT="claude-bridge.service"
 MODE="install"
-[ "${1:-}" = "--update" ] && MODE="update"
+MANAGED=""
+for argument in "$@"; do
+  case "$argument" in
+    --update) MODE="update" ;;
+    # The bridge started this update and will restart itself once the build lands, so the script
+    # must not touch the service: it is a child of the very thing it would be restarting.
+    --managed) MANAGED="1" ;;
+  esac
+done
 
 mkdir -p "$STATE_DIR"
 
@@ -214,9 +222,12 @@ if [ "$MODE" = "update" ]; then
   fetch_source
   phase building
   build
+  say "built $(git -C "$SRC" describe --tags --always 2>/dev/null || echo unknown)"
   phase restarting
+  if [ -n "$MANAGED" ]; then
+    exit 0
+  fi
   restart_service
-  say "updated to $(git -C "$SRC" describe --tags --always 2>/dev/null || echo unknown)"
   phase succeeded "$(now)"
   exit 0
 fi

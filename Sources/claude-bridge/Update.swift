@@ -172,7 +172,7 @@ actor UpdateService {
 
     func status(refreshing: Bool = true) -> UpdateStatus {
         let state = readState()
-        let phase = state?.phase ?? "idle"
+        let phase = Self.settled(state)
         var status = UpdateStatus(
             version: BridgeVersion.describe(source: source),
             commit: BridgeVersion.commit(source: source),
@@ -228,14 +228,13 @@ actor UpdateService {
         try? Data().write(to: logURL, options: .atomic)
         write(UpdateState(phase: "running", startedAt: Date(), finishedAt: nil))
         detach(script: script, source: source)
+        watch()
         lastFetch = nil
         return (true, status(refreshing: false))
     }
 
-    /// The updater has to outlive the process that starts it: its last step restarts the service,
-    /// and a child of that service dies with it. systemd gives us a transient unit outside our own
-    /// cgroup, launchd takes a submitted job, and anything else gets a plain detached process —
-    /// enough when nothing is going to signal a process group.
+    /// Hands the work to a process that keeps running after this one answers, and stops caring
+    /// about it: the script builds, and the restart is this process's own job — see ``watch()``.
     private func detach(script: String, source: String) {
         var environment = [
             "BRIDGE_SRC": source,
@@ -243,27 +242,64 @@ actor UpdateService {
         ]
         environment["PATH"] = ProcessInfo.processInfo.environment["PATH"]
         environment["HOME"] = FileManager.default.homeDirectoryForCurrentUser.path
-        let command = "\(exports(environment)) exec /bin/bash \(script) --update"
-        switch Self.serviceManager {
-        case "systemd":
-            var arguments = ["--user", "--collect", "--quiet", "--unit=claude-bridge-update"]
-            arguments += environment.map { "--setenv=\($0.key)=\($0.value)" }
-            arguments += ["/bin/bash", script, "--update"]
-            Shell.run("systemd-run", arguments, timeout: 15)
-        case "launchd":
-            Shell.run(
-                "launchctl",
-                [
-                    "submit", "-l", "com.guitaripod.claude-bridge.update", "--", "/bin/bash", "-c",
-                    command,
-                ],
-                timeout: 15)
-        default:
-            Shell.run(
-                "/bin/sh",
-                ["-c", "\(exports(environment)) nohup /bin/bash \(script) --update >/dev/null 2>&1 &"],
-                timeout: 15)
+        Shell.run(
+            "/bin/sh",
+            [
+                "-c",
+                "\(exports(environment)) nohup /bin/bash \(script) --update --managed "
+                    + ">/dev/null 2>&1 &",
+            ],
+            timeout: 15)
+    }
+
+    /// Picks up an update that was already building when this process started — a bridge that was
+    /// restarted for another reason mid-update still has to load the binary that lands.
+    func resumeIfWorking() {
+        guard let phase = readState()?.phase, phase == "running" || phase == "building" else {
+            return
         }
+        watch()
+    }
+
+    /// Restarting is the bridge's own move, not the script's.
+    ///
+    /// Every way of asking a supervisor to restart a service kills the process group the asking
+    /// script lives in — and a launchd job that keeps being respawned will happily rebuild and
+    /// restart forever. So the script stops at `restarting`, and the bridge exits: `Restart=always`
+    /// and `KeepAlive` bring it straight back, now running the binary that was just built.
+    private func watch() {
+        Task { [weak self] in
+            guard let self else { return }
+            for _ in 0..<600 {
+                try? await Task.sleep(for: .seconds(2))
+                guard let phase = await self.phaseOnDisk() else { continue }
+                if phase == "restarting" {
+                    await self.finishAndExit()
+                    return
+                }
+                if phase == "failed" || phase == "succeeded" { return }
+            }
+        }
+    }
+
+    private func phaseOnDisk() -> String? { readState()?.phase }
+
+    /// An update whose process was killed — a machine that slept, a service stopped mid-build —
+    /// leaves its phase behind forever. After half an hour it is not running, it failed.
+    private static func settled(_ state: UpdateState?) -> String {
+        guard let state else { return "idle" }
+        let unfinished = ["running", "building", "restarting"].contains(state.phase)
+        guard unfinished, let started = state.startedAt,
+            Date().timeIntervalSince(started) > 30 * 60
+        else { return state.phase }
+        return "failed"
+    }
+
+    private func finishAndExit() async {
+        write(UpdateState(phase: "succeeded", startedAt: readState()?.startedAt, finishedAt: Date()))
+        guard Self.serviceManager != "manual" else { return }
+        try? await Task.sleep(for: .milliseconds(600))
+        exit(0)
     }
 
     private func exports(_ environment: [String: String]) -> String {
