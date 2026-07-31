@@ -288,11 +288,15 @@ actor UpdateService {
         return staged
     }
 
+    /// Only the fetch is rate-limited — it is the part that costs a network round trip. How far
+    /// behind this checkout is gets recomputed every time: it is a local question, and the answer
+    /// changes the moment the checkout moves.
     private func remoteState() -> RemoteState? {
         guard let source else { return nil }
-        if let lastFetch, Date().timeIntervalSince(lastFetch) < 300 { return cachedRemote }
-        Shell.run("git", ["fetch", "--quiet", "--tags", "origin"], cwd: source, timeout: 25)
-        lastFetch = Date()
+        if lastFetch.map({ Date().timeIntervalSince($0) >= 300 }) ?? true {
+            Shell.run("git", ["fetch", "--quiet", "--tags", "origin"], cwd: source, timeout: 25)
+            lastFetch = Date()
+        }
         guard let head = remoteHead(source) else {
             cachedRemote = nil
             return nil
@@ -306,7 +310,7 @@ actor UpdateService {
         let describe = Shell.run("git", ["describe", "--tags", "--always", head], cwd: source)
             .trimmedOrNil()
         cachedRemote = RemoteState(
-            commit: String(head.prefix(9)), describe: describe, changes: changes, behind: behind)
+            commit: String(head.prefix(7)), describe: describe, changes: changes, behind: behind)
         return cachedRemote
     }
 
