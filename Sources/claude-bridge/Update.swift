@@ -225,15 +225,11 @@ actor UpdateService {
             current.reason = "install.sh is missing from the checkout, so there is nothing to run."
             return (false, current)
         }
-        let now = Date()
-        write(UpdateState(phase: "running", startedAt: now, finishedAt: nil))
         try? Data().write(to: logURL, options: .atomic)
+        write(UpdateState(phase: "running", startedAt: Date(), finishedAt: nil))
         detach(script: script, source: source)
         lastFetch = nil
-        current.phase = "running"
-        current.startedAt = now
-        current.finishedAt = nil
-        return (true, current)
+        return (true, status(refreshing: false))
     }
 
     /// The updater has to outlive the process that starts it: its last step restarts the service,
@@ -356,9 +352,12 @@ actor UpdateService {
         try? data.write(to: stateURL, options: .atomic)
     }
 
-    private func logTail(lines: Int = 40) -> String? {
+    /// A tail, not a transcript: a Swift build prints thousands of lines of warnings, and this
+    /// rides in every poll a client makes while the update runs.
+    private func logTail(lines: Int = 12, characters: Int = 2000) -> String? {
         guard let contents = try? String(contentsOf: logURL, encoding: .utf8) else { return nil }
-        return contents.split(separator: "\n").suffix(lines).joined(separator: "\n").trimmedOrNil()
+        let tail = contents.split(separator: "\n").suffix(lines).joined(separator: "\n")
+        return String(tail.suffix(characters)).trimmedOrNil()
     }
 
     static let serviceManager: String = {
