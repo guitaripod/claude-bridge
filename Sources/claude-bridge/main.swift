@@ -97,9 +97,10 @@ let index = TranscriptIndex(
 let watcher = TranscriptWatcher(index: index, store: store)
 await store.attach(index: index)
 await store.pusher.endOrphans()
+let updater = UpdateService(stateDirectory: storeURL.deletingLastPathComponent())
 registerRoutes(
-    router, store: store, index: index, watcher: watcher, agentModel: defaultModel,
-    hasAuth: !password.isEmpty)
+    router, store: store, index: index, watcher: watcher, updater: updater,
+    agentModel: defaultModel, hasAuth: !password.isEmpty)
 startExternalIdleSweep(index: index, store: store)
 
 let app = Application(

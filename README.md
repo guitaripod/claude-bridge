@@ -29,7 +29,33 @@ Known consumers:
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and logged in
   (`claude` must work interactively for the user running the bridge).
 
-## Quickstart
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/guitaripod/claude-bridge/master/install.sh | bash
+```
+
+Clones into `~/.claude-bridge/src`, builds it, generates a password, and registers a service that
+survives a reboot — `systemctl --user` on Linux, a launch agent on macOS. It prints the address,
+username and password to paste into a client. Config lives in `~/.claude-bridge/config.env`;
+edit it and restart the service to change the port, model, or APNs key.
+
+## Updating
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/guitaripod/claude-bridge/master/install.sh | bash
+```
+
+Re-running the installer updates in place and keeps your config and service. It never overwrites
+an existing `config.env`.
+
+Or update it from your phone: `GET /update` reports the running version, whether the remote has
+newer commits, and what they say; `POST /update` fetches, rebuilds and restarts, reporting progress
+through a state file that outlives the restart. [Tailscode](https://github.com/guitaripod/Tailscode)
+exposes this as a button on the server screen, so the machine never needs an ssh session to keep
+current. An update refuses to run on a checkout with uncommitted changes, and says so.
+
+## Running it by hand
 
 ```sh
 git clone https://github.com/guitaripod/claude-bridge
@@ -57,7 +83,9 @@ All request/response bodies are JSON. When `BRIDGE_PASSWORD` is set, every route
 | Method | Path | Body | Response |
 |---|---|---|---|
 | GET | `/health` | — | `ok` |
-| GET | `/status` | — | `{"agent": "claude", "model": "<default model>"}` |
+| GET | `/status` | — | `{"agent": "claude", "model": "<default model>", "version": "<git describe>"}` |
+| GET | `/update` | `?check=false` to skip the remote fetch | `UpdateStatus` — running version, newer commits and their subjects, whether this install can update itself, and the phase of the last update |
+| POST | `/update` | — | `202 UpdateStatus` once the update is running (`409` when it cannot, with `reason`); poll `GET /update` for `phase`: `running` → `building` → `restarting` → `succeeded`/`failed` |
 | GET | `/sessions` | — | `[SessionSummary]`, newest first, store + discovered transcripts merged |
 | POST | `/sessions` | `{title?, model?, effort?}` | the created `Session` |
 | GET | `/sessions/:id` | — | `Session` (404 if unknown), including the turn in flight |

@@ -53,7 +53,7 @@ private func isValidDeviceToken(_ token: String) -> Bool {
 
 func registerRoutes(
     _ router: Router<BasicRequestContext>, store: SessionStore, index: TranscriptIndex,
-    watcher: TranscriptWatcher, agentModel: String, hasAuth: Bool
+    watcher: TranscriptWatcher, updater: UpdateService, agentModel: String, hasAuth: Bool
 ) {
     @Sendable func adoptIfNeeded(_ id: String) async {
         guard await store.get(id) == nil, let discovered = await index.session(id) else { return }
@@ -63,7 +63,24 @@ func registerRoutes(
     router.get("health") { _, _ in "ok" }
 
     router.get("status") { _, _ in
-        jsonResponse(["agent": "claude", "model": agentModel])
+        jsonResponse([
+            "agent": "claude", "model": agentModel,
+            "version": BridgeVersion.describe(source: BridgeVersion.sourceDirectory()),
+        ])
+    }
+
+    /// What version this bridge runs, whether a newer one exists, and what happened to the last
+    /// update — so a client can offer the update rather than leaving a phone user to ssh in.
+    router.get("update") { request, _ in
+        let refreshing = request.uri.queryParameters.get("check") != "false"
+        return jsonResponse(await updater.status(refreshing: refreshing))
+    }
+
+    /// Runs the update. Answers immediately with the status to poll: the work outlives this
+    /// process, which the restart at the end of it takes down.
+    router.post("update") { _, _ in
+        let (accepted, status) = await updater.start()
+        return jsonResponse(status, status: accepted ? .accepted : .conflict)
     }
 
     router.get("usage") { _, _ in
