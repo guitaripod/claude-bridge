@@ -46,7 +46,30 @@ actor SessionStore {
     let pusher: LiveActivityPusher
     let devicePusher: DevicePusher
     private var hiddenTranscripts: Set<String>
-    private var runnerTurnClaudeIDs: Set<String> = []
+    /// Counted, not a set: a `--fork-session` turn resumes its parent's Claude id, so parent and
+    /// fork can legitimately hold the same key at once and whichever finishes first must not
+    /// declare the other's turn over.
+    private var runnerTurnClaudeIDs: [String: Int] = [:]
+    /// Sessions with a turn this bridge is running, and the prompts waiting behind them. Two
+    /// clients on one session are the normal case, so a second prompt queues rather than starting
+    /// a second `claude -p --resume` against the same transcript in the same working directory.
+    private var inFlight: Set<String> = []
+    private var pendingPrompts: [String: [QueuedPrompt]] = [:]
+
+    private struct QueuedPrompt {
+        let prompt: String
+        let model: String?
+        let effort: String?
+    }
+
+    /// What ``send(_:request:)`` did with a prompt. Both outcomes are accepted (202): a client
+    /// treats any non-2xx as message-lost and hands the text back to the composer, so refusing a
+    /// queued prompt would eat it.
+    enum SendOutcome: Sendable, Equatable {
+        case started
+        case queued(position: Int)
+        case unknownSession
+    }
     /// Attached after construction (the index is built from the same config, but later), so a
     /// finished turn can report *why* it ended when a goal drove it.
     private weak var index: TranscriptIndex?
@@ -211,11 +234,13 @@ actor SessionStore {
         return created
     }
 
-    /// Appends the user's prompt, runs a Claude turn, and streams events to subscribers.
-    func send(_ id: String, request: SendRequest) {
-        guard var session = sessions[id] else { return }
-        if let model = request.model { session.model = model }
-        if let effort = request.effort { session.effort = effort }
+    /// Records the user's prompt, then either runs a Claude turn or queues the prompt behind the
+    /// one already running. The message is appended and broadcast either way: a client drops its
+    /// optimistic echo by user-message count, so a prompt the server accepted but has not started
+    /// still has to exist in the transcript.
+    @discardableResult
+    func send(_ id: String, request: SendRequest) -> SendOutcome {
+        guard var session = sessions[id] else { return .unknownSession }
 
         let upload = storeAttachments(for: request, sessionID: id)
         let userMessage = Message(
@@ -231,20 +256,39 @@ actor SessionStore {
         sessions[id] = session
         moveToFront(id)
         persist()
+        broadcaster(for: id).send(.messageUpserted(userMessage))
+
+        let queued = QueuedPrompt(prompt: upload.prompt, model: request.model, effort: request.effort)
+        guard !inFlight.contains(id) else {
+            pendingPrompts[id, default: []].append(queued)
+            return .queued(position: pendingPrompts[id]?.count ?? 1)
+        }
+        inFlight.insert(id)
+        startTurn(id, queued)
+        return .started
+    }
+
+    /// Launches one `claude -p` for a prompt whose turn slot this session already holds.
+    private func startTurn(_ id: String, _ queued: QueuedPrompt) {
+        guard var session = sessions[id] else {
+            inFlight.remove(id)
+            return
+        }
+        if let model = queued.model { session.model = model }
+        if let effort = queued.effort { session.effort = effort }
+        sessions[id] = session
 
         let caster = broadcaster(for: id)
-        caster.send(.messageUpserted(userMessage))
-
         let runner = self.runner
         let resume = session.claudeSessionID
         let model = session.model
         let effort = session.effort.isEmpty ? defaultEffort : session.effort
-        let text = upload.prompt
+        let text = queued.prompt
         let fork = session.pendingFork == true
         let directory = session.directory
 
         let turnClaudeID = resume ?? id
-        runnerTurnClaudeIDs.insert(turnClaudeID)
+        retainRunnerTurn(turnClaudeID)
         Task {
             let turnStart = Date()
             let outcome = await runner.run(
@@ -261,6 +305,19 @@ actor SessionStore {
                 })
             await self.finishTurn(
                 id, outcome: outcome, turnClaudeID: turnClaudeID, startedAt: turnStart)
+        }
+    }
+
+    private func retainRunnerTurn(_ claudeSessionID: String) {
+        runnerTurnClaudeIDs[claudeSessionID, default: 0] += 1
+    }
+
+    private func releaseRunnerTurn(_ claudeSessionID: String) {
+        guard let count = runnerTurnClaudeIDs[claudeSessionID] else { return }
+        if count <= 1 {
+            runnerTurnClaudeIDs[claudeSessionID] = nil
+        } else {
+            runnerTurnClaudeIDs[claudeSessionID] = count - 1
         }
     }
 
@@ -411,7 +468,9 @@ actor SessionStore {
     private func linkClaudeSession(_ id: String, claudeSessionID sid: String) {
         guard var session = sessions[id], session.claudeSessionID != sid else { return }
         let supersededTurnID = session.claudeSessionID ?? id
-        if runnerTurnClaudeIDs.remove(supersededTurnID) != nil { runnerTurnClaudeIDs.insert(sid) }
+        if let held = runnerTurnClaudeIDs.removeValue(forKey: supersededTurnID) {
+            runnerTurnClaudeIDs[sid, default: 0] += held
+        }
         setClaudeSessionID(sid, on: &session)
         sessions[id] = session
         persist()
@@ -429,23 +488,32 @@ actor SessionStore {
         session.claudeSessionID = new
     }
 
-    /// Stops a turn this bridge is running by terminating its claude process;
-    /// the runner's stream ends and the partial turn is persisted normally.
-    func abortTurn(_ id: String) -> Bool {
-        guard let pid = turnProcessIDs[id] else { return false }
+    /// Stops a turn this bridge is running by terminating its claude process and discards anything
+    /// queued behind it; the runner's stream ends and the partial turn is persisted normally. Stop
+    /// means stop — leaving the queue to drain would start a fresh turn the moment the one the user
+    /// just killed ended.
+    func abortTurn(_ id: String) -> (stopped: Bool, discarded: Int) {
+        let discarded = pendingPrompts.removeValue(forKey: id)?.count ?? 0
+        guard let pid = turnProcessIDs[id] else { return (false, discarded) }
         kill(pid, SIGTERM)
-        return true
+        return (true, discarded)
+    }
+
+    /// True while this bridge holds a turn slot for the session — including a prompt still waiting
+    /// in its queue, which is why `/clear` consults it rather than the process table.
+    func hasQueuedOrRunningTurn(_ id: String) -> Bool {
+        inFlight.contains(id)
     }
 
     func hasRunnerTurnInFlight(claudeSessionID: String) -> Bool {
-        runnerTurnClaudeIDs.contains(claudeSessionID)
+        runnerTurnClaudeIDs[claudeSessionID] != nil
     }
 
     /// True while this bridge's own runner is (or was, within the window)
     /// writing the session's transcript — used to tell our own transcript
     /// residue apart from an external process working in the session.
     func recentRunnerActivity(claudeSessionID: String, within seconds: TimeInterval) -> Bool {
-        if runnerTurnClaudeIDs.contains(claudeSessionID) { return true }
+        if runnerTurnClaudeIDs[claudeSessionID] != nil { return true }
         guard let finished = lastRunnerFinish[claudeSessionID] else { return false }
         return Date().timeIntervalSince(finished) < seconds
     }
@@ -489,12 +557,13 @@ actor SessionStore {
         turnProcessIDs[id] = nil
         liveTurns[id] = nil
         settledTurnMessageIDs[id] = outcome.message.id
-        runnerTurnClaudeIDs.remove(turnClaudeID)
+        releaseRunnerTurn(turnClaudeID)
         lastRunnerFinish[turnClaudeID] = Date()
-        if let newID = outcome.claudeSessionID {
-            runnerTurnClaudeIDs.remove(newID)
+        if let newID = outcome.claudeSessionID, newID != turnClaudeID {
+            releaseRunnerTurn(newID)
             lastRunnerFinish[newID] = Date()
         }
+        defer { advanceQueue(id) }
         guard var session = sessions[id] else { return }
         if let existing = session.messages.firstIndex(where: { $0.id == outcome.message.id }) {
             session.messages[existing] = outcome.message
@@ -528,6 +597,22 @@ actor SessionStore {
                 sessionID: id, title: title, toolCount: toolCount, failed: false,
                 duration: turnDuration, goal: goal)
         }
+    }
+
+    /// Starts whatever queued behind the turn that just ended, or gives the session's turn slot
+    /// back. The session goes idle here rather than in ``ClaudeRunner``: the runner only knows its
+    /// own process ended, and announcing idle with a prompt still queued drains every client's
+    /// local queue into turns nobody asked for.
+    private func advanceQueue(_ id: String) {
+        if var queue = pendingPrompts[id], !queue.isEmpty {
+            let next = queue.removeFirst()
+            pendingPrompts[id] = queue.isEmpty ? nil : queue
+            startTurn(id, next)
+            return
+        }
+        pendingPrompts[id] = nil
+        inFlight.remove(id)
+        broadcaster(for: id).send(.status("idle"))
     }
 
     /// After the first completed turn (and after /clear), replace the

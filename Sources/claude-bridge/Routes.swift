@@ -29,6 +29,21 @@ private func jsonResponse<T: Encodable>(_ value: T, status: HTTPResponse.Status 
     return Response(status: status, headers: headers, body: .init(byteBuffer: buffer))
 }
 
+/// A prompt the bridge accepted, and whether it is running now or waiting behind a turn already
+/// in flight — a client that sent it while another client's turn was running needs to be able to
+/// say so rather than showing it as sent-and-ignored.
+private struct SendAccepted: Encodable {
+    let ok = true
+    let queued: Bool
+    let position: Int?
+}
+
+private struct AbortResult: Encodable {
+    let ok = true
+    let stopped: Bool
+    let discarded: Int
+}
+
 private func rawResponse(
     _ data: Data, mime: String?, cacheControl: String = "private, max-age=60"
 ) -> Response {
@@ -328,14 +343,24 @@ func registerRoutes(
     router.post("sessions/:id/clear") { _, context in
         let id = context.parameters.get("id") ?? ""
         await adoptIfNeeded(id)
+        guard await !store.hasQueuedOrRunningTurn(id) else {
+            return jsonResponse(
+                [
+                    "error":
+                        "This session has a turn running. Stop it first, or fork to start clean without interrupting it."
+                ],
+                status: .conflict)
+        }
         await store.clear(id)
         return jsonResponse(["ok": true])
     }
 
     router.post("sessions/:id/abort") { _, context in
         let id = context.parameters.get("id") ?? ""
-        if await store.abortTurn(id) {
-            return jsonResponse(["ok": true])
+        let result = await store.abortTurn(id)
+        if result.stopped || result.discarded > 0 {
+            return jsonResponse(
+                AbortResult(stopped: result.stopped, discarded: result.discarded))
         }
         return jsonResponse(
             [
@@ -371,8 +396,14 @@ func registerRoutes(
                 ],
                 status: .conflict)
         }
-        await store.send(id, request: body)
-        return jsonResponse(["ok": true], status: .accepted)
+        switch await store.send(id, request: body) {
+        case .unknownSession:
+            return jsonResponse(["error": "not found"], status: .notFound)
+        case .started:
+            return jsonResponse(SendAccepted(queued: false, position: nil), status: .accepted)
+        case .queued(let position):
+            return jsonResponse(SendAccepted(queued: true, position: position), status: .accepted)
+        }
     }
 
     router.get("sessions/:id/agents") { _, context in

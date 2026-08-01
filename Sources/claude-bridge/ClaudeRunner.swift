@@ -97,7 +97,6 @@ struct ClaudeRunner: Sendable {
 
         let message = assembler.finalMessage()
         emit(.messageUpserted(message))
-        emit(.status("idle"))
         return Outcome(
             message: message, claudeSessionID: assembler.sessionID ?? claudeSessionID,
             costUSD: assembler.costUSD, tokens: assembler.tokens,

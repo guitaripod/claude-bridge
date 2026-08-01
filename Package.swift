@@ -15,6 +15,10 @@ let package = Package(
                 .product(name: "Hummingbird", package: "hummingbird"),
                 .product(name: "Crypto", package: "swift-crypto"),
             ]
-        )
+        ),
+        .testTarget(
+            name: "BridgeTests",
+            dependencies: ["claude-bridge"]
+        ),
     ]
 )
