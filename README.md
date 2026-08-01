@@ -95,9 +95,9 @@ All request/response bodies are JSON. When `BRIDGE_PASSWORD` is set, every route
 | GET | `/sessions/:id` | — | `Session` (404 if unknown), including the turn in flight |
 | PATCH | `/sessions/:id` | `{title}` | the renamed `Session` |
 | DELETE | `/sessions/:id` | — | `{"ok": true}` |
-| POST | `/sessions/:id/message` | `{text, model?, effort?, attachments?}` | `202 {"ok": true}`; the turn runs async, watch `/events`. `409` when the session is already being written by a turn on the machine itself |
-| POST | `/sessions/:id/abort` | — | `{"ok": true}`; stops the turn in flight |
-| POST | `/sessions/:id/clear` | — | `{"ok": true}`; drops history and the resumable Claude session id |
+| POST | `/sessions/:id/message` | `{text, model?, effort?, attachments?}` | `202 {"ok": true, "queued": false}`; the turn runs async, watch `/events`. A prompt sent while this bridge is already running a turn on the session is accepted and **queued** behind it — `202 {"ok": true, "queued": true, "position": n}` — so two clients on one session cannot start two `claude` processes against one transcript. `409` when the session is being written by a turn started outside this bridge (a terminal), which it cannot serialize against |
+| POST | `/sessions/:id/abort` | — | `{"ok": true, "stopped": bool, "discarded": n}`; stops the turn in flight and discards anything queued behind it. `409` when there is nothing to stop from here |
+| POST | `/sessions/:id/clear` | — | `{"ok": true}`; drops history and the resumable Claude session id. `409` while a turn is running or queued — fork instead |
 | POST | `/sessions/:id/fork` | — | new `Session` (404 if unknown) seeded with the source's history; its first turn runs `--fork-session` so it diverges instead of mutating the parent |
 | GET | `/sessions/:id/events` | — | `text/event-stream` of bridge events (below) |
 | GET | `/sessions/:id/usage` | — | `{costUSD?, tokens?}` for the session's last turn |
@@ -137,6 +137,19 @@ OAuth URL and waits for the code the browser hands back, so the bridge runs it o
 and splits those two halves across the network: a client opens the URL wherever the person is, and
 returns the code. That is what makes a headless server signable-in from a phone that has no shell
 on it.
+
+## One turn at a time
+
+A session runs one turn. A prompt that arrives while a turn is in flight is appended to the
+transcript and broadcast like any other, then queued behind it and started when that turn ends —
+so a phone and a desktop can both drive one session without two `claude -p --resume` processes
+running against one transcript in one working directory, each blind to the other's edits.
+
+The session goes `idle` only when nothing is left waiting, which is what stops a client's own
+send queue from draining into turns nobody asked for. Stopping a turn discards what queued behind
+it. `/clear` refuses while a turn is held, because pulling the transcript out from under a running
+turn loses it; fork instead. A turn started outside this bridge — an interactive `claude` in a
+terminal — cannot be serialized against, so `/message` still answers `409` for that case alone.
 
 ## Transcript discovery
 
