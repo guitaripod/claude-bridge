@@ -99,8 +99,9 @@ await store.attach(index: index)
 await store.pusher.endOrphans()
 let updater = UpdateService(stateDirectory: storeURL.deletingLastPathComponent())
 await updater.resume()
+let auth = AuthService(claudePath: claudePath, workdir: workdir)
 registerRoutes(
-    router, store: store, index: index, watcher: watcher, updater: updater,
+    router, store: store, index: index, watcher: watcher, updater: updater, auth: auth,
     agentModel: defaultModel, hasAuth: !password.isEmpty)
 startExternalIdleSweep(index: index, store: store)
 

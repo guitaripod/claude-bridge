@@ -51,9 +51,21 @@ private func isValidDeviceToken(_ token: String) -> Bool {
     !token.isEmpty && token.count <= 200 && token.allSatisfy(\.isHexDigit)
 }
 
+struct BridgeStatus: Encodable {
+    let agent: String
+    let model: String
+    let version: String
+    let authenticated: Bool
+}
+
+struct AuthCodeRequest: Decodable {
+    let code: String
+}
+
 func registerRoutes(
     _ router: Router<BasicRequestContext>, store: SessionStore, index: TranscriptIndex,
-    watcher: TranscriptWatcher, updater: UpdateService, agentModel: String, hasAuth: Bool
+    watcher: TranscriptWatcher, updater: UpdateService, auth: AuthService, agentModel: String,
+    hasAuth: Bool
 ) {
     @Sendable func adoptIfNeeded(_ id: String) async {
         guard await store.get(id) == nil, let discovered = await index.session(id) else { return }
@@ -63,10 +75,44 @@ func registerRoutes(
     router.get("health") { _, _ in "ok" }
 
     router.get("status") { _, _ in
-        jsonResponse([
-            "agent": "claude", "model": agentModel,
-            "version": BridgeVersion.describe(source: BridgeVersion.sourceDirectory()),
-        ])
+        jsonResponse(
+            BridgeStatus(
+                agent: "claude", model: agentModel,
+                version: BridgeVersion.describe(source: BridgeVersion.sourceDirectory()),
+                authenticated: await auth.status().loggedIn))
+    }
+
+    /// Whether the CLI behind this bridge is signed in, and the sign-in in progress if there is
+    /// one. A logged-out CLI answers turns with prose instead of failing, so a client has to be
+    /// able to ask.
+    router.get("auth") { _, _ in
+        jsonResponse(await auth.status(refreshing: true))
+    }
+
+    /// Starts `claude auth login` on this machine and answers with the URL it printed. The user
+    /// opens that on the phone, signs in, and sends the code back to `/auth/code`.
+    router.post("auth/login") { _, _ in
+        do {
+            return jsonResponse(try await auth.beginLogin())
+        } catch let error as AuthError {
+            return jsonResponse(["error": error.message], status: .badGateway)
+        }
+    }
+
+    router.post("auth/code") { request, _ in
+        guard let body = try? await decodeBody(AuthCodeRequest.self, request) else {
+            return jsonResponse(["error": "code required"], status: .badRequest)
+        }
+        do {
+            return jsonResponse(try await auth.submit(code: body.code))
+        } catch let error as AuthError {
+            return jsonResponse(["error": error.message], status: .badRequest)
+        }
+    }
+
+    router.post("auth/cancel") { _, _ in
+        await auth.cancel()
+        return jsonResponse(["ok": true])
     }
 
     /// What version this bridge runs, whether a newer one exists, and what happened to the last

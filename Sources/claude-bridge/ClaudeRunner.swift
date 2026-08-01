@@ -236,9 +236,32 @@ private struct Assembler {
                 let output = usage["output_tokens"] as? Int ?? 0
                 tokens = input + output
             }
+            ingestFailure(object, emit: emit)
         default:
             break
         }
+    }
+
+    /// A turn the CLI refused rather than answered.
+    ///
+    /// The clearest case is a signed-out machine: the CLI reports "Not logged in · Please run
+    /// /login" as a result, and the assistant message it streams alongside is empty — so without
+    /// this the client shows a blank turn and no reason for it. The text becomes both a failure
+    /// event, which a client can act on, and the turn's own words, so the transcript says what
+    /// happened.
+    private mutating func ingestFailure(_ object: [String: Any], emit: (BridgeEvent) -> Void) {
+        guard object["is_error"] as? Bool == true,
+            let text = (object["result"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty
+        else { return }
+        emit(.error(text))
+        let hasContent = segments.contains { segment in
+            switch segment {
+            case .text(let value): return !value.trimmingCharacters(in: .whitespaces).isEmpty
+            case .thinking, .tool, .file, .compaction: return true
+            }
+        }
+        if !hasContent { segments.append(.text(text)) }
     }
 
     /// Compaction is a turn that spends minutes reading instead of answering, and the CLI is the

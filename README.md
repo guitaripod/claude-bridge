@@ -83,7 +83,11 @@ All request/response bodies are JSON. When `BRIDGE_PASSWORD` is set, every route
 | Method | Path | Body | Response |
 |---|---|---|---|
 | GET | `/health` | — | `ok` |
-| GET | `/status` | — | `{"agent": "claude", "model": "<default model>", "version": "<git describe>"}` |
+| GET | `/status` | — | `{"agent": "claude", "model": "<default model>", "version": "<git describe>", "authenticated": true}` |
+| GET | `/auth` | — | whether the CLI is signed in, as whom, and the sign-in in progress if there is one |
+| POST | `/auth/login` | — | starts `claude auth login` on a pseudo-terminal and answers with the URL it printed |
+| POST | `/auth/code` | `{code}` | types the code the browser produced; answers with the status once the machine is signed in (`400` with `error` if it wasn't accepted) |
+| POST | `/auth/cancel` | — | drops a sign-in that was left waiting |
 | GET | `/update` | `?check=false` to skip the remote fetch | `UpdateStatus` — running version, newer commits and their subjects, whether this install can update itself, and the phase of the last update |
 | POST | `/update` | — | `202 UpdateStatus` once the update is running (`409` when it cannot, with `reason`); poll `GET /update` for `phase`: `running` → `building` → `restarting` → `succeeded`/`failed` |
 | GET | `/sessions` | — | `[SessionSummary]`, newest first, store + discovered transcripts merged |
@@ -123,6 +127,16 @@ one, docked at the tool call that read it, with `url` pointing at `/files/raw` s
 the same picture without the base64 the transcript keeps. The picture outlives the file: agents
 write screenshots to `/tmp` and clean them up, so `/files/raw` falls back to the transcript's own
 copy when the path is gone.
+
+## Signing in
+
+A signed-out CLI does not fail a turn — it answers it, with "Not logged in · Please run /login" —
+so the bridge reports the machine's account state (`/status` carries `authenticated`, `/auth` the
+detail) and can run the sign-in itself. `claude auth login` is a terminal program that prints an
+OAuth URL and waits for the code the browser hands back, so the bridge runs it on a pseudo-terminal
+and splits those two halves across the network: a client opens the URL wherever the person is, and
+returns the code. That is what makes a headless server signable-in from a phone that has no shell
+on it.
 
 ## Transcript discovery
 
