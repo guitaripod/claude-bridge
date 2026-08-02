@@ -110,7 +110,12 @@ actor SessionStore {
             guard let session = sessions[id] else { return nil }
             var summary = session.summary
             let claudeID = session.claudeSessionID ?? session.id
+            // A turn this bridge is running IS liveness, regardless of transcript recency: a
+            // single tool can run quietly for ten minutes, and the row must not flicker to idle
+            // while the process the bridge spawned is still working.
             summary.active = activeClaudeIDs.contains(claudeID)
+                || inFlight.contains(id)
+                || (runnerTurnClaudeIDs[claudeID] ?? 0) > 0
             // The record says what the session was created with; the transcript says what
             // answered last. A `/model` typed into a terminal only exists in the transcript.
             if let observed = settings[claudeID] {

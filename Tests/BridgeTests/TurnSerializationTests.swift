@@ -149,3 +149,29 @@ struct TurnSerializationTests {
         #expect(await store.hasRunnerTurnInFlight(claudeSessionID: "fake-session") == false)
     }
 }
+
+/// The list's `active` flag must follow the bridge's own knowledge of a running turn, not just
+/// transcript recency — a single quiet tool can run for ten minutes without writing a byte, and
+/// the row must stay live the whole time.
+@Suite("Runner liveness")
+struct RunnerLivenessTests {
+    @Test("A session with a bridge-run turn lists as active even with a silent transcript")
+    func runnerTurnIsLive() async throws {
+        let fake = try FakeClaude(holdSeconds: 0.8)
+        defer { fake.cleanUp() }
+        let (store, _) = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        let before = await store.list().first { $0.id == session.id }
+        #expect(before?.active != true)
+
+        _ = await store.send(session.id, request: SendRequest(text: "work quietly"))
+        try await Task.sleep(for: .milliseconds(250))
+        let during = await store.list().first { $0.id == session.id }
+        #expect(during?.active == true, "a held turn must read as live with no transcript growth")
+
+        try await Task.sleep(for: .seconds(1.5))
+        let after = await store.list().first { $0.id == session.id }
+        #expect(after?.active != true)
+    }
+}
