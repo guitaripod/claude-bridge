@@ -9,6 +9,10 @@ actor TranscriptIndex {
         var title: String
         var directory: String?
         var model: String?
+        /// The reasoning effort the last answer actually ran at, read from the transcript — the
+        /// CLI records it per line, and a `/effort` typed into a terminal never reaches any
+        /// stored session record.
+        var effort: String?
         var createdAt: Date
         var updatedAt: Date
         var path: String
@@ -312,6 +316,24 @@ actor TranscriptIndex {
 
     /// Latest transcript mtime per session id, for freshening stored sessions
     /// whose conversation has since continued elsewhere.
+    /// What each transcript's most recent answer ran with, for the stored sessions whose records
+    /// were written when they were created and never hear about a `/model` typed into a terminal.
+    func transcriptSettings() -> [String: TranscriptSettings] {
+        scan()
+        var settings: [String: TranscriptSettings] = [:]
+        for slot in cache.values {
+            guard let entry = slot.entry, entry.model != nil || entry.effort != nil else { continue }
+            settings[entry.id] = TranscriptSettings(model: entry.model, effort: entry.effort)
+        }
+        return settings
+    }
+
+    func transcriptSettings(for id: String) -> TranscriptSettings? {
+        guard let path = path(for: id), let entry = cache[path]?.entry else { return nil }
+        guard entry.model != nil || entry.effort != nil else { return nil }
+        return TranscriptSettings(model: entry.model, effort: entry.effort)
+    }
+
     func transcriptDates() -> [String: Date] {
         scan()
         var dates: [String: Date] = [:]
@@ -354,7 +376,7 @@ actor TranscriptIndex {
             directory: entry.directory,
             claudeSessionID: entry.id,
             model: entry.model ?? defaultModel,
-            effort: "",
+            effort: entry.effort ?? "",
             createdAt: entry.createdAt,
             updatedAt: entry.updatedAt,
             messages: messages,
@@ -454,9 +476,9 @@ actor TranscriptIndex {
 
     static let activityWindow: TimeInterval = 180
 
-    /// Discovered transcripts don't record an effort level, so the summary
-    /// carries an empty one rather than presenting the server default as if
-    /// the session actually ran with it.
+    /// Model and effort come from the transcript's own last answer, never from the server
+    /// default: a session the CLI switched with `/model` or `/effort` must not keep advertising
+    /// what it was started with.
     private func summary(for entry: Entry, turnClosed: Bool) -> SessionSummary {
         let threshold = Date().addingTimeInterval(-Self.activityWindow)
         let active =
@@ -468,7 +490,7 @@ actor TranscriptIndex {
             title: entry.title,
             directory: entry.directory,
             model: entry.model ?? defaultModel,
-            effort: "",
+            effort: entry.effort ?? "",
             createdAt: entry.createdAt,
             updatedAt: entry.updatedAt,
             active: active,
@@ -516,12 +538,23 @@ actor TranscriptIndex {
         if let slot = cache[file.path], slot.mtime == mtime, slot.size == size { return }
 
         let contentDate = TranscriptParser.lastContentDate(atPath: file.path)
-        let entry = TranscriptParser.entry(at: file, id: id, updatedAt: contentDate ?? mtime)
+        var entry = TranscriptParser.entry(at: file, id: id, updatedAt: contentDate ?? mtime)
+        // The prefix scan names the model that *started* the conversation; the tail names the one
+        // answering now, which is what every badge in every client is claiming to show.
+        let settings = TranscriptParser.lastSettings(atPath: file.path)
+        if let model = settings.model { entry?.model = model }
+        entry?.effort = settings.effort
         cache[file.path] = CacheSlot(
             mtime: mtime, size: size, entry: entry, contentDate: contentDate,
             turnClosed: TranscriptParser.isTurnClosed(atPath: file.path))
         if entry != nil { pathByID[id] = file.path }
     }
+}
+
+/// What a transcript's most recent answer ran with.
+struct TranscriptSettings: Sendable, Equatable {
+    var model: String?
+    var effort: String?
 }
 
 /// Parses Claude Code CLI transcript files (`.jsonl`, one JSON object per line).
@@ -537,6 +570,10 @@ enum TranscriptParser {
 
         var directory: String?
         var model: String?
+        /// The reasoning effort the last answer actually ran at, read from the transcript — the
+        /// CLI records it per line, and a `/effort` typed into a terminal never reaches any
+        /// stored session record.
+        var effort: String?
         var createdAt: Date?
         var title: String?
         var commandTitle: String?
@@ -584,6 +621,30 @@ enum TranscriptParser {
             }
         }
         return nil
+    }
+
+    /// The model and effort of the transcript's last real answer. Read from the tail because a
+    /// conversation can change either mid-way — `/model`, `/effort`, or a client sending its own
+    /// — and only the newest line says what is answering now. Widens the window once when the
+    /// tail holds nothing but tool results.
+    static func lastSettings(atPath path: String) -> TranscriptSettings {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return TranscriptSettings() }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
+        for window in [256 * 1024, 4 * 1024 * 1024] {
+            let span = min(size, window)
+            try? handle.seek(toOffset: UInt64(size - span))
+            guard let data = try? handle.read(upToCount: span) else { break }
+            for line in jsonLines(in: data, dropIncompleteTail: false).reversed() {
+                guard line["type"] as? String == "assistant",
+                    let model = (line["message"] as? [String: Any])?["model"] as? String,
+                    model != "<synthetic>"
+                else { continue }
+                return TranscriptSettings(model: model, effort: line["effort"] as? String)
+            }
+            if span == size { break }
+        }
+        return TranscriptSettings()
     }
 
     /// First line of the first user prompt in a (sidecar) transcript — the

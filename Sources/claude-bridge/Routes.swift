@@ -156,8 +156,9 @@ func registerRoutes(
         let active = await index.activeIDs(within: TranscriptIndex.activityWindow)
         let dates = await index.transcriptDates()
         let agents = await index.agentActivity()
+        let settings = await index.transcriptSettings()
         let stored = await store.list(
-            activeClaudeIDs: active, transcriptDates: dates, agents: agents)
+            activeClaudeIDs: active, transcriptDates: dates, agents: agents, settings: settings)
         let (claimed, hidden) = await store.excludedTranscriptIDs()
         let discovered = await index.list(excluding: claimed, hidden: hidden)
         return jsonResponse((stored + discovered).sorted { $0.updatedAt > $1.updatedAt })
@@ -188,7 +189,12 @@ func registerRoutes(
                 session.messages = fresh.messages
                 session.updatedAt = transcriptDate
             }
-            session.goal = await index.goal(for: session.claudeSessionID ?? id)
+            let claudeID = session.claudeSessionID ?? id
+            if let observed = await index.transcriptSettings(for: claudeID) {
+                if let model = observed.model { session.model = model }
+                if let effort = observed.effort { session.effort = effort }
+            }
+            session.goal = await index.goal(for: claudeID)
             return jsonResponse(session)
         }
         if var discovered = await index.session(id) {

@@ -99,13 +99,19 @@ actor SessionStore {
 
     func list(
         activeClaudeIDs: Set<String> = [], transcriptDates: [String: Date] = [:],
-        agents: [String: AgentActivity] = [:]
+        agents: [String: AgentActivity] = [:], settings: [String: TranscriptSettings] = [:]
     ) -> [SessionSummary] {
         order.compactMap { id -> SessionSummary? in
             guard let session = sessions[id] else { return nil }
             var summary = session.summary
             let claudeID = session.claudeSessionID ?? session.id
             summary.active = activeClaudeIDs.contains(claudeID)
+            // The record says what the session was created with; the transcript says what
+            // answered last. A `/model` typed into a terminal only exists in the transcript.
+            if let observed = settings[claudeID] {
+                if let model = observed.model { summary.model = model }
+                if let effort = observed.effort { summary.effort = effort }
+            }
             if let working = agents[claudeID] {
                 summary.agents = working.count
                 summary.agentTask = working.task
