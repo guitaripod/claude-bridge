@@ -231,6 +231,10 @@ func registerRoutes(
         jsonResponse(await GrokUsage.snapshot())
     }
 
+    router.get("usage/opencode") { _, _ in
+        jsonResponse(await OpenCodeGoUsage.snapshot())
+    }
+
     router.get("sessions") { _, _ in
         // The observer already computed this within the last second; recomputing per request
         // is what made the route take fifteen seconds under a live turn.
