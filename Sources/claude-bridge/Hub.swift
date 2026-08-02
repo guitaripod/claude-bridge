@@ -121,6 +121,8 @@ actor ObserverLoop {
     /// — same contract as the legacy per-session watcher.
     private var suppressedUntil: [String: Date] = [:]
     private static let runnerGrace: TimeInterval = 5
+    private var tick = 0
+    private var lastActivity: [String: AgentActivity] = [:]
 
     init(index: TranscriptIndex, store: SessionStore, hub: Hub) {
         self.index = index
@@ -135,10 +137,17 @@ actor ObserverLoop {
         }
     }
 
+    /// List rows and transcript growth move every second; the agent scan — sidecar walks and
+    /// progress tails for every live fan-out — runs at a third of that. It was the per-second
+    /// scan that queued a 27-second `/sessions/:id` behind the index actor.
     func sweep() async {
+        tick += 1
+        if tick % 3 == 1 {
+            lastActivity = await index.agentActivity()
+            await publishAgentChanges()
+        }
         await publishListChanges()
         await publishTranscriptGrowth()
-        await publishAgentChanges()
     }
 
     /// What the last sweep computed, at most a second old — `GET /sessions` serves this instead
@@ -150,7 +159,7 @@ actor ObserverLoop {
     private func currentSummaries() async -> [String: SessionSummary] {
         let active = await index.activeIDs(within: TranscriptIndex.activityWindow)
         let dates = await index.transcriptDates()
-        let agents = await index.agentActivity()
+        let agents = lastActivity
         let settings = await index.transcriptSettings()
         let stored = await store.list(
             activeClaudeIDs: active, transcriptDates: dates, agents: agents, settings: settings)
