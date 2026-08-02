@@ -141,6 +141,12 @@ actor ObserverLoop {
         await publishAgentChanges()
     }
 
+    /// What the last sweep computed, at most a second old — `GET /sessions` serves this instead
+    /// of recomputing the world per request while a live turn keeps the index busy.
+    func summariesSnapshot() -> [SessionSummary] {
+        lastSummaries.values.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
     private func currentSummaries() async -> [String: SessionSummary] {
         let active = await index.activeIDs(within: TranscriptIndex.activityWindow)
         let dates = await index.transcriptDates()

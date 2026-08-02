@@ -83,7 +83,7 @@ struct AuthCodeRequest: Decodable {
 func registerRoutes(
     _ router: Router<BasicRequestContext>, store: SessionStore, index: TranscriptIndex,
     watcher: TranscriptWatcher, updater: UpdateService, auth: AuthService, hub: Hub,
-    agentModel: String, hasAuth: Bool
+    observer: ObserverLoop, agentModel: String, hasAuth: Bool
 ) {
     @Sendable func adoptIfNeeded(_ id: String) async {
         guard await store.get(id) == nil, let discovered = await index.session(id) else { return }
@@ -232,6 +232,10 @@ func registerRoutes(
     }
 
     router.get("sessions") { _, _ in
+        // The observer already computed this within the last second; recomputing per request
+        // is what made the route take fifteen seconds under a live turn.
+        let warm = await observer.summariesSnapshot()
+        if !warm.isEmpty { return jsonResponse(warm) }
         let active = await index.activeIDs(within: TranscriptIndex.activityWindow)
         let dates = await index.transcriptDates()
         let agents = await index.agentActivity()
