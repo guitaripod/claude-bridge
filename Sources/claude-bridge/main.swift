@@ -95,14 +95,21 @@ let index = TranscriptIndex(
     root: URL(fileURLWithPath: projectsDir), defaultModel: defaultModel,
     defaultEffort: defaultEffort)
 let watcher = TranscriptWatcher(index: index, store: store)
+let hub = Hub()
 await store.attach(index: index)
+await store.installHubTap { id, event in
+    Task { await hub.publish(.session(id: id, event: event)) }
+}
+let observer = ObserverLoop(index: index, store: store, hub: hub)
+Task { await observer.run() }
+Task { await hub.runHeartbeats() }
 await store.pusher.endOrphans()
 let updater = UpdateService(stateDirectory: storeURL.deletingLastPathComponent())
 await updater.resume()
 let auth = AuthService(claudePath: claudePath, workdir: workdir)
 registerRoutes(
     router, store: store, index: index, watcher: watcher, updater: updater, auth: auth,
-    agentModel: defaultModel, hasAuth: !password.isEmpty)
+    hub: hub, agentModel: defaultModel, hasAuth: !password.isEmpty)
 startExternalIdleSweep(index: index, store: store)
 
 let app = Application(

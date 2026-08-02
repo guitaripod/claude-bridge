@@ -71,6 +71,9 @@ struct BridgeStatus: Encodable {
     let model: String
     let version: String
     let authenticated: Bool
+    /// Protocol 2: this bridge serves `GET /stream` — one sequenced, replayable event stream.
+    let proto: Int
+    let epoch: String
 }
 
 struct AuthCodeRequest: Decodable {
@@ -79,8 +82,8 @@ struct AuthCodeRequest: Decodable {
 
 func registerRoutes(
     _ router: Router<BasicRequestContext>, store: SessionStore, index: TranscriptIndex,
-    watcher: TranscriptWatcher, updater: UpdateService, auth: AuthService, agentModel: String,
-    hasAuth: Bool
+    watcher: TranscriptWatcher, updater: UpdateService, auth: AuthService, hub: Hub,
+    agentModel: String, hasAuth: Bool
 ) {
     @Sendable func adoptIfNeeded(_ id: String) async {
         guard await store.get(id) == nil, let discovered = await index.session(id) else { return }
@@ -94,7 +97,83 @@ func registerRoutes(
             BridgeStatus(
                 agent: "claude", model: agentModel,
                 version: BridgeVersion.describe(source: BridgeVersion.sourceDirectory()),
-                authenticated: await auth.status().loggedIn))
+                authenticated: await auth.status().loggedIn,
+                proto: 2, epoch: await hub.epoch))
+    }
+
+    /// One sequenced stream of everything: session deltas, list rows, agents, statuses. Every
+    /// frame carries `id: <seq>` under the hello's epoch; a client reconnecting with
+    /// `Last-Event-ID` (or `?since=epoch:seq`) replays what it missed, or is told `reset` when
+    /// that window is gone. Heartbeats every 10 s make silence distinguishable from death.
+    router.get("stream") { request, _ in
+        var sinceEpoch: String?
+        var sinceSeq: UInt64?
+        let sinceParam = request.uri.queryParameters.get("since").map { String($0) }
+        let cursor =
+            request.headers[.init("Last-Event-ID")!].flatMap { $0.isEmpty ? nil : $0 }
+            ?? sinceParam
+        if let cursor {
+            let parts = cursor.split(separator: ":", maxSplits: 1)
+            if parts.count == 2, let seq = UInt64(parts[1]) {
+                sinceEpoch = String(parts[0])
+                sinceSeq = seq
+            }
+        }
+        let attachment = await hub.attach(sinceEpoch: sinceEpoch, sinceSeq: sinceSeq)
+        let epoch = await hub.epoch
+        let oldest = await hub.oldestReplayableSeq
+
+        let body = ResponseBody { writer in
+            func writeFrame(seq: UInt64?, event: String, json: Data) async throws {
+                var buffer = ByteBuffer()
+                if let seq { buffer.writeString("id: \(epoch):\(seq)\n") }
+                buffer.writeString("event: \(event)\ndata: ")
+                buffer.writeBytes(json)
+                buffer.writeString("\n\n")
+                try await writer.write(buffer)
+            }
+            func encode<Value: Encodable>(_ value: Value) -> Data {
+                (try? JSONCoding.encoder.encode(value)) ?? Data("{}".utf8)
+            }
+            func writeHub(_ frame: HubFrame) async throws {
+                switch frame.event {
+                case .session(let id, let event):
+                    let payload = SessionFramePayload(session: id, event: event)
+                    try await writeFrame(seq: frame.seq, event: "session", json: encode(payload))
+                case .listUpsert(let summary):
+                    try await writeFrame(seq: frame.seq, event: "list.upsert", json: encode(summary))
+                case .listRemove(let id):
+                    try await writeFrame(
+                        seq: frame.seq, event: "list.remove", json: encode(["id": id]))
+                case .agents(let sessionID, let agents):
+                    let payload = AgentsFramePayload(session: sessionID, agents: agents)
+                    try await writeFrame(seq: frame.seq, event: "agents", json: encode(payload))
+                case .heartbeat(let seq):
+                    try await writeFrame(
+                        seq: nil, event: "heartbeat", json: encode(Heartbeat(seq: seq, t: Date())))
+                }
+            }
+
+            let hello = StreamHello(
+                proto: 2, epoch: epoch, seq: attachment.headSeq, oldestSeq: oldest,
+                heartbeat: 10, reset: attachment.tooOld)
+            try await writeFrame(seq: attachment.headSeq, event: "hello", json: encode(hello))
+            for frame in attachment.replay { try await writeHub(frame) }
+
+            try await withGracefulShutdownHandler {
+                for await frame in attachment.stream {
+                    try await writeHub(frame)
+                }
+            } onGracefulShutdown: {
+                Task { await hub.detach(attachment.id) }
+            }
+            await hub.detach(attachment.id)
+            try await writer.finish(nil)
+        }
+        var headers = HTTPFields()
+        headers[.contentType] = "text/event-stream"
+        headers[.cacheControl] = "no-cache"
+        return Response(status: .ok, headers: headers, body: body)
     }
 
     /// Whether the CLI behind this bridge is signed in, and the sign-in in progress if there is

@@ -123,7 +123,7 @@ struct Session: Codable, Sendable {
     }
 }
 
-struct SessionSummary: Codable, Sendable {
+struct SessionSummary: Codable, Sendable, Equatable {
     var id: String
     var title: String
     var directory: String?
@@ -146,7 +146,7 @@ struct AgentActivity: Sendable {
     var task: String?
 }
 
-struct SubagentSummary: Codable, Sendable {
+struct SubagentSummary: Codable, Sendable, Equatable {
     var id: String
     var title: String
     var agentType: String?

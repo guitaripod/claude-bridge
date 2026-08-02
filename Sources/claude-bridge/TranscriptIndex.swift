@@ -30,6 +30,8 @@ actor TranscriptIndex {
         var fold: TranscriptFold
         var offset: Int
         var includeSidechain: Bool
+        /// What the most recent advance changed — consumed by the observer, empty on no growth.
+        var lastChanged: Set<String> = []
     }
 
     private let root: URL
@@ -427,6 +429,23 @@ actor TranscriptIndex {
         await advanceFold(atPath: path, includeSidechain: false)
     }
 
+    /// Transcript paths keyed by session id — the observer's sweep list.
+    func pathsByID() -> [String: String] {
+        scan()
+        return pathByID
+    }
+
+    /// Advances the fold over appended bytes and reports exactly which messages they changed,
+    /// so the observer publishes precise upserts instead of re-sending a transcript.
+    func advanceReportingChanges(atPath path: String)
+        async -> (messages: [Message], changed: Set<String>, goal: GoalStatus?)?
+    {
+        guard let state = await advanceFold(atPath: path, includeSidechain: false) else {
+            return nil
+        }
+        return (state.fold.snapshot, state.lastChanged, state.fold.goal)
+    }
+
     /// The session's current `/goal`, read from the same incremental fold that serves its messages.
     func goal(for id: String) async -> GoalStatus? {
         if pathByID[id] == nil { scan() }
@@ -483,12 +502,16 @@ actor TranscriptIndex {
                 offset: 0,
                 includeSidechain: includeSidechain)
         }
-        guard size > state.offset else { return state }
-        try? handle.seek(toOffset: UInt64(state.offset))
-        guard let data = try? handle.read(upToCount: size - state.offset), !data.isEmpty else {
+        guard size > state.offset else {
+            state.lastChanged = []
             return state
         }
-        _ = state.fold.consume(data)
+        try? handle.seek(toOffset: UInt64(state.offset))
+        guard let data = try? handle.read(upToCount: size - state.offset), !data.isEmpty else {
+            state.lastChanged = []
+            return state
+        }
+        state.lastChanged = state.fold.consume(data)
         state.offset += data.count
         return state
     }

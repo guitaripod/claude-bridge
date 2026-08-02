@@ -4,6 +4,9 @@ import Foundation
 final class Broadcaster: @unchecked Sendable {
     private let lock = NSLock()
     private var continuations: [UUID: AsyncStream<BridgeEvent>.Continuation] = [:]
+    /// Every event published to this session also flows into the bridge-wide hub, where it gets
+    /// a sequence number. Installed at creation; the per-session stream is unchanged.
+    var tap: (@Sendable (BridgeEvent) -> Void)?
 
     var hasSubscribers: Bool {
         lock.withLock { !continuations.isEmpty }
@@ -23,6 +26,7 @@ final class Broadcaster: @unchecked Sendable {
     func send(_ event: BridgeEvent) {
         let targets = lock.withLock { Array(continuations.values) }
         for continuation in targets { continuation.yield(event) }
+        tap?(event)
     }
 
     /// Ends one subscriber's stream. An SSE response otherwise never completes,
@@ -38,6 +42,7 @@ actor SessionStore {
     private var sessions: [String: Session] = [:]
     private var order: [String] = []
     private var broadcasters: [String: Broadcaster] = [:]
+    private var hubTap: (@Sendable (String, BridgeEvent) -> Void)?
     private let runner: ClaudeRunner
     private let defaultModel: String
     private let defaultEffort: String
@@ -233,9 +238,31 @@ actor SessionStore {
         persist()
     }
 
+    /// The store session whose conversation lives in the given CLI transcript, if any — the id
+    /// clients address; a discovered transcript is addressed by its own id.
+    func sessionID(forClaudeID claudeID: String) -> String? {
+        if sessions[claudeID] != nil { return claudeID }
+        for (id, session) in sessions {
+            if session.claudeSessionID == claudeID { return id }
+            if session.priorClaudeSessionIDs?.contains(claudeID) == true { return id }
+        }
+        return nil
+    }
+
+    /// Wires every per-session broadcaster (existing and future) into the bridge-wide hub.
+    func installHubTap(_ tap: @escaping @Sendable (String, BridgeEvent) -> Void) {
+        hubTap = tap
+        for (id, caster) in broadcasters {
+            caster.tap = { event in tap(id, event) }
+        }
+    }
+
     func broadcaster(for id: String) -> Broadcaster {
         if let existing = broadcasters[id] { return existing }
         let created = Broadcaster()
+        if let hubTap {
+            created.tap = { event in hubTap(id, event) }
+        }
         broadcasters[id] = created
         return created
     }
