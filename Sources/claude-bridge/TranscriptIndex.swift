@@ -637,6 +637,7 @@ enum TranscriptParser {
             guard let data = try? handle.read(upToCount: span) else { break }
             for line in jsonLines(in: data, dropIncompleteTail: false).reversed() {
                 guard line["type"] as? String == "assistant",
+                    line["isSidechain"] as? Bool != true,
                     let model = (line["message"] as? [String: Any])?["model"] as? String,
                     model != "<synthetic>"
                 else { continue }

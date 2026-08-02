@@ -63,6 +63,18 @@ import Testing
         #expect(settings.effort == "max")
     }
 
+    /// A subagent answers on the same file with its own model and effort. The conversation's own
+    /// badge must keep saying what the conversation runs at, not what its last helper did.
+    @Test func ignoresSubagentAnswers() throws {
+        let sidechain = """
+            {"type":"assistant","isSidechain":true,"uuid":"sc","timestamp":"2026-08-02T10:05:00.000Z","effort":"low","message":{"id":"m2","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"done"}]}}
+            """
+        let path = try write([assistant(model: "claude-opus-5", effort: "high"), sidechain])
+        let settings = TranscriptParser.lastSettings(atPath: path)
+        #expect(settings.model == "claude-opus-5")
+        #expect(settings.effort == "high")
+    }
+
     @Test func anEffortlessAnswerReportsItsModelAlone() throws {
         let path = try write([assistant(model: "claude-sonnet-5", effort: nil)])
         let settings = TranscriptParser.lastSettings(atPath: path)
