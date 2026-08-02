@@ -154,6 +154,14 @@ struct SubagentSummary: Codable, Sendable {
     var updatedAt: Date
     var active: Bool
     var completed: Bool
+    /// What a live agent is doing right now, from its sidecar transcript: when it keeps a todo
+    /// list, how far through it is; always, how many tools it has run and which one is current.
+    var startedAt: Date?
+    var toolCount: Int?
+    var currentTool: String?
+    var todosDone: Int?
+    var todosTotal: Int?
+    var currentTodo: String?
 }
 
 struct SubagentTranscript: Codable, Sendable {

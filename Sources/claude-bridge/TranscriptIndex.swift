@@ -186,6 +186,24 @@ actor TranscriptIndex {
     static let subagentActivityWindow: TimeInterval = 90
 
     private var resolvedCache: [String: (offset: Int, ids: Set<String>)] = [:]
+    private var progressCache: [String: SubagentProgress] = [:]
+
+    /// Incremental like ``resolvedTools``: only appended bytes are parsed, so polling a fan-out
+    /// of forty sidecars every few seconds costs what changed, not forty full files.
+    private func progress(atPath path: String) -> SubagentProgress {
+        var cached = progressCache[path] ?? SubagentProgress()
+        guard let handle = FileHandle(forReadingAtPath: path) else { return cached }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
+        if size < cached.offset { cached = SubagentProgress() }
+        guard size > cached.offset else { return cached }
+        try? handle.seek(toOffset: UInt64(cached.offset))
+        guard let data = try? handle.read(upToCount: size - cached.offset) else { return cached }
+        TranscriptParser.accumulateProgress(&cached, data: data)
+        cached.offset = size
+        progressCache[path] = cached
+        return cached
+    }
 
     /// Incremental: only bytes appended since the last call are scanned (with a small
     /// overlap so a marker split across reads isn't missed). A full-file scan of a
@@ -264,12 +282,23 @@ actor TranscriptIndex {
                 let completed =
                     toolUseID.map(resolved.contains) ?? false
                     || journalCompleted.contains(agentID)
-                return SubagentSummary(
+                let active = !completed && lastContent > threshold
+                var summary = SubagentSummary(
                     id: agentID,
                     title: title, agentType: agentType, toolUseID: toolUseID,
                     updatedAt: lastContent,
-                    active: !completed && lastContent > threshold,
+                    active: active,
                     completed: completed)
+                if active {
+                    let progress = progress(atPath: file.path)
+                    summary.startedAt = progress.startedAt
+                    summary.toolCount = progress.toolCount > 0 ? progress.toolCount : nil
+                    summary.currentTool = progress.currentTool
+                    summary.todosDone = progress.todosTotal != nil ? progress.todosDone : nil
+                    summary.todosTotal = progress.todosTotal
+                    summary.currentTodo = progress.currentTodo
+                }
+                return summary
             }
     }
 
@@ -557,6 +586,18 @@ struct TranscriptSettings: Sendable, Equatable {
     var effort: String?
 }
 
+/// What a subagent's sidecar says it is doing, accumulated incrementally: how many tools it has
+/// run, which one is current, its todo list when it keeps one, and when it started.
+struct SubagentProgress: Sendable {
+    var offset = 0
+    var startedAt: Date?
+    var toolCount = 0
+    var currentTool: String?
+    var todosDone = 0
+    var todosTotal: Int?
+    var currentTodo: String?
+}
+
 /// Parses Claude Code CLI transcript files (`.jsonl`, one JSON object per line).
 enum TranscriptParser {
     private static let summaryScanLimit = 512 * 1024
@@ -701,6 +742,55 @@ enum TranscriptParser {
     /// a subagent whose spawning Task call is resolved has finished. Byte
     /// scan, never a String walk: grapheme-aware searching of a transcript
     /// this size takes minutes.
+    /// Folds appended sidecar bytes into a progress accumulator. The last TodoWrite wins whole;
+    /// every other tool bumps the count and becomes "current" with a one-line description.
+    static func accumulateProgress(_ progress: inout SubagentProgress, data: Data) {
+        for line in jsonLines(in: data, dropIncompleteTail: false) {
+            if progress.startedAt == nil,
+                let stamp = (line["timestamp"] as? String).flatMap(parseTimestamp)
+            {
+                progress.startedAt = stamp
+            }
+            guard line["type"] as? String == "assistant",
+                let blocks = (line["message"] as? [String: Any])?["content"] as? [[String: Any]]
+            else { continue }
+            for block in blocks where block["type"] as? String == "tool_use" {
+                guard let name = block["name"] as? String else { continue }
+                let input = block["input"] as? [String: Any]
+                if name == "TodoWrite" {
+                    guard let todos = input?["todos"] as? [[String: Any]] else { continue }
+                    progress.todosTotal = todos.count
+                    progress.todosDone = todos.count { $0["status"] as? String == "completed" }
+                    progress.currentTodo =
+                        todos.first { $0["status"] as? String == "in_progress" }?["content"]
+                        as? String
+                        ?? todos.first { $0["status"] as? String == "pending" }?["content"]
+                        as? String
+                    continue
+                }
+                progress.toolCount += 1
+                progress.currentTool = describeTool(name: name, input: input)
+            }
+        }
+    }
+
+    private static func describeTool(name: String, input: [String: Any]?) -> String {
+        let detail: String? =
+            (input?["command"] as? String).map { firstLine($0) }
+            ?? (input?["file_path"] as? String).map {
+                URL(fileURLWithPath: $0).lastPathComponent
+            }
+            ?? input?["description"] as? String
+            ?? (input?["pattern"] as? String)
+            ?? (input?["query"] as? String)
+        guard let detail, !detail.isEmpty else { return name }
+        return "\(name) \(String(detail.prefix(60)))"
+    }
+
+    private static func firstLine(_ text: String) -> String {
+        text.split(separator: "\n").first.map(String.init) ?? text
+    }
+
     static func toolUseIDs(in data: Data) -> Set<String> {
         let marker = Data("\"tool_use_id\":\"".utf8)
         var ids = Set<String>()
