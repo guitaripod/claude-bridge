@@ -44,8 +44,7 @@ actor SessionStore {
     private var broadcasters: [String: Broadcaster] = [:]
     private var hubTap: (@Sendable (String, BridgeEvent) -> Void)?
     private let runner: ClaudeRunner
-    private let defaultModel: String
-    private let defaultEffort: String
+    private let defaults: MachineDefaults
     private let storeURL: URL
     private let projectsDir: String
     let pusher: LiveActivityPusher
@@ -84,15 +83,14 @@ actor SessionStore {
     }
 
     init(
-        runner: ClaudeRunner, defaultModel: String, defaultEffort: String, storeURL: URL,
+        runner: ClaudeRunner, defaults: MachineDefaults, storeURL: URL,
         projectsDir: String = "", pusher: LiveActivityPusher = LiveActivityPusher(client: nil),
         devicePusher: DevicePusher = DevicePusher(client: nil, devicesURL: nil)
     ) {
         self.pusher = pusher
         self.devicePusher = devicePusher
         self.runner = runner
-        self.defaultModel = defaultModel
-        self.defaultEffort = defaultEffort
+        self.defaults = defaults
         self.storeURL = storeURL
         self.projectsDir = projectsDir
         hiddenTranscripts = Self.loadHidden(from: Self.hiddenURL(for: storeURL))
@@ -170,8 +168,8 @@ actor SessionStore {
             title: request.title ?? "New chat",
             directory: Self.normalizedDirectory(request.directory),
             claudeSessionID: nil,
-            model: request.model ?? defaultModel,
-            effort: request.effort ?? defaultEffort,
+            model: request.model ?? defaults.model(),
+            effort: request.effort ?? defaults.effort(),
             createdAt: now, updatedAt: now, messages: [], lastCostUSD: nil, lastTokens: nil,
             pendingFork: nil)
         sessions[session.id] = session
@@ -319,9 +317,11 @@ actor SessionStore {
         let caster = broadcaster(for: id)
         let runner = self.runner
         let resume = session.claudeSessionID
-        let model = session.model
-        let effort = session.effort.isEmpty ? defaultEffort : session.effort
+        let model = session.model.isEmpty ? defaults.model() : session.model
+        let requestedEffort = session.effort.isEmpty ? defaults.effort() : session.effort
         let text = queued.prompt
+        let ultracode = requestedEffort == "ultracode" || Self.invokesUltracode(text)
+        let effort = requestedEffort == "ultracode" ? "xhigh" : requestedEffort
         let fork = session.pendingFork == true
         let directory = session.directory
 
@@ -330,7 +330,8 @@ actor SessionStore {
         Task {
             let turnStart = Date()
             let outcome = await runner.run(
-                prompt: text, resume: resume, model: model, effort: effort, fork: fork,
+                prompt: text, resume: resume, model: model, effort: effort,
+                ultracode: ultracode, fork: fork,
                 directory: directory,
                 onStart: { pid in Task { await self.registerTurnProcess(id, pid: pid) } },
                 onSessionID: { sid in Task { await self.linkClaudeSession(id, claudeSessionID: sid) } },
@@ -693,6 +694,13 @@ actor SessionStore {
     private func moveToFront(_ id: String) {
         order.removeAll { $0 == id }
         order.insert(id, at: 0)
+    }
+
+    /// The CLI's own "ultracode" prompt keyword never fires in print mode — it only trusts
+    /// interactive human input — so the bridge honours it instead: a prompt that says the word
+    /// opts that one turn into workflow orchestration, exactly as it would in a terminal.
+    static func invokesUltracode(_ prompt: String) -> Bool {
+        prompt.range(of: #"(?i)\bultracode\b"#, options: .regularExpression) != nil
     }
 
     /// A readable list title from a raw prompt: the first real line (slash

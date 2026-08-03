@@ -51,7 +51,7 @@ private func makeStore(_ fake: FakeClaude) -> (SessionStore, URL) {
     let runner = ClaudeRunner(
         claudePath: fake.binary, workdir: fake.root.path, permissionMode: "default")
     let store = SessionStore(
-        runner: runner, defaultModel: "sonnet", defaultEffort: "medium", storeURL: storeURL,
+        runner: runner, defaults: MachineDefaults(modelOverride: "sonnet", effortOverride: "medium", home: NSTemporaryDirectory()), storeURL: storeURL,
         projectsDir: fake.root.path)
     return (store, storeURL)
 }

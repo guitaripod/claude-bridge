@@ -83,7 +83,7 @@ struct AuthCodeRequest: Decodable {
 func registerRoutes(
     _ router: Router<BasicRequestContext>, store: SessionStore, index: TranscriptIndex,
     watcher: TranscriptWatcher, updater: UpdateService, auth: AuthService, hub: Hub,
-    observer: ObserverLoop, agentModel: String, hasAuth: Bool
+    observer: ObserverLoop, defaults: MachineDefaults, hasAuth: Bool
 ) {
     @Sendable func adoptIfNeeded(_ id: String) async {
         guard await store.get(id) == nil, let discovered = await index.session(id) else { return }
@@ -95,7 +95,7 @@ func registerRoutes(
     router.get("status") { _, _ in
         jsonResponse(
             BridgeStatus(
-                agent: "claude", model: agentModel,
+                agent: "claude", model: defaults.model(),
                 version: BridgeVersion.describe(source: BridgeVersion.sourceDirectory()),
                 authenticated: await auth.status().loggedIn,
                 proto: 2, epoch: await hub.epoch))
@@ -276,12 +276,17 @@ func registerRoutes(
                 session.messages = fresh.messages
                 session.updatedAt = transcriptDate
             }
-            let claudeID = session.claudeSessionID ?? id
-            if let observed = await index.transcriptSettings(for: claudeID) {
-                if let model = observed.model { session.model = model }
-                if let effort = observed.effort { session.effort = effort }
+            // A session with no linked transcript — every fresh chat before its first turn — has
+            // nothing the index could say about it: the store id is minted here and the CLI mints
+            // its own. Asking anyway queued this GET behind the sweep's fold work, which is where
+            // "several seconds to open a brand-new empty chat" actually went.
+            if let claudeID = session.claudeSessionID {
+                if let observed = await index.transcriptSettings(for: claudeID) {
+                    if let model = observed.model { session.model = model }
+                    if let effort = observed.effort { session.effort = effort }
+                }
+                session.goal = await index.goal(for: claudeID)
             }
-            session.goal = await index.goal(for: claudeID)
             return jsonResponse(session)
         }
         if var discovered = await index.session(id) {

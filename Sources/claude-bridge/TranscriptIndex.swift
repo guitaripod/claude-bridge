@@ -35,19 +35,19 @@ actor TranscriptIndex {
     }
 
     private let root: URL
-    private let defaultModel: String
-    private let defaultEffort: String
+    private let defaults: MachineDefaults
     private var cache: [String: CacheSlot] = [:]
     private var pathByID: [String: String] = [:]
     private var folds: [String: FoldState] = [:]
     private var foldOrder: [String] = []
     private var foldTasks: [String: Task<FoldState?, Never>] = [:]
     private static let foldCacheLimit = 24
+    private var lastScanAt: ContinuousClock.Instant?
+    private static let scanDebounce: Duration = .seconds(2)
 
-    init(root: URL, defaultModel: String, defaultEffort: String) {
+    init(root: URL, defaults: MachineDefaults) {
         self.root = root
-        self.defaultModel = defaultModel
-        self.defaultEffort = defaultEffort
+        self.defaults = defaults
     }
 
     func list(excluding claimed: Set<String>, hidden: Set<String>) -> [SessionSummary] {
@@ -406,7 +406,7 @@ actor TranscriptIndex {
             title: entry.title,
             directory: entry.directory,
             claudeSessionID: entry.id,
-            model: entry.model ?? defaultModel,
+            model: entry.model ?? defaults.model(),
             effort: entry.effort ?? "",
             createdAt: entry.createdAt,
             updatedAt: entry.updatedAt,
@@ -541,7 +541,7 @@ actor TranscriptIndex {
             id: entry.id,
             title: entry.title,
             directory: entry.directory,
-            model: entry.model ?? defaultModel,
+            model: entry.model ?? defaults.model(),
             effort: entry.effort ?? "",
             createdAt: entry.createdAt,
             updatedAt: entry.updatedAt,
@@ -550,7 +550,14 @@ actor TranscriptIndex {
             agentTask: agents?.task)
     }
 
+    /// A lookup for a session that has no transcript yet — every freshly created chat, until its
+    /// first turn lands — misses `pathByID` and used to walk all of `~/.claude/projects` per
+    /// request: two hundred stats twice per `GET /sessions/:id`, seconds of latency for a session
+    /// that is empty by definition. A scan that just ran is still the truth for the next moment,
+    /// so repeats inside the window are free; the watcher's sweep outruns the window anyway.
     private func scan() {
+        if let last = lastScanAt, ContinuousClock.now - last < Self.scanDebounce { return }
+        lastScanAt = ContinuousClock.now
         let fileManager = FileManager.default
         guard
             let projectDirs = try? fileManager.contentsOfDirectory(

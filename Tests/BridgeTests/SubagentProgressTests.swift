@@ -108,7 +108,7 @@ import Testing
             to: project.appendingPathComponent("\(sessionID).jsonl"),
             atomically: true, encoding: .utf8)
 
-        let index = TranscriptIndex(root: root, defaultModel: "sonnet", defaultEffort: "high")
+        let index = TranscriptIndex(root: root, defaults: MachineDefaults(modelOverride: "sonnet", effortOverride: "high", home: NSTemporaryDirectory()))
         let agents = await index.subagents(for: sessionID)
         let alive = try #require(agents.first { $0.id == "alive1" })
         let done = try #require(agents.first { $0.id == "done1" })

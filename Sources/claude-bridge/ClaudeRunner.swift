@@ -22,6 +22,7 @@ struct ClaudeRunner: Sendable {
         resume claudeSessionID: String?,
         model: String,
         effort: String,
+        ultracode: Bool = false,
         fork: Bool = false,
         directory: String? = nil,
         onStart: (@Sendable (Int32) -> Void)? = nil,
@@ -42,6 +43,9 @@ struct ClaudeRunner: Sendable {
         ]
         if permissionMode == "bypassPermissions" {
             arguments.append("--dangerously-skip-permissions")
+        }
+        if ultracode {
+            arguments += ["--settings", #"{"ultracode":true}"#]
         }
         if let claudeSessionID {
             arguments += ["--resume", claudeSessionID]

@@ -52,8 +52,14 @@ let bindAddress = env("BRIDGE_BIND", "127.0.0.1")
 let password = env("BRIDGE_PASSWORD", "")
 let workdir = env("BRIDGE_WORKDIR", "\(home)/agentapi-workdir")
 let claudePath = env("BRIDGE_CLAUDE", "\(home)/.local/bin/claude")
-let defaultModel = env("BRIDGE_MODEL", "sonnet")
-let defaultEffort = env("BRIDGE_EFFORT", "medium")
+let machineDefaults = MachineDefaults(
+    modelOverride: ProcessInfo.processInfo.environment["BRIDGE_MODEL"].flatMap {
+        $0.isEmpty ? nil : $0
+    },
+    effortOverride: ProcessInfo.processInfo.environment["BRIDGE_EFFORT"].flatMap {
+        $0.isEmpty ? nil : $0
+    },
+    home: home)
 let storeURL = URL(fileURLWithPath: env("BRIDGE_STORE", "\(home)/.claude-bridge/sessions.json"))
 let permissionMode = env("BRIDGE_PERMISSION", "bypassPermissions")
 let projectsDir = env("BRIDGE_PROJECTS", "\(home)/.claude/projects")
@@ -77,7 +83,7 @@ let apnsClient: APNSClient? = {
 
 let store = SessionStore(
     runner: ClaudeRunner(claudePath: claudePath, workdir: workdir, permissionMode: permissionMode),
-    defaultModel: defaultModel, defaultEffort: defaultEffort, storeURL: storeURL,
+    defaults: machineDefaults, storeURL: storeURL,
     projectsDir: projectsDir,
     pusher: LiveActivityPusher(
         client: apnsClient,
@@ -91,9 +97,7 @@ let router = Router()
 if !password.isEmpty {
     router.middlewares.add(BasicAuthMiddleware(username: "claude", password: password))
 }
-let index = TranscriptIndex(
-    root: URL(fileURLWithPath: projectsDir), defaultModel: defaultModel,
-    defaultEffort: defaultEffort)
+let index = TranscriptIndex(root: URL(fileURLWithPath: projectsDir), defaults: machineDefaults)
 let watcher = TranscriptWatcher(index: index, store: store)
 let hub = Hub()
 await store.attach(index: index)
@@ -109,7 +113,7 @@ await updater.resume()
 let auth = AuthService(claudePath: claudePath, workdir: workdir)
 registerRoutes(
     router, store: store, index: index, watcher: watcher, updater: updater, auth: auth,
-    hub: hub, observer: observer, agentModel: defaultModel, hasAuth: !password.isEmpty)
+    hub: hub, observer: observer, defaults: machineDefaults, hasAuth: !password.isEmpty)
 startExternalIdleSweep(index: index, store: store)
 
 let app = Application(
