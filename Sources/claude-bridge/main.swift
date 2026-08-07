@@ -113,7 +113,8 @@ await updater.resume()
 let auth = AuthService(claudePath: claudePath, workdir: workdir)
 registerRoutes(
     router, store: store, index: index, watcher: watcher, updater: updater, auth: auth,
-    hub: hub, observer: observer, defaults: machineDefaults, hasAuth: !password.isEmpty)
+    hub: hub, observer: observer, defaults: machineDefaults, hasAuth: !password.isEmpty,
+    projectsDir: projectsDir)
 startExternalIdleSweep(index: index, store: store)
 
 let app = Application(

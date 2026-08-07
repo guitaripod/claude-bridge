@@ -83,7 +83,7 @@ struct AuthCodeRequest: Decodable {
 func registerRoutes(
     _ router: Router<BasicRequestContext>, store: SessionStore, index: TranscriptIndex,
     watcher: TranscriptWatcher, updater: UpdateService, auth: AuthService, hub: Hub,
-    observer: ObserverLoop, defaults: MachineDefaults, hasAuth: Bool
+    observer: ObserverLoop, defaults: MachineDefaults, hasAuth: Bool, projectsDir: String
 ) {
     @Sendable func adoptIfNeeded(_ id: String) async {
         guard await store.get(id) == nil, let discovered = await index.session(id) else { return }
@@ -256,6 +256,21 @@ func registerRoutes(
         return jsonResponse(await store.create(body ?? CreateRequest(title: nil, model: nil, effort: nil)))
     }
 
+    /// Search across every conversation this machine has had. A chat list can only match titles,
+    /// so without this everything actually said stops being findable the moment it scrolls off.
+    /// Bounded from the inside: it fans out over the transcript directory, which is gigabytes on a
+    /// machine that has been used, and reports honestly when it ran out of time rather than letting
+    /// an absence read as an answer.
+    router.get("search") { request, _ in
+        let query = request.uri.queryParameters.get("q").map { String($0) } ?? ""
+        let limit =
+            request.uri.queryParameters.get("limit").flatMap { Int($0) }
+            ?? TranscriptSearch.defaultLimit
+        let root = URL(fileURLWithPath: projectsDir)
+        return jsonResponse(
+            await TranscriptSearch.run(root: root, query: query, limit: max(1, min(limit, 200))))
+    }
+
     router.get("commands") { request, _ in
         let directory = request.uri.queryParameters.get("directory").map { String($0) }
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -412,6 +427,19 @@ func registerRoutes(
             return jsonResponse(UsageSummary(costUSD: nil, tokens: nil))
         }
         return jsonResponse(["error": "not found"], status: .notFound)
+    }
+
+    router.get("sessions/:id/spend") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        let claudeID = (await store.get(id))?.claudeSessionID ?? id
+        var found = await index.path(for: claudeID)
+        if found == nil { found = await index.path(for: id) }
+        guard let path = found,
+            let report = SpendReader.read(transcriptPath: path)
+        else {
+            return jsonResponse(["error": "not found"], status: .notFound)
+        }
+        return jsonResponse(report)
     }
 
     router.patch("sessions/:id") { request, context in
