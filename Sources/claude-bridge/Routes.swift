@@ -429,6 +429,12 @@ func registerRoutes(
         return jsonResponse(["error": "not found"], status: .notFound)
     }
 
+    let analytics = AnalyticsLedger(index: index)
+    router.get("analytics") { request, _ in
+        let days = request.uri.queryParameters.get("days").flatMap { Int($0) } ?? 30
+        return jsonResponse(await analytics.report(days: days))
+    }
+
     router.get("sessions/:id/spend") { _, context in
         let id = context.parameters.get("id") ?? ""
         let claudeID = (await store.get(id))?.claudeSessionID ?? id

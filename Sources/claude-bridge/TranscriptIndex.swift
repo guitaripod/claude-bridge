@@ -365,6 +365,27 @@ actor TranscriptIndex {
         return TranscriptSettings(model: entry.model, effort: entry.effort)
     }
 
+    struct AnalyticsSource: Sendable {
+        var path: String
+        var id: String
+        var title: String
+        var directory: String?
+        var mtime: Date
+        var size: Int
+    }
+
+    /// Every transcript on the machine with just enough identity to aggregate it — the
+    /// analytics walk decides for itself which files are worth opening.
+    func analyticsSources() -> [AnalyticsSource] {
+        scan()
+        return cache.compactMap { path, slot in
+            guard let entry = slot.entry else { return nil }
+            return AnalyticsSource(
+                path: path, id: entry.id, title: entry.title, directory: entry.directory,
+                mtime: slot.mtime, size: slot.size)
+        }
+    }
+
     func transcriptDates() -> [String: Date] {
         scan()
         var dates: [String: Date] = [:]
