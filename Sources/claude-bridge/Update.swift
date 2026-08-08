@@ -61,7 +61,16 @@ enum Shell {
     static func run(
         _ executable: String, _ arguments: [String], cwd: String? = nil, timeout: TimeInterval = 30
     ) -> String {
-        guard let url = which(executable) else { return "" }
+        String(
+            data: data(executable, arguments, cwd: cwd, timeout: timeout), encoding: .utf8) ?? ""
+    }
+
+    /// The bytes as the command wrote them. A path is bytes, and git's `-z` formats separate
+    /// records with a NUL — both survive a `Data` and neither survives a lossy decode.
+    static func data(
+        _ executable: String, _ arguments: [String], cwd: String? = nil, timeout: TimeInterval = 30
+    ) -> Data {
+        guard let url = which(executable) else { return Data() }
         let process = Process()
         process.executableURL = url
         process.arguments = arguments
@@ -72,7 +81,7 @@ enum Shell {
         var environment = ProcessInfo.processInfo.environment
         environment["GIT_TERMINAL_PROMPT"] = "0"
         process.environment = environment
-        guard (try? process.run()) != nil else { return "" }
+        guard (try? process.run()) != nil else { return Data() }
         let output = Output()
         let handle = pipe.fileHandleForReading
         let finished = DispatchSemaphore(value: 0)
@@ -85,7 +94,7 @@ enum Shell {
             _ = finished.wait(timeout: .now() + 5)
         }
         process.waitUntilExit()
-        return String(data: output.data, encoding: .utf8) ?? ""
+        return output.data
     }
 
     /// Starts a command and walks away: no pipe to read, no exit to wait for. Backgrounding
