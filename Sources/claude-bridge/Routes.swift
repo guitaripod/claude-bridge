@@ -361,6 +361,56 @@ func registerRoutes(
         return jsonResponse(["error": "not readable"], status: .notFound)
     }
 
+    /// Where a git question is asked from: a path the client already knows, or the working
+    /// directory of a conversation, which is the only thing a phone reliably has.
+    @Sendable func gitDirectory(_ request: Request) async -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if let raw = request.uri.queryParameters.get("dir"), !raw.isEmpty {
+            return FileBrowsing.resolve(String(raw), home: home)
+        }
+        guard let session = request.uri.queryParameters.get("session") else { return nil }
+        let id = String(session)
+        if let directory = await store.get(id)?.directory { return directory }
+        return await index.session(id)?.directory
+    }
+
+    /// What the repository behind a conversation is doing. Read-only by design: the app shows the
+    /// state a change lands in — branch, upstream, what the working tree holds that no commit does
+    /// — and never offers to commit, stage or push on the person's behalf from a phone.
+    router.get("git") { request, _ in
+        guard let directory = await gitDirectory(request) else {
+            return jsonResponse(["error": "directory required"], status: .badRequest)
+        }
+        return jsonResponse(
+            Git.snapshot(directory: directory) ?? GitSnapshot(root: directory, repo: false))
+    }
+
+    router.get("git/diff") { request, _ in
+        guard let directory = await gitDirectory(request),
+            let path = request.uri.queryParameters.get("path")
+        else {
+            return jsonResponse(["error": "path required"], status: .badRequest)
+        }
+        let staged = request.uri.queryParameters.get("staged") == "true"
+        guard let patch = Git.patch(directory: directory, path: String(path), staged: staged)
+        else {
+            return jsonResponse(["error": "not a repository"], status: .notFound)
+        }
+        return jsonResponse(patch)
+    }
+
+    router.get("git/commit") { request, _ in
+        guard let directory = await gitDirectory(request),
+            let hash = request.uri.queryParameters.get("hash")
+        else {
+            return jsonResponse(["error": "hash required"], status: .badRequest)
+        }
+        guard let detail = Git.commit(directory: directory, hash: String(hash)) else {
+            return jsonResponse(["error": "not found"], status: .notFound)
+        }
+        return jsonResponse(detail)
+    }
+
     router.get("attachments/:session/:name") { _, context in
         let session = context.parameters.get("session") ?? ""
         let name = context.parameters.get("name") ?? ""
