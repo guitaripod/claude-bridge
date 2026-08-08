@@ -112,6 +112,7 @@ enum SpendReader {
         var lastAt: Date?
         var pendingPrompt: String?
         var pendingPromptAt: Date?
+        var chargedMessages = Set<String>()
 
         func close() {
             guard var turn = open else { return }
@@ -140,9 +141,7 @@ enum SpendReader {
             else { continue }
             let at = date(entry["timestamp"]) ?? lastAt ?? Date()
             lastAt = at
-            let counts = tokens(in: usage)
             let model = message["model"] as? String
-            let cost = Rate.forModel(model ?? "").cost(of: counts)
             if open == nil {
                 open = SpendTurn(
                     at: pendingPromptAt ?? at, model: model, calls: 0, tokens: TokenCounts(),
@@ -152,9 +151,12 @@ enum SpendReader {
             }
             var turn = open ?? SpendTurn(
                 at: at, model: model, calls: 0, tokens: TokenCounts(), costUSD: 0, prompt: nil)
-            turn.calls += 1
-            turn.tokens = turn.tokens + counts
-            turn.costUSD += cost
+            if (message["id"] as? String).map({ chargedMessages.insert($0).inserted }) ?? true {
+                let counts = tokens(in: usage)
+                turn.calls += 1
+                turn.tokens = turn.tokens + counts
+                turn.costUSD += Rate.forModel(model ?? "").cost(of: counts)
+            }
             if turn.model == nil { turn.model = model }
             open = turn
         }

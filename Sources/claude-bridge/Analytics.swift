@@ -97,16 +97,29 @@ struct AnalyticsReport: Codable, Sendable {
 
 /// One file reduced to what aggregation needs, cached against the file's identity so a machine
 /// with years of history pays the full walk once and then only for files that grew.
+///
+/// A turn keeps its lines instead of a pre-summed total because the ledger must not pay twice
+/// for what the CLI wrote twice: one API message is split across one JSONL line per content
+/// block, each repeating the same `usage`, and a fork or resume copies the whole inherited
+/// prefix — ids, timestamps and all — into the new file. Money dedups machine-wide by the API
+/// message id; tool calls by the line's own uuid, because two tool blocks of one message share
+/// the message id and are still two calls.
 struct AnalyticsFileStats: Sendable {
+    struct Line: Sendable {
+        var messageID: String?
+        var uuid: String?
+        var tokens: TokenCounts
+        var costUSD: Double
+        var tools: [String: Int]
+    }
+
     struct Turn: Sendable {
         var at: Date
         var seconds: Double?
         var model: String?
-        var tokens: TokenCounts
-        var costUSD: Double
         var sidechain: Bool
         var prompt: String?
-        var tools: [String: Int]
+        var lines: [Line]
     }
 
     struct Compaction: Sendable {
@@ -187,9 +200,16 @@ actor AnalyticsLedger {
             perSource[job.sourceIndex].stats.turns.append(contentsOf: stats.turns)
             perSource[job.sourceIndex].stats.compactions.append(contentsOf: stats.compactions)
         }
+        let order = perSource.indices.sorted {
+            perSource[$0].source.createdAt < perSource[$1].source.createdAt
+        }
         return Self.aggregate(
-            perSource: perSource, subagentRuns: subagentRuns, since: since, window: window,
-            now: now, calendar: calendar)
+            perSource: order.map { perSource[$0] },
+            subagentRuns: Dictionary(
+                uniqueKeysWithValues: order.enumerated().compactMap { position, original in
+                    subagentRuns[original].map { (position, $0) }
+                }),
+            since: since, window: window, now: now, calendar: calendar)
     }
 
     private struct SidecarFile: Sendable {
@@ -281,33 +301,52 @@ actor AnalyticsLedger {
         var priciestTurn: AnalyticsReport.Records.Turn?
         var longestTurn: AnalyticsReport.Records.Turn?
         var priciestSession: AnalyticsReport.Records.Session?
+        var chargedMessages = Set<String>()
+        var chargedLines = Set<String>()
 
         for (source, stats) in perSource {
             var sessionCost = 0.0
             var sessionTurns = 0
             for turn in stats.turns where turn.at >= since {
+                var turnTokens = TokenCounts()
+                var turnCost = 0.0
+                var turnTools: [String: Int] = [:]
+                var owned = turn.lines.isEmpty
+                for line in turn.lines {
+                    if line.messageID.map({ chargedMessages.insert($0).inserted }) ?? true {
+                        turnTokens = turnTokens + line.tokens
+                        turnCost += line.costUSD
+                    }
+                    if line.uuid.map({ chargedLines.insert($0).inserted }) ?? true {
+                        owned = true
+                        for (name, calls) in line.tools {
+                            turnTools[name, default: 0] += calls
+                        }
+                    }
+                }
+                guard owned else { continue }
                 let key = dayFormat.string(from: turn.at)
                 var bucket = daily[key] ?? DayBucket()
-                let turnTools = turn.tools.values.reduce(0, +)
-                bucket.costUSD += turn.costUSD
-                bucket.tokens = bucket.tokens + turn.tokens
-                bucket.toolCalls += turnTools
+                let turnToolCalls = turnTools.values.reduce(0, +)
+                bucket.costUSD += turnCost
+                bucket.tokens = bucket.tokens + turnTokens
+                bucket.toolCalls += turnToolCalls
                 bucket.sessions.insert(source.id)
-                totals.costUSD += turn.costUSD
-                totals.tokens = totals.tokens + turn.tokens
-                totals.toolCalls += turnTools
-                sessionCost += turn.costUSD
-                for (name, calls) in turn.tools {
+                totals.costUSD += turnCost
+                totals.tokens = totals.tokens + turnTokens
+                totals.toolCalls += turnToolCalls
+                sessionCost += turnCost
+                for (name, calls) in turnTools {
                     tools[name, default: 0] += calls
                 }
                 let rate = Rate.forModel(turn.model ?? "")
-                cacheSaved += Double(turn.tokens.cacheRead) / 1_000_000 * rate.input
+                cacheSaved += Double(turnTokens.cacheRead) / 1_000_000 * rate.input
                     * (1 - Rate.cacheRead)
                 let modelKey = turn.model ?? "unknown"
                 var share = models[modelKey]
                     ?? SpendModel(model: modelKey, turns: 0, tokens: TokenCounts(), costUSD: 0)
-                share.tokens = share.tokens + turn.tokens
-                share.costUSD += turn.costUSD
+                share.tokens = share.tokens + turnTokens
+                share.costUSD += turnCost
                 var project: AnalyticsReport.Project?
                 if let directory = source.directory {
                     var slot = projects[directory]
@@ -316,13 +355,13 @@ actor AnalyticsLedger {
                             name: directory == home
                                 ? "~" : (directory as NSString).lastPathComponent,
                             sessions: 0, turns: 0, costUSD: 0, tokens: TokenCounts())
-                    slot.costUSD += turn.costUSD
-                    slot.tokens = slot.tokens + turn.tokens
+                    slot.costUSD += turnCost
+                    slot.tokens = slot.tokens + turnTokens
                     project = slot
                 }
                 if turn.sidechain {
-                    subagents.tokens = subagents.tokens + turn.tokens
-                    subagents.costUSD += turn.costUSD
+                    subagents.tokens = subagents.tokens + turnTokens
+                    subagents.costUSD += turnCost
                 } else {
                     bucket.turns += 1
                     totals.turns += 1
@@ -331,14 +370,14 @@ actor AnalyticsLedger {
                     project?.turns += 1
                     let hour = calendar.component(.hour, from: turn.at)
                     hourTurns[hour] += 1
-                    hourCost[hour] += turn.costUSD
-                    if turn.costUSD > (priciestTurn?.costUSD ?? 0) {
-                        priciestTurn = record(turn: turn, title: source.title)
+                    hourCost[hour] += turnCost
+                    if turnCost > (priciestTurn?.costUSD ?? 0) {
+                        priciestTurn = record(turn: turn, costUSD: turnCost, title: source.title)
                     }
                     if let seconds = turn.seconds, seconds <= plausibleTurnSeconds,
                         seconds > (longestTurn?.seconds ?? 0)
                     {
-                        longestTurn = record(turn: turn, title: source.title)
+                        longestTurn = record(turn: turn, costUSD: turnCost, title: source.title)
                     }
                 }
                 daily[key] = bucket
@@ -390,11 +429,11 @@ actor AnalyticsLedger {
                     days: Set(daily.keys), calendar: calendar, format: dayFormat)))
     }
 
-    private static func record(turn: AnalyticsFileStats.Turn, title: String)
+    private static func record(turn: AnalyticsFileStats.Turn, costUSD: Double, title: String)
         -> AnalyticsReport.Records.Turn
     {
         AnalyticsReport.Records.Turn(
-            at: turn.at, costUSD: turn.costUSD, seconds: turn.seconds, model: turn.model,
+            at: turn.at, costUSD: costUSD, seconds: turn.seconds, model: turn.model,
             prompt: turn.prompt, sessionTitle: title)
     }
 
@@ -472,30 +511,30 @@ enum AnalyticsWalker {
             let usage = message["usage"] as? [String: Any] ?? [:]
             let at = date(entry["timestamp"]) ?? lastAt ?? Date()
             let counts = tokens(in: usage)
-            let cost = Rate.forModel(model ?? "").cost(of: counts)
-            let calls = toolCalls(in: message)
+            let line = AnalyticsFileStats.Line(
+                messageID: message["id"] as? String,
+                uuid: entry["uuid"] as? String,
+                tokens: counts,
+                costUSD: Rate.forModel(model ?? "").cost(of: counts),
+                tools: toolCalls(in: message))
             if sidechain {
                 stats.turns.append(
                     AnalyticsFileStats.Turn(
-                        at: at, seconds: nil, model: model, tokens: counts, costUSD: cost,
-                        sidechain: true, prompt: nil, tools: calls))
+                        at: at, seconds: nil, model: model, sidechain: true, prompt: nil,
+                        lines: [line]))
                 continue
             }
             lastAt = at
             if open == nil {
                 open = AnalyticsFileStats.Turn(
-                    at: pendingPromptAt ?? at, seconds: nil, model: model, tokens: TokenCounts(),
-                    costUSD: 0, sidechain: false, prompt: pendingPrompt, tools: [:])
+                    at: pendingPromptAt ?? at, seconds: nil, model: model, sidechain: false,
+                    prompt: pendingPrompt, lines: [])
                 pendingPrompt = nil
                 pendingPromptAt = nil
             }
             guard var turn = open else { continue }
-            turn.tokens = turn.tokens + counts
-            turn.costUSD += cost
+            turn.lines.append(line)
             if turn.model == nil { turn.model = model }
-            for (name, count) in calls {
-                turn.tools[name, default: 0] += count
-            }
             open = turn
         }
         close()

@@ -370,6 +370,7 @@ actor TranscriptIndex {
         var id: String
         var title: String
         var directory: String?
+        var createdAt: Date
         var mtime: Date
         var size: Int
     }
@@ -382,7 +383,7 @@ actor TranscriptIndex {
             guard let entry = slot.entry else { return nil }
             return AnalyticsSource(
                 path: path, id: entry.id, title: entry.title, directory: entry.directory,
-                mtime: slot.mtime, size: slot.size)
+                createdAt: entry.createdAt, mtime: slot.mtime, size: slot.size)
         }
     }
 
