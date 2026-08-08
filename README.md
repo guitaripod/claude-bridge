@@ -37,8 +37,17 @@ curl -fsSL https://raw.githubusercontent.com/guitaripod/claude-bridge/master/ins
 
 Clones into `~/.claude-bridge/src`, builds it, generates a password, and registers a service that
 survives a reboot — `systemctl --user` on Linux, a launch agent on macOS. It prints the address,
-username and password to paste into a client. Config lives in `~/.claude-bridge/config.env`;
-edit it and restart the service to change the port, model, or APNs key.
+username and password to paste into a client — including a single `http://… BRIDGE_PASSWORD=…`
+line that [Tailscode](https://github.com/guitaripod/Tailscode) reads whole, filling both fields
+from one paste. Config lives in `~/.claude-bridge/config.env`; edit it and restart the service to
+change the port, model, or APNs key.
+
+A client that already minted a password can bake it into the one-liner, so both sides carry the
+same one without anyone retyping it (an existing config's password is never overwritten):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/guitaripod/claude-bridge/master/install.sh | BRIDGE_PASSWORD=xxx bash
+```
 
 ## Updating
 

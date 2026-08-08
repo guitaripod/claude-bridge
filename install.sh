@@ -8,6 +8,10 @@
 # registers a service (systemd --user on Linux, launchd on macOS) so the bridge comes back after a
 # reboot. Re-run it any time to update; --update is the same thing without touching config or
 # service files, and is what the bridge runs when a client asks it to update itself.
+#
+# A client app that already minted a password can pass it through the pipe:
+#
+#   curl -fsSL https://raw.githubusercontent.com/guitaripod/claude-bridge/master/install.sh | BRIDGE_PASSWORD=xxx bash
 
 set -euo pipefail
 
@@ -98,10 +102,22 @@ build() {
   ( cd "$SRC" && swift build -c release ) >>"$LOG" 2>&1 || fail "build failed — see $LOG"
 }
 
+# A client app can mint the password and bake it into the install one-liner
+# (`curl … | BRIDGE_PASSWORD=xxx bash`) so both sides carry the same one without
+# anyone retyping it. An existing config always wins: rotating a working
+# install's password would lock out every client that already has it.
 write_config() {
-  [ -f "$CONFIG" ] && return 0
+  if [ -f "$CONFIG" ]; then
+    if [ -n "${BRIDGE_PASSWORD:-}" ]; then
+      local existing
+      existing="$(. "$CONFIG" && printf '%s' "$BRIDGE_PASSWORD")"
+      [ "$existing" = "$BRIDGE_PASSWORD" ] ||
+        say "keeping the password already in $CONFIG — use the one printed below, not the one you passed"
+    fi
+    return 0
+  fi
   local password
-  password="$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | cut -c1-24)"
+  password="${BRIDGE_PASSWORD:-$(head -c 18 /dev/urandom | base64 | tr -d '/+=' | cut -c1-24)}"
   cat >"$CONFIG" <<EOF
 # claude-bridge configuration. Edit, then restart the service.
 export BRIDGE_PASSWORD="$password"
@@ -209,7 +225,11 @@ claude-bridge is running.
   Username  claude
   Password  $password
 
-Put that address and password into Tailscode (Settings → Servers → Add), or:
+Copy this one line into Tailscode's address field — it fills the password too:
+
+  http://$address:$PORT BRIDGE_PASSWORD=$password
+
+Or check it by hand:
 
   curl -u claude:$password http://$address:$PORT/health
 
