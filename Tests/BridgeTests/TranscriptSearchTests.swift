@@ -31,6 +31,27 @@ import Testing
         return id
     }
 
+    /// A subagent transcript, filed where the CLI files them: under the conversation that spawned
+    /// it, at whatever depth.
+    private func writeSubagent(
+        _ lines: [[String: Any]], project: String, session: String, workflow: String? = nil,
+        in root: URL
+    ) throws {
+        var dir = root.appendingPathComponent(project).appendingPathComponent(session)
+            .appendingPathComponent("subagents")
+        if let workflow { dir = dir.appendingPathComponent("workflows").appendingPathComponent(workflow) }
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let body =
+            lines.compactMap {
+                (try? JSONSerialization.data(withJSONObject: $0)).flatMap {
+                    String(data: $0, encoding: .utf8)
+                }
+            }.joined(separator: "\n") + "\n"
+        try body.write(
+            to: dir.appendingPathComponent("agent-\(UUID().uuidString).jsonl"), atomically: true,
+            encoding: .utf8)
+    }
+
     private func user(_ text: String) -> [String: Any] {
         ["type": "user", "cwd": "/home/m/proj", "message": ["content": text]]
     }
@@ -151,6 +172,48 @@ import Testing
         #expect(capped.hits.count == 2)
         #expect(capped.truncated)
         #expect(await TranscriptSearch.run(root: root, query: "marker", limit: 20).truncated == false)
+    }
+
+    @Test("What a subagent did is found under the conversation that sent it")
+    func subagentWorkIsFound() async throws {
+        let root = try makeRoot()
+        let session = try write([user("audit the login flow")], project: "a", in: root)
+        try writeSubagent(
+            [assistant([["type": "text", "text": "the session cookie is never rotated"]])],
+            project: "a", session: session, in: root)
+        try writeSubagent(
+            [assistant([["type": "thinking", "thinking": "checking the rotation window"]])],
+            project: "a", session: session, workflow: "wf_1", in: root)
+
+        let found = await TranscriptSearch.run(root: root, query: "rotated", limit: 10)
+        #expect(found.hits.count == 1)
+        #expect(found.hits.first?.sessionID == session)
+        #expect(found.hits.first?.title == "audit the login flow")
+        let nested = await TranscriptSearch.run(root: root, query: "rotation window", limit: 10)
+        #expect(nested.hits.first?.sessionID == session)
+    }
+
+    @Test("A conversation and its subagents are one row, not several")
+    func subagentsFoldIntoOneRow() async throws {
+        let root = try makeRoot()
+        let session = try write([user("the beacon is missing")], project: "a", in: root)
+        try writeSubagent([assistant([["type": "text", "text": "beacon found"]])],
+            project: "a", session: session, in: root)
+        try writeSubagent([assistant([["type": "text", "text": "beacon again"]])],
+            project: "a", session: session, in: root)
+
+        let found = await TranscriptSearch.run(root: root, query: "beacon", limit: 10)
+        #expect(found.hits.count == 1)
+        #expect(found.hits.first?.total == 3)
+        #expect(found.hits.first?.matches.count == 3)
+    }
+
+    @Test("A subagent whose conversation is gone is not offered as somewhere to go back to")
+    func orphanedSubagentsAreLeftOut() async throws {
+        let root = try makeRoot()
+        try writeSubagent([assistant([["type": "text", "text": "orphan marker here"]])],
+            project: "a", session: UUID().uuidString, in: root)
+        #expect(await TranscriptSearch.run(root: root, query: "orphan marker", limit: 10).hits.isEmpty)
     }
 
     @Test("A conversation carries where it happened, so a result can name its project")
