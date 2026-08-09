@@ -149,11 +149,11 @@ actor TranscriptWatcher {
     }
 
     private nonisolated func fileSize(_ path: String) -> Int? {
-        (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int
+        TranscriptIndex.statSize(path)
     }
 
     private nonisolated func mtime(_ path: String) -> Date? {
-        (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date
+        TranscriptIndex.statMtime(path)
     }
 
     private nonisolated func readChunk(_ path: String, from offset: Int, count: Int) -> Data {

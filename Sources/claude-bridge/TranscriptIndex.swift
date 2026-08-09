@@ -1,5 +1,11 @@
 import Foundation
 
+#if canImport(Glibc)
+    import Glibc
+#elseif canImport(Darwin)
+    import Darwin
+#endif
+
 /// Read-only view over `~/.claude/projects`: every Claude Code CLI transcript on this machine
 /// becomes a listable, resumable session. One `.jsonl` file is one session — the CLI keeps a
 /// stable session id across `--resume` and appends turns to the same file.
@@ -409,10 +415,105 @@ actor TranscriptIndex {
     }
 
     private func isSidecarActive(transcriptPath: String, after threshold: Date) -> Bool {
-        guard let latest = TranscriptParser.sidecarActivity(transcriptPath: transcriptPath) else {
-            return false
-        }
+        guard let latest = sidecarLatest(transcriptPath: transcriptPath) else { return false }
         return latest > threshold
+    }
+
+    private struct SidecarProbe {
+        var latest: Date?
+        var dirStamps: [String: Date]
+        var checkedAt: ContinuousClock.Instant
+        var walkedAt: ContinuousClock.Instant
+    }
+
+    private var sidecarProbes: [String: SidecarProbe] = [:]
+    private static let sidecarProbeDebounce: Duration = .milliseconds(900)
+    private static let sidecarColdRecheck: Duration = .seconds(120)
+
+    /// Latest sidecar write for a transcript, memoized so the sweep's several askers per second
+    /// cost one directory walk only where agents might actually be working. A repeat inside the
+    /// debounce answers from the cache outright — the same sweep asks through `activeIDs`, the
+    /// listing and the agent scan, and the answer cannot have changed between them. A session
+    /// whose sidecars wrote recently is re-walked every time: those are few, and their file
+    /// mtimes are the very signal being read. A cold session — most of the machine, forever — is
+    /// trusted while its sidecar directories' own mtimes stand still, because a new agent means a
+    /// new file and a new file stamps its directory. The slow recheck backstops the one write no
+    /// directory mtime can betray (an old file appended with no new neighbour), so even that
+    /// heals inside two minutes.
+    private func sidecarLatest(transcriptPath: String) -> Date? {
+        let now = ContinuousClock.now
+        if let probe = sidecarProbes[transcriptPath] {
+            if now - probe.checkedAt < Self.sidecarProbeDebounce { return probe.latest }
+            let warm =
+                probe.latest.map {
+                    Date().timeIntervalSince($0) < Self.subagentActivityWindow * 3
+                } ?? false
+            if !warm, now - probe.walkedAt < Self.sidecarColdRecheck,
+                Self.sidecarDirStamps(transcriptPath: transcriptPath) == probe.dirStamps
+            {
+                sidecarProbes[transcriptPath]?.checkedAt = now
+                return probe.latest
+            }
+        }
+        let stamps = Self.sidecarDirStamps(transcriptPath: transcriptPath)
+        let latest =
+            stamps.isEmpty
+            ? nil : TranscriptParser.sidecarActivity(transcriptPath: transcriptPath)
+        sidecarProbes[transcriptPath] = SidecarProbe(
+            latest: latest, dirStamps: stamps, checkedAt: now, walkedAt: now)
+        return latest
+    }
+
+    /// The memoized probe for every known session at once, keyed by session id — one actor call
+    /// for the observer's whole agent sweep instead of one uncached walk per session per tick.
+    func sidecarLatestsByID() -> [String: Date] {
+        scan()
+        var latests: [String: Date] = [:]
+        for (id, path) in pathByID {
+            if let latest = sidecarLatest(transcriptPath: path) { latests[id] = latest }
+        }
+        return latests
+    }
+
+    /// The mtimes of the directories that can hold this session's sidecars — the cheap question
+    /// whose answer changes whenever an agent file is created or removed. Empty means the session
+    /// has never fanned out, which is most sessions and costs exactly one `stat`.
+    nonisolated private static func sidecarDirStamps(transcriptPath: String) -> [String: Date] {
+        guard transcriptPath.hasSuffix(".jsonl") else { return [:] }
+        let root = String(transcriptPath.dropLast(".jsonl".count)) + "/subagents"
+        var stamps: [String: Date] = [:]
+        guard let rootStamp = statMtime(root) else { return stamps }
+        stamps[root] = rootStamp
+        let workflows = root + "/workflows"
+        guard statMtime(workflows) != nil,
+            let runs = try? FileManager.default.contentsOfDirectory(atPath: workflows)
+        else { return stamps }
+        for run in runs {
+            let dir = workflows + "/" + run
+            if let stamp = statMtime(dir) { stamps[dir] = stamp }
+        }
+        return stamps
+    }
+
+    /// One `stat` and nothing else: the probes run hundreds of times a second across the whole
+    /// machine, and Foundation's attribute dictionaries are the cost being avoided.
+    nonisolated static func statMtime(_ path: String) -> Date? {
+        var status = stat()
+        guard stat(path, &status) == 0 else { return nil }
+        #if os(Linux)
+            let seconds = status.st_mtim
+        #else
+            let seconds = status.st_mtimespec
+        #endif
+        return Date(
+            timeIntervalSince1970: TimeInterval(seconds.tv_sec)
+                + TimeInterval(seconds.tv_nsec) / 1_000_000_000)
+    }
+
+    nonisolated static func statSize(_ path: String) -> Int? {
+        var status = stat()
+        guard stat(path, &status) == 0 else { return nil }
+        return Int(status.st_size)
     }
 
     /// Parses the transcript into a `Session` suitable for display or adoption. Incremental:
@@ -605,6 +706,7 @@ actor TranscriptIndex {
         for stale in cache.keys where !seen.contains(stale) {
             if let id = cache[stale]?.entry?.id { pathByID[id] = nil }
             cache[stale] = nil
+            sidecarProbes[stale] = nil
         }
     }
 

@@ -191,14 +191,12 @@ actor ObserverLoop {
         if !baselined {
             baselined = true
             for (_, path) in paths {
-                let size =
-                    (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int
-                if let size { lastSizes[path] = size }
+                if let size = TranscriptIndex.statSize(path) { lastSizes[path] = size }
             }
             return
         }
         for (claudeID, path) in paths {
-            let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int
+            let size = TranscriptIndex.statSize(path)
             guard let size, size != lastSizes[path] else { continue }
             lastSizes[path] = size
             let sessionID = await store.sessionID(forClaudeID: claudeID) ?? claudeID
@@ -222,10 +220,10 @@ actor ObserverLoop {
 
     private func publishAgentChanges() async {
         let threshold = Date().addingTimeInterval(-TranscriptIndex.subagentActivityWindow)
+        let latests = await index.sidecarLatestsByID()
         let paths = await index.pathsByID()
-        for (claudeID, path) in paths {
-            let hasRecent = TranscriptParser.sidecarActivity(transcriptPath: path)
-                .map { $0 > threshold } ?? false
+        for (claudeID, _) in paths {
+            let hasRecent = latests[claudeID].map { $0 > threshold } ?? false
             let hadAgents = !(lastAgents[claudeID] ?? []).isEmpty
             guard hasRecent || hadAgents else { continue }
             let agents = await index.subagents(for: claudeID)
