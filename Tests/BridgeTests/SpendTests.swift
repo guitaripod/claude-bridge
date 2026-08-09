@@ -27,13 +27,16 @@ import Testing
         """
     }
 
+    /// One API response. The id defaults to a fresh one because that is what the CLI writes — an id
+    /// is repeated only across the several lines one response was split into, which is the whole
+    /// reason the reader charges by it.
     private func assistant(
-        model: String, at: String, input: Int = 0, output: Int = 0, cacheRead: Int = 0,
-        write5m: Int = 0, write1h: Int = 0
+        model: String, at: String, id: String = UUID().uuidString, input: Int = 0, output: Int = 0,
+        cacheRead: Int = 0, write5m: Int = 0, write1h: Int = 0
     ) -> String {
         let created = write5m + write1h
         return """
-            {"type":"assistant","uuid":"\(UUID().uuidString)","timestamp":"\(at)","message":{"id":"m","role":"assistant","model":"\(model)","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":\(input),"output_tokens":\(output),"cache_read_input_tokens":\(cacheRead),"cache_creation_input_tokens":\(created),"cache_creation":{"ephemeral_5m_input_tokens":\(write5m),"ephemeral_1h_input_tokens":\(write1h)}}}}
+            {"type":"assistant","uuid":"\(UUID().uuidString)","timestamp":"\(at)","message":{"id":"\(id)","role":"assistant","model":"\(model)","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":\(input),"output_tokens":\(output),"cache_read_input_tokens":\(cacheRead),"cache_creation_input_tokens":\(created),"cache_creation":{"ephemeral_5m_input_tokens":\(write5m),"ephemeral_1h_input_tokens":\(write1h)}}}}
             """
     }
 
@@ -108,6 +111,24 @@ import Testing
         #expect(report.byModel[0].model == "claude-opus-5")
         #expect(report.byModel[0].costUSD > report.byModel[1].costUSD)
         #expect(report.byModel[1].turns == 1)
+    }
+
+    @Test("A response written across several lines is billed once, not once per line")
+    func chargesEachMessageOnce() throws {
+        let path = try write([
+            user("go", at: "2026-08-07T10:00:00.000Z"),
+            assistant(
+                model: "claude-opus-5", at: "2026-08-07T10:00:01.000Z", id: "msg_1", output: 200),
+            assistant(
+                model: "claude-opus-5", at: "2026-08-07T10:00:02.000Z", id: "msg_1", output: 200),
+            assistant(
+                model: "claude-opus-5", at: "2026-08-07T10:00:03.000Z", id: "msg_2", output: 50),
+        ])
+
+        let report = try #require(SpendReader.read(transcriptPath: path))
+        #expect(report.turns.count == 1)
+        #expect(report.turns[0].calls == 2)
+        #expect(report.tokens.output == 250)
     }
 
     @Test("A transcript with nothing priced in it reports nothing rather than zero")
