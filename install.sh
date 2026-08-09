@@ -100,6 +100,20 @@ fetch_source() {
 build() {
   say "building (this takes a few minutes the first time)"
   ( cd "$SRC" && swift build -c release ) >>"$LOG" 2>&1 || fail "build failed — see $LOG"
+  stamp_build
+}
+
+# What the binary that was just produced was built from.
+#
+# `git describe` run later answers about the *directory*, which moves when somebody checks out a
+# branch and runs ahead of the process for the whole stretch between a build and a restart. The
+# bridge reads this file once at startup, so what it reports is a fact about itself.
+stamp_build() {
+  local describe commit
+  describe="$( cd "$SRC" && git describe --tags --always --dirty 2>/dev/null || true )"
+  commit="$( cd "$SRC" && git rev-parse --short HEAD 2>/dev/null || true )"
+  printf '{"version":"%s","commit":"%s","builtAt":"%s","source":"%s"}\n' \
+    "${describe:-unknown}" "${commit:-}" "$(now)" "$SRC" >"$STATE_DIR/build.json"
 }
 
 # A client app can mint the password and bake it into the install one-liner
@@ -139,6 +153,7 @@ set -euo pipefail
 export PATH="\$HOME/.local/bin:\$HOME/.local/share/swiftly/bin:/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin"
 [ -f "$CONFIG" ] && . "$CONFIG"
 export BRIDGE_SRC="$SRC"
+export BRIDGE_STATE_DIR="$STATE_DIR"
 exec "$SRC/.build/release/claude-bridge"
 EOF
   chmod 755 "$RUNNER"
@@ -243,6 +258,10 @@ if [ "$MODE" = "update" ]; then
   fetch_source
   phase building
   build
+  # An install predating a runner variable would never gain it otherwise, and the bridge reads the
+  # build stamp through one: rewriting the launcher is what carries the new contract onto machines
+  # that only ever take updates.
+  write_runner
   say "built $(git -C "$SRC" describe --tags --always 2>/dev/null || echo unknown)"
   phase restarting
   if [ -n "$MANAGED" ]; then

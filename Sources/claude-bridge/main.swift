@@ -66,6 +66,12 @@ let projectsDir = env("BRIDGE_PROJECTS", "\(home)/.claude/projects")
 
 enforceFailClosedStartup(password: password, permissionMode: permissionMode)
 
+/// Read before anything can rewrite it. The stamp names the build that produced *this* process, and
+/// an update landing later replaces the file — so a lazy first read halfway through the day would
+/// hand back the version of a binary nobody has started yet, which is the one thing it exists to
+/// prevent saying.
+_ = BridgeVersion.running
+
 try? FileManager.default.createDirectory(
     at: URL(fileURLWithPath: workdir), withIntermediateDirectories: true)
 
