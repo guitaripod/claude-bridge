@@ -37,10 +37,17 @@ private struct ClaudeCredentials {
     var rateLimitTier: String
 }
 
+/// What the account itself says it is on, as opposed to what this machine's login file remembers.
+private struct ClaudeProfile: Sendable {
+    var planName: String?
+    var rateLimitTier: String?
+}
+
 /// Live Claude Max/Pro quota from the same OAuth endpoint Claude Code's
 /// `/usage` command uses, read from this machine's `~/.claude/.credentials.json`.
 enum ClaudeUsage {
     private static let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+    private static let profileURL = URL(string: "https://api.anthropic.com/api/oauth/profile")!
     private static let tokenURL = URL(string: "https://platform.claude.com/v1/oauth/token")!
     private static let clientID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
     private static let oauthBeta = "oauth-2025-04-20"
@@ -51,6 +58,26 @@ enum ClaudeUsage {
     /// blanking every gauge.
     private static let cache = UsageSnapshotCache(name: "claude")
     private static let staleWindow: TimeInterval = 24 * 3600
+    /// A plan changes on a billing cycle, so it is asked for far less often than the gauges — and
+    /// the last answer is kept without an expiry as the fallback, because the account's own answer
+    /// from ten minutes ago is still a better account of the plan than a login file from March.
+    private static let planCache = PlanCache()
+    private static let planTTL: TimeInterval = 600
+
+    private actor PlanCache {
+        private var held: ClaudeProfile?
+        private var at: Date?
+
+        func value(within ttl: TimeInterval) -> ClaudeProfile? {
+            guard let held, let at, Date().timeIntervalSince(at) < ttl else { return nil }
+            return held
+        }
+
+        func store(_ profile: ClaudeProfile) {
+            held = profile
+            at = Date()
+        }
+    }
 
     static func snapshot() async -> UsageSnapshot {
         if let fresh = await cache.fresh(within: 60) { return fresh }
@@ -89,10 +116,47 @@ enum ClaudeUsage {
             guard retryStatus == 200 else {
                 throw UsageError.message("usage endpoint returned \(retryStatus) after refresh")
             }
-            return parse(retryBody, creds: fresh)
+            return parse(retryBody, creds: fresh, profile: await profile(fresh.accessToken))
         }
         guard status == 200 else { throw UsageError.message("usage endpoint returned \(status)") }
-        return parse(body, creds: creds)
+        return parse(body, creds: creds, profile: await profile(creds.accessToken))
+    }
+
+    /// The account's own answer about which plan it is on, kept for longer than the gauges because
+    /// a plan changes on a billing cycle rather than on a turn, and asked with the same token the
+    /// gauges were just fetched with. A failure here is not a failure of the snapshot: the bars are
+    /// still true, so the plan simply goes unnamed rather than taking the snapshot down with it.
+    private static func profile(_ token: String) async -> ClaudeProfile? {
+        if let held = await planCache.value(within: planTTL) { return held }
+        var request = URLRequest(url: profileURL)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "authorization")
+        request.setValue(oauthBeta, forHTTPHeaderField: "anthropic-beta")
+        request.setValue("application/json", forHTTPHeaderField: "accept")
+        request.setValue(
+            "claude-bridge (+https://github.com/guitaripod/claude-bridge)",
+            forHTTPHeaderField: "user-agent")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+            (response as? HTTPURLResponse)?.statusCode == 200,
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else { return await planCache.value(within: .infinity) }
+        let organization = json["organization"] as? [String: Any]
+        let account = json["account"] as? [String: Any]
+        let named: String? = {
+            if let type = organization?["organization_type"] as? String {
+                switch type {
+                case "claude_max": return "Max"
+                case "claude_pro": return "Pro"
+                default: break
+                }
+            }
+            if (account?["has_claude_max"] as? NSNumber)?.boolValue == true { return "Max" }
+            if (account?["has_claude_pro"] as? NSNumber)?.boolValue == true { return "Pro" }
+            return nil
+        }()
+        let found = ClaudeProfile(
+            planName: named, rateLimitTier: organization?["rate_limit_tier"] as? String)
+        await planCache.store(found)
+        return found
     }
 
     private static func getUsage(_ token: String) async throws -> (Int, [String: Any]) {
@@ -109,7 +173,9 @@ enum ClaudeUsage {
         return (status, json)
     }
 
-    private static func parse(_ json: [String: Any], creds: ClaudeCredentials) -> UsageSnapshot {
+    private static func parse(
+        _ json: [String: Any], creds: ClaudeCredentials, profile: ClaudeProfile?
+    ) -> UsageSnapshot {
         var gauges: [UsageGauge] = []
         if let limits = json["limits"] as? [[String: Any]] {
             gauges = limits.compactMap(gaugeFromLimit)
@@ -119,7 +185,7 @@ enum ClaudeUsage {
 
         return UsageSnapshot(
             providerName: "Claude",
-            subtitle: subtitle(creds),
+            subtitle: subtitle(creds, profile: profile),
             source: "api.anthropic.com · live",
             live: true,
             gauges: gauges,
@@ -190,17 +256,32 @@ enum ClaudeUsage {
         return details
     }
 
-    private static func subtitle(_ creds: ClaudeCredentials) -> String {
-        let plan: String
-        switch creds.subscriptionType {
-        case "max": plan = "Max"
-        case "pro": plan = "Pro"
-        default: plan = creds.subscriptionType
+    /// What plan these bars are a percentage of.
+    ///
+    /// Never read from `~/.claude/.credentials.json`. That file is written at login and the CLI
+    /// rewrites only the tokens in it, so its `rateLimitTier` is whatever the plan was the day the
+    /// account signed in — an account that moved from Max 20× to Max 5× goes on being told it is
+    /// on 20× forever, with the gauges underneath it already measuring the smaller plan. The
+    /// account is the authority on the account, so the multiplier comes from the profile endpoint
+    /// or it does not come at all: a plan named without its multiplier is incomplete, and a plan
+    /// named with the wrong one is false.
+    private static func subtitle(_ creds: ClaudeCredentials, profile: ClaudeProfile?) -> String {
+        let plan = profile?.planName ?? planName(creds.subscriptionType)
+        guard let tier = profile?.rateLimitTier,
+            let multiplier = tier.split(separator: "_").last, multiplier.hasSuffix("x"),
+            let count = Int(multiplier.dropLast())
+        else { return plan }
+        return "\(plan) · \(count)×"
+    }
+
+    private static func planName(_ subscriptionType: String) -> String {
+        switch subscriptionType {
+        case "max": return "Max"
+        case "pro": return "Pro"
+        case "team": return "Team"
+        case "enterprise": return "Enterprise"
+        default: return subscriptionType.isEmpty ? "Claude" : subscriptionType.capitalized
         }
-        if let multiplier = creds.rateLimitTier.split(separator: "_").last, multiplier.hasSuffix("x") {
-            return "\(plan) · \(multiplier.dropLast())×"
-        }
-        return plan
     }
 
     private static func pretty(_ kind: String) -> String {
