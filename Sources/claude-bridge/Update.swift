@@ -7,7 +7,7 @@ import Foundation
 /// one, otherwise the tag it descends from and the commit. The constant is the fallback for an
 /// install that shipped without its `.git` directory.
 enum BridgeVersion {
-    static let fallback = "1.2.0"
+    static let fallback = "1.4.0"
 
     static func describe(source: String?) -> String {
         guard let source,
