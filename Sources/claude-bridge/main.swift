@@ -97,7 +97,8 @@ let store = SessionStore(
             .appendingPathComponent("live-activities.json")),
     devicePusher: DevicePusher(
         client: apnsClient,
-        devicesURL: storeURL.deletingLastPathComponent().appendingPathComponent("devices.json")))
+        devicesURL: storeURL.deletingLastPathComponent().appendingPathComponent("devices.json")),
+    autoResumeDefault: env("BRIDGE_AUTO_RESUME", "0") == "1")
 
 let router = Router()
 if !password.isEmpty {
@@ -114,6 +115,9 @@ let observer = ObserverLoop(index: index, store: store, hub: hub)
 Task { await observer.run() }
 Task { await hub.runHeartbeats() }
 await store.pusher.endOrphans()
+// Before anything is served: decide what became of every turn that was open when this process last
+// stopped. A client that connects first would otherwise be told a cut-off conversation is idle.
+await store.recoverJournaledTurns()
 let updater = UpdateService(stateDirectory: storeURL.deletingLastPathComponent())
 await updater.resume()
 let auth = AuthService(claudePath: claudePath, workdir: workdir)

@@ -553,6 +553,52 @@ func registerRoutes(
             status: .conflict)
     }
 
+    // Its own route rather than a field on the session: a client asks this on every transcript
+    // load, and a whole conversation is an expensive way to answer one question. A bridge too old
+    // to have it 404s, which reads as "nothing was interrupted" and is the truth about that server.
+    router.get("sessions/:id/interruption") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        guard let interruption = await store.interruption(id) else {
+            return jsonResponse(["interruption": Interruption?.none])
+        }
+        return jsonResponse(["interruption": interruption])
+    }
+
+    router.post("sessions/:id/resume") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        switch await store.resumeInterrupted(id) {
+        case .unknownSession:
+            return jsonResponse(["error": "not found"], status: .notFound)
+        case .noInterruption:
+            return jsonResponse(
+                ["error": "Nothing to pick up — no turn in this session was interrupted."],
+                status: .conflict)
+        case .started:
+            return jsonResponse(SendAccepted(queued: false, position: nil), status: .accepted)
+        case .queued(let position):
+            return jsonResponse(SendAccepted(queued: true, position: position), status: .accepted)
+        }
+    }
+
+    router.post("sessions/:id/interruption/dismiss") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        guard await store.dismissInterruption(id) else {
+            return jsonResponse(["error": "not found"], status: .notFound)
+        }
+        return jsonResponse(["ok": true])
+    }
+
+    router.post("sessions/:id/auto-resume") { request, context in
+        let id = context.parameters.get("id") ?? ""
+        guard let body = try? await decodeBody(AutoResumeRequest.self, request) else {
+            return jsonResponse(["error": "bad request"], status: .badRequest)
+        }
+        guard await store.setAutoResume(id, enabled: body.enabled) else {
+            return jsonResponse(["error": "not found"], status: .notFound)
+        }
+        return jsonResponse(["ok": true])
+    }
+
     router.post("sessions/:id/fork") { _, context in
         let id = context.parameters.get("id") ?? ""
         await adoptIfNeeded(id)

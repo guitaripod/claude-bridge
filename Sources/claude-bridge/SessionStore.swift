@@ -59,11 +59,36 @@ actor SessionStore {
     /// a second `claude -p --resume` against the same transcript in the same working directory.
     private var inFlight: Set<String> = []
     private var pendingPrompts: [String: [QueuedPrompt]] = [:]
+    /// The same two facts — what is running, what is waiting — written where they survive the
+    /// process. Everything above this line is lost the moment the machine stops, which is exactly
+    /// when it matters most.
+    private var journal: TurnJournal
+    private let journalURL: URL
 
     private struct QueuedPrompt {
         let prompt: String
+        let displayPrompt: String
         let model: String?
         let effort: String?
+
+        var record: QueuedRecord {
+            QueuedRecord(
+                prompt: prompt, displayPrompt: displayPrompt, model: model, effort: effort)
+        }
+
+        init(prompt: String, displayPrompt: String, model: String?, effort: String?) {
+            self.prompt = prompt
+            self.displayPrompt = displayPrompt
+            self.model = model
+            self.effort = effort
+        }
+
+        init(_ record: QueuedRecord) {
+            prompt = record.prompt
+            displayPrompt = record.displayPrompt
+            model = record.model
+            effort = record.effort
+        }
     }
 
     /// What ``send(_:request:)`` did with a prompt. Both outcomes are accepted (202): a client
@@ -82,17 +107,26 @@ actor SessionStore {
         self.index = index
     }
 
+    /// Whether an interrupted turn continues on its own when the session has no opinion of its own.
+    /// A machine that is left running work unattended wants this; a machine somebody is sitting in
+    /// front of does not, which is why it is a decision and not a behaviour.
+    private let autoResumeDefault: Bool
+
     init(
         runner: ClaudeRunner, defaults: MachineDefaults, storeURL: URL,
         projectsDir: String = "", pusher: LiveActivityPusher = LiveActivityPusher(client: nil),
-        devicePusher: DevicePusher = DevicePusher(client: nil, devicesURL: nil)
+        devicePusher: DevicePusher = DevicePusher(client: nil, devicesURL: nil),
+        autoResumeDefault: Bool = false
     ) {
+        self.autoResumeDefault = autoResumeDefault
         self.pusher = pusher
         self.devicePusher = devicePusher
         self.runner = runner
         self.defaults = defaults
         self.storeURL = storeURL
         self.projectsDir = projectsDir
+        journalURL = TurnJournal.url(besides: storeURL)
+        journal = TurnJournal.load(from: journalURL)
         hiddenTranscripts = Self.loadHidden(from: Self.hiddenURL(for: storeURL))
         for session in Self.loadStored(from: storeURL) {
             sessions[session.id] = session
@@ -127,6 +161,9 @@ actor SessionStore {
             }
             if let fresh = transcriptDates[claudeID], fresh > summary.updatedAt {
                 summary.updatedAt = fresh
+            }
+            if let interruption = session.interruption, !interruption.isResumed {
+                summary.interrupted = true
             }
             return summary
         }
@@ -277,17 +314,32 @@ actor SessionStore {
     /// still has to exist in the transcript.
     @discardableResult
     func send(_ id: String, request: SendRequest) -> SendOutcome {
+        let upload = storeAttachments(for: request, sessionID: id)
+        return accept(
+            id, display: request.text, runnerPrompt: upload.prompt, files: upload.files,
+            model: request.model, effort: request.effort)
+    }
+
+    /// One prompt, in the two forms a turn needs it: what the person sees in their own transcript,
+    /// and what the CLI is actually handed. They diverge whenever the bridge has to say something
+    /// to the model that nobody typed — attachment paths, and the briefing that picks an
+    /// interrupted turn back up — and conflating them puts machine-written prose in the
+    /// conversation under someone else's name.
+    @discardableResult
+    private func accept(
+        _ id: String, display: String, runnerPrompt: String, files: [FileRef],
+        model: String?, effort: String?
+    ) -> SendOutcome {
         guard var session = sessions[id] else { return .unknownSession }
 
-        let upload = storeAttachments(for: request, sessionID: id)
         let userMessage = Message(
             id: UUID().uuidString, role: .user,
-            parts: upload.files.map { Part.file($0) } + [.text(request.text)], createdAt: Date())
+            parts: files.map { Part.file($0) } + [.text(display)], createdAt: Date())
         session.messages.append(userMessage)
         if session.title == "New chat"
             || (session.customTitle != true && session.messages.count <= 1)
         {
-            session.title = Self.deriveTitle(request.text, fallback: session.title)
+            session.title = Self.deriveTitle(display, fallback: session.title)
         }
         session.updatedAt = Date()
         sessions[id] = session
@@ -295,9 +347,12 @@ actor SessionStore {
         persist()
         broadcaster(for: id).send(.messageUpserted(userMessage))
 
-        let queued = QueuedPrompt(prompt: upload.prompt, model: request.model, effort: request.effort)
+        let queued = QueuedPrompt(
+            prompt: runnerPrompt, displayPrompt: display, model: model, effort: effort)
         guard !inFlight.contains(id) else {
             pendingPrompts[id, default: []].append(queued)
+            journal.turns[id]?.queued.append(queued.record)
+            journal.write(to: journalURL)
             return .queued(position: pendingPrompts[id]?.count ?? 1)
         }
         inFlight.insert(id)
@@ -329,6 +384,12 @@ actor SessionStore {
 
         let turnClaudeID = resume ?? id
         retainRunnerTurn(turnClaudeID)
+        journal.turns[id] = TurnRecord(
+            turnID: UUID().uuidString, sessionID: id, claudeSessionID: resume,
+            prompt: text, displayPrompt: queued.displayPrompt, model: model, effort: effort,
+            fork: fork, directory: directory, startedAt: Date(), pid: nil,
+            queued: (pendingPrompts[id] ?? []).map(\.record))
+        journal.write(to: journalURL)
         Task {
             let turnStart = Date()
             let outcome = await runner.run(
@@ -499,6 +560,9 @@ actor SessionStore {
 
     private func registerTurnProcess(_ id: String, pid: Int32) {
         turnProcessIDs[id] = pid
+        guard journal.turns[id] != nil else { return }
+        journal.turns[id]?.pid = pid
+        journal.write(to: journalURL)
     }
 
     /// Links the real Claude session id onto a stored session as soon as the runner reports it
@@ -507,6 +571,10 @@ actor SessionStore {
     /// Handles mid-conversation id rotation (compaction/resume mints a fresh transcript id): the
     /// superseded id is retained via ``setClaudeSessionID(_:on:)`` so its transcript stays claimed.
     private func linkClaudeSession(_ id: String, claudeSessionID sid: String) {
+        if journal.turns[id]?.claudeSessionID != sid, journal.turns[id] != nil {
+            journal.turns[id]?.claudeSessionID = sid
+            journal.write(to: journalURL)
+        }
         guard var session = sessions[id], session.claudeSessionID != sid else { return }
         let supersededTurnID = session.claudeSessionID ?? id
         if let held = runnerTurnClaudeIDs.removeValue(forKey: supersededTurnID) {
@@ -535,6 +603,10 @@ actor SessionStore {
     /// just killed ended.
     func abortTurn(_ id: String) -> (stopped: Bool, discarded: Int) {
         let discarded = pendingPrompts.removeValue(forKey: id)?.count ?? 0
+        if journal.turns[id] != nil {
+            journal.turns[id]?.queued = []
+            journal.write(to: journalURL)
+        }
         guard let pid = turnProcessIDs[id] else { return (false, discarded) }
         kill(pid, SIGTERM)
         return (true, discarded)
@@ -596,6 +668,7 @@ actor SessionStore {
     ) {
         let turnDuration = Date().timeIntervalSince(startedAt)
         turnProcessIDs[id] = nil
+        clearJournal(id)
         liveTurns[id] = nil
         settledTurnMessageIDs[id] = outcome.message.id
         releaseRunnerTurn(turnClaudeID)
@@ -613,6 +686,13 @@ actor SessionStore {
         }
         setClaudeSessionID(outcome.claudeSessionID, on: &session)
         session.pendingFork = nil
+        // A resumed turn that reaches its end is the interruption over. Clearing it only here — and
+        // never when the resume is merely sent — means a bridge that dies again mid-resume comes
+        // back still knowing the work was cut off.
+        if session.interruption?.isResumed == true {
+            session.interruption = nil
+            broadcaster(for: id).send(.interrupted(nil))
+        }
         if let cost = outcome.costUSD { session.lastCostUSD = cost }
         if let tokens = outcome.tokens { session.lastTokens = tokens }
         session.updatedAt = Date()
@@ -653,7 +733,224 @@ actor SessionStore {
         }
         pendingPrompts[id] = nil
         inFlight.remove(id)
+        clearJournal(id)
         broadcaster(for: id).send(.status("idle"))
+    }
+
+    private func clearJournal(_ id: String) {
+        guard journal.turns.removeValue(forKey: id) != nil else { return }
+        journal.write(to: journalURL)
+    }
+
+    /// What a resume did with the briefing it composed.
+    enum ResumeOutcome: Sendable, Equatable {
+        case started
+        case queued(position: Int)
+        case noInterruption
+        case unknownSession
+    }
+
+    /// The first thing this bridge does on the way back up: decide what became of every turn it had
+    /// open when it stopped.
+    ///
+    /// The transcript is the authority, not the journal and not the process table — a turn that
+    /// closed on disk finished, whether or not anything was alive to watch it, and a turn that
+    /// never closed did not. Three outcomes, and every one of them says something: the answer is
+    /// taken back out of the transcript and the queue behind it drains; or the child outlived us
+    /// and is still working, in which case it is watched to its end rather than declared lost; or
+    /// the work was cut off, which is a state with a name, a record of how far it got, and an offer
+    /// to continue. What there is no longer is a fourth outcome where a conversation simply sits
+    /// there looking finished.
+    func recoverJournaledTurns() async {
+        guard !journal.turns.isEmpty else { return }
+        let bootedAt = MachineUptime.bootedAt()
+        let records = journal.turns.values.sorted { $0.startedAt < $1.startedAt }
+        for record in records {
+            guard sessions[record.sessionID] != nil else {
+                clearJournal(record.sessionID)
+                continue
+            }
+            let claudeID = record.claudeSessionID ?? record.sessionID
+            let path = await index?.path(for: claudeID)
+            switch TurnRecovery.verdict(
+                for: record, transcriptPath: path, bootedAt: bootedAt)
+            {
+            case .completed:
+                await settleFromTranscript(record)
+            case .stillRunning(let pid):
+                adoptRunningTurn(record, pid: pid)
+            case .interrupted:
+                markInterrupted(record, transcriptPath: path)
+            }
+        }
+    }
+
+    /// Takes a finished turn back out of the transcript the CLI wrote while nothing was listening,
+    /// then drains whatever was queued behind it. Those prompts were accepted and never started —
+    /// nothing about them is half-done — so running them is what the session was already promised.
+    private func settleFromTranscript(_ record: TurnRecord) async {
+        let id = record.sessionID
+        let claudeID = record.claudeSessionID ?? id
+        if let fresh = await index?.session(claudeID), !fresh.messages.isEmpty,
+            var session = sessions[id]
+        {
+            session.messages = fresh.messages
+            if session.claudeSessionID == nil { session.claudeSessionID = claudeID }
+            session.pendingFork = nil
+            session.updatedAt = Date()
+            sessions[id] = session
+            moveToFront(id)
+            persist()
+            if let last = fresh.messages.last(where: { $0.role == .assistant }) {
+                broadcaster(for: id).send(.messageUpserted(last))
+            }
+        }
+        turnProcessIDs[id] = nil
+        liveTurns[id] = nil
+        clearJournal(id)
+        let owed = record.queued.map(QueuedPrompt.init)
+        guard let first = owed.first else {
+            inFlight.remove(id)
+            broadcaster(for: id).send(.status("idle"))
+            return
+        }
+        inFlight.insert(id)
+        pendingPrompts[id] = Array(owed.dropFirst())
+        startTurn(id, first)
+    }
+
+    /// A claude that outlived the bridge. Its stdout died with us — the events of this turn are
+    /// gone — but the work is not, and killing it to tidy up would throw away minutes of somebody's
+    /// machine. The session says it is running, and the transcript is watched until the turn closes
+    /// or the process goes.
+    private func adoptRunningTurn(_ record: TurnRecord, pid: Int32) {
+        let id = record.sessionID
+        let claudeID = record.claudeSessionID ?? id
+        inFlight.insert(id)
+        turnProcessIDs[id] = pid
+        retainRunnerTurn(claudeID)
+        broadcaster(for: id).send(.status("running"))
+        Task { await self.watchAdopted(record, pid: pid, claudeID: claudeID) }
+    }
+
+    /// How long an adopted turn is given before it is called interrupted regardless. Generous: a
+    /// single overnight run is a real thing people do, and the process check ends the wait the
+    /// moment it is actually over.
+    private static let adoptedTurnDeadline: TimeInterval = 12 * 3_600
+
+    private func watchAdopted(_ record: TurnRecord, pid: Int32, claudeID: String) async {
+        let deadline = Date().addingTimeInterval(Self.adoptedTurnDeadline)
+        while Date() < deadline {
+            try? await Task.sleep(for: .seconds(5))
+            let path = await index?.path(for: claudeID)
+            if let path, TranscriptParser.isTurnClosed(atPath: path) {
+                releaseRunnerTurn(claudeID)
+                lastRunnerFinish[claudeID] = Date()
+                await settleFromTranscript(record)
+                return
+            }
+            guard ProcessProbe.isLiveClaude(pid) else {
+                releaseRunnerTurn(claudeID)
+                lastRunnerFinish[claudeID] = Date()
+                let settled = await index?.path(for: claudeID)
+                if let settled, TranscriptParser.isTurnClosed(atPath: settled) {
+                    await settleFromTranscript(record)
+                } else {
+                    markInterrupted(record, transcriptPath: settled)
+                }
+                return
+            }
+        }
+        releaseRunnerTurn(claudeID)
+        markInterrupted(record, transcriptPath: await index?.path(for: claudeID))
+    }
+
+    private func markInterrupted(_ record: TurnRecord, transcriptPath: String?) {
+        let id = record.sessionID
+        let interruption = Interruption(
+            turnID: record.turnID, prompt: record.displayPrompt, startedAt: record.startedAt,
+            detectedAt: Date(), claudeSessionID: record.claudeSessionID,
+            progress: TurnRecovery.progress(
+                transcriptPath: transcriptPath, since: record.startedAt),
+            queued: record.queued.map(\.displayPrompt), resumedAt: nil)
+        turnProcessIDs[id] = nil
+        liveTurns[id] = nil
+        inFlight.remove(id)
+        pendingPrompts[id] = nil
+        clearJournal(id)
+        guard var session = sessions[id] else { return }
+        session.interruption = interruption
+        session.updatedAt = Date()
+        sessions[id] = session
+        persist()
+        let caster = broadcaster(for: id)
+        caster.send(.interrupted(interruption))
+        caster.send(.status("idle"))
+        let title = session.title
+        let tools = interruption.progress.toolCount
+        let duration = interruption.detectedAt.timeIntervalSince(interruption.startedAt)
+        Task {
+            await pusher.endTurn(sessionID: id, toolCount: tools, failed: true)
+            await devicePusher.pushTurnEnd(
+                sessionID: id, title: title, toolCount: tools, failed: true,
+                duration: duration, goal: nil)
+        }
+        guard session.autoResume ?? autoResumeDefault else { return }
+        resumeInterrupted(id)
+    }
+
+    func interruption(_ id: String) -> Interruption? { sessions[id]?.interruption }
+
+    /// Picks an interrupted turn back up.
+    ///
+    /// The prompt that goes out is a briefing, not the original words: the conversation is resumed
+    /// so the model still has its own context, but what it does *not* have is any idea that it was
+    /// cut off, or which of the things it started actually landed on disk. Re-sending the original
+    /// would be a blind retry of work that may be half-done — the one outcome worth engineering
+    /// against. What the person sees in their transcript is one line, because nobody typed the rest.
+    @discardableResult
+    func resumeInterrupted(_ id: String) -> ResumeOutcome {
+        guard var session = sessions[id] else { return .unknownSession }
+        guard var interruption = session.interruption, !interruption.isResumed else {
+            return .noInterruption
+        }
+        interruption.resumedAt = Date()
+        session.interruption = interruption
+        sessions[id] = session
+        persist()
+        broadcaster(for: id).send(.interrupted(interruption))
+        let outcome = accept(
+            id, display: Self.resumeDisplayText,
+            runnerPrompt: ResumeBrief.compose(interruption), files: [],
+            model: nil, effort: nil)
+        switch outcome {
+        case .started: return .started
+        case .queued(let position): return .queued(position: position)
+        case .unknownSession: return .unknownSession
+        }
+    }
+
+    static let resumeDisplayText = "Continue the turn that was interrupted."
+
+    /// Lets go of an interruption without continuing it — the work is no longer wanted, or was
+    /// done by hand. The record goes; the transcript keeps whatever actually happened.
+    @discardableResult
+    func dismissInterruption(_ id: String) -> Bool {
+        guard var session = sessions[id], session.interruption != nil else { return false }
+        session.interruption = nil
+        sessions[id] = session
+        persist()
+        broadcaster(for: id).send(.interrupted(nil))
+        return true
+    }
+
+    @discardableResult
+    func setAutoResume(_ id: String, enabled: Bool) -> Bool {
+        guard var session = sessions[id] else { return false }
+        session.autoResume = enabled
+        sessions[id] = session
+        persist()
+        return true
     }
 
     /// After the first completed turn (and after /clear), replace the

@@ -113,6 +113,14 @@ struct Session: Codable, Sendable {
     var pendingFork: Bool?
     var customTitle: Bool?
     var autoTitled: Bool?
+    /// A turn that was running when this bridge stopped and was not running when it came back.
+    /// Kept on the session until it is picked up or dismissed, so a client that was not connected
+    /// when the machine died still finds out that work was cut off rather than finding silence.
+    var interruption: Interruption?
+    /// Whether an interrupted turn in this session picks itself back up without being asked.
+    /// Off unless someone says otherwise: continuing on its own is right for a long unattended
+    /// run and wrong for anything with a person watching, and only the person knows which it is.
+    var autoResume: Bool?
     /// Derived from the transcript when a session is served, never stored — the CLI owns goal state.
     var goal: GoalStatus?
 
@@ -132,6 +140,9 @@ struct SessionSummary: Codable, Sendable, Equatable {
     var createdAt: Date
     var updatedAt: Date
     var active: Bool?
+    /// A turn in this session was cut off by the machine and has not been picked back up. A list
+    /// that cannot say this shows a conversation that merely looks finished.
+    var interrupted: Bool?
     /// How many agents are working for this session right now, and — when a
     /// single one is — what it was sent to do. A session deep in fan-out is
     /// live without a word appearing in its own transcript, so this is the only
@@ -194,6 +205,10 @@ struct SendAttachment: Codable, Sendable {
     var dataBase64: String
 }
 
+struct AutoResumeRequest: Codable, Sendable {
+    var enabled: Bool
+}
+
 struct CreateRequest: Codable, Sendable {
     var title: String?
     var directory: String?
@@ -214,9 +229,14 @@ enum BridgeEvent: Codable, Sendable {
     /// still running throughout — it just spends minutes re-reading the conversation instead of
     /// answering, and a client that can't say so looks hung.
     case compaction(phase: String, error: String?)
+    /// A turn was cut off by the machine rather than by the model, and here is what it had got
+    /// done. `nil` clears the state — the turn was picked back up, or dismissed. Separate from
+    /// ``error`` because an error is something the turn said and this is something that happened
+    /// to it, and only one of the two is worth offering to continue.
+    case interrupted(Interruption?)
 
     private enum CodingKeys: String, CodingKey {
-        case type, message, messageID, delta, tool, status, error, goal, phase
+        case type, message, messageID, delta, tool, status, error, goal, phase, interruption
     }
 
     func encode(to encoder: Encoder) throws {
@@ -246,6 +266,9 @@ enum BridgeEvent: Codable, Sendable {
             try c.encode("compaction", forKey: .type)
             try c.encode(phase, forKey: .phase)
             try c.encodeIfPresent(error, forKey: .error)
+        case .interrupted(let interruption):
+            try c.encode("interrupted", forKey: .type)
+            try c.encodeIfPresent(interruption, forKey: .interruption)
         }
     }
 
@@ -267,6 +290,8 @@ enum BridgeEvent: Codable, Sendable {
             self = .compaction(
                 phase: try c.decode(String.self, forKey: .phase),
                 error: try c.decodeIfPresent(String.self, forKey: .error))
+        case "interrupted":
+            self = .interrupted(try c.decodeIfPresent(Interruption.self, forKey: .interruption))
         default: self = .error(try c.decode(String.self, forKey: .error))
         }
     }
