@@ -17,4 +17,19 @@ struct UltracodeTests {
         #expect(!SessionStore.invokesUltracode("run the multiagent sweep"))
         #expect(!SessionStore.invokesUltracode(""))
     }
+
+    @Test("The transcript's xhigh confirms ultracode rather than erasing it")
+    func transcriptCannotDemoteUltracode() {
+        #expect(SessionStore.reconciledEffort(stored: "ultracode", observed: "xhigh") == "ultracode")
+        #expect(SessionStore.reconciledEffort(stored: "ultracode", observed: nil) == "ultracode")
+        #expect(SessionStore.reconciledEffort(stored: "ultracode", observed: "") == "ultracode")
+    }
+
+    @Test("An effort actually changed elsewhere still wins")
+    func terminalPickWins() {
+        #expect(SessionStore.reconciledEffort(stored: "ultracode", observed: "high") == "high")
+        #expect(SessionStore.reconciledEffort(stored: "ultracode", observed: "max") == "max")
+        #expect(SessionStore.reconciledEffort(stored: "medium", observed: "xhigh") == "xhigh")
+        #expect(SessionStore.reconciledEffort(stored: "medium", observed: nil) == "medium")
+    }
 }

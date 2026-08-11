@@ -118,7 +118,8 @@ actor SessionStore {
             // answered last. A `/model` typed into a terminal only exists in the transcript.
             if let observed = settings[claudeID] {
                 if let model = observed.model { summary.model = model }
-                if let effort = observed.effort { summary.effort = effort }
+                summary.effort = Self.reconciledEffort(
+                    stored: summary.effort, observed: observed.effort)
             }
             if let working = agents[claudeID] {
                 summary.agents = working.count
@@ -320,8 +321,9 @@ actor SessionStore {
         let model = session.model.isEmpty ? defaults.model() : session.model
         let requestedEffort = session.effort.isEmpty ? defaults.effort() : session.effort
         let text = queued.prompt
-        let ultracode = requestedEffort == "ultracode" || Self.invokesUltracode(text)
-        let effort = requestedEffort == "ultracode" ? "xhigh" : requestedEffort
+        let ultracode = requestedEffort == Self.ultracodeEffort || Self.invokesUltracode(text)
+        let effort =
+            requestedEffort == Self.ultracodeEffort ? Self.ultracodeRunsAs : requestedEffort
         let fork = session.pendingFork == true
         let directory = session.directory
 
@@ -702,6 +704,22 @@ actor SessionStore {
     static func invokesUltracode(_ prompt: String) -> Bool {
         prompt.range(of: #"(?i)\bultracode\b"#, options: .regularExpression) != nil
     }
+
+    /// The effort a session is reported at, given what it is recorded as and what its transcript
+    /// last answered at. Ultracode is a mode the CLI has no name for — it runs as `xhigh` plus a
+    /// settings flag — so the transcript can only ever *confirm* it, never contradict it: an
+    /// observed `xhigh` against a session recorded as ultracode is the same turn described in the
+    /// only vocabulary the transcript has, and overwriting it there is what made a chat started in
+    /// ultracode open as plain xhigh on another client. Any other observed level was chosen after
+    /// the fact — `/effort` in a terminal — and wins.
+    static func reconciledEffort(stored: String, observed: String?) -> String {
+        guard let observed, !observed.isEmpty else { return stored }
+        if stored == ultracodeEffort && observed == ultracodeRunsAs { return stored }
+        return observed
+    }
+
+    static let ultracodeEffort = "ultracode"
+    static let ultracodeRunsAs = "xhigh"
 
     /// A readable list title from a raw prompt: the first real line (slash
     /// commands and markup skipped), whitespace collapsed, cut at a word

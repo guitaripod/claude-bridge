@@ -298,7 +298,8 @@ func registerRoutes(
             if let claudeID = session.claudeSessionID {
                 if let observed = await index.transcriptSettings(for: claudeID) {
                     if let model = observed.model { session.model = model }
-                    if let effort = observed.effort { session.effort = effort }
+                    session.effort = SessionStore.reconciledEffort(
+                        stored: session.effort, observed: observed.effort)
                 }
                 session.goal = await index.goal(for: claudeID)
             }
