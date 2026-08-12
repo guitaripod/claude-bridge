@@ -933,40 +933,95 @@ enum TranscriptParser {
         return found
     }
 
-    /// Whether the transcript's last meaningful line closes the turn: the CLI
-    /// writes a `system`/`turn_duration` marker when a turn completes, and an
-    /// interruption leaves a "[Request interrupted…" user line. Absence of
-    /// both means a turn is (or may still be) in flight.
+    /// Whether the transcript's newest conversation line ends the turn.
+    ///
+    /// This decides which chats a client draws as live, so a wrong answer is either a finished
+    /// conversation stuck under "live now" or a working one that looks idle. It used to look for
+    /// a `system`/`turn_duration` marker, which the CLI does not write — every transcript ever
+    /// read therefore answered "open", and a chat left the live section only by ageing out of a
+    /// three-minute staleness window. The transcript does say when a turn ended; it says it in the
+    /// API's own vocabulary, on the assistant line itself.
+    ///
+    /// Read backwards, and only the *conversation* is read: the CLI interleaves bookkeeping of its
+    /// own — `last-prompt`, `attachment`, `queue-operation`, `mode`, `ai-title`, `permission-mode`
+    /// — that says nothing about whether a turn is open, and a sidechain is a subagent's turn
+    /// rather than this one's (sidecar liveness is judged separately, by the files the subagents
+    /// write). The first line that actually belongs to this conversation decides, and nothing
+    /// after it is consulted.
     static func isTurnClosed(atPath path: String) -> Bool {
         guard let handle = FileHandle(forReadingAtPath: path) else { return false }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
-        let window = min(size, 64 * 1024)
-        try? handle.seek(toOffset: UInt64(size - window))
-        guard let data = try? handle.read(upToCount: window) else { return false }
-        var closed = false
+        // Two passes: the last few lines answer almost every transcript, and a turn whose tail is
+        // one enormous tool result needs a wider look before falling back to "open".
+        for window in [64 * 1024, 4 * 1024 * 1024] {
+            let span = min(size, window)
+            try? handle.seek(toOffset: UInt64(size - span))
+            guard let data = try? handle.read(upToCount: span) else { break }
+            if let verdict = turnVerdict(in: data) { return verdict }
+            if span == size { break }
+        }
+        return false
+    }
+
+    /// The turn's state as the newest conversation line tells it, or nil when this window holds no
+    /// line that can tell.
+    static func turnVerdict(in data: Data) -> Bool? {
+        var verdict: Bool?
         forEachJSONLineReversed(in: data) { line in
+            // A subagent's lines are its own turn. Its end_turn does not end the parent's, and its
+            // tool_use does not keep the parent open.
+            guard line["isSidechain"] as? Bool != true else { return true }
             switch line["type"] as? String {
             case "system":
+                // Kept for any CLI that does write it — it is the least ambiguous signal there is.
                 if line["subtype"] as? String == "turn_duration" {
-                    closed = true
+                    verdict = true
                     return false
                 }
-            case "user":
-                if let content = (line["message"] as? [String: Any])?["content"] as? String,
-                    content.hasPrefix("[Request interrupted")
-                {
-                    closed = true
-                }
-                return false
+                return true
             case "assistant":
+                guard let message = line["message"] as? [String: Any] else { return true }
+                if message["model"] as? String == "<synthetic>" { return true }
+                // "tool_use" means the model asked for something and is waiting on it; anything
+                // else it stops for — end_turn, stop_sequence, max_tokens, refusal — is the model
+                // having finished speaking. A line still being written carries no stop reason at
+                // all, and a turn mid-write is a turn that is open.
+                let reason = message["stop_reason"] as? String
+                verdict = reason != nil && reason != "tool_use"
+                return false
+            case "user":
+                guard let message = line["message"] as? [String: Any] else { return true }
+                if let text = message["content"] as? String {
+                    // Somebody typed something: a turn is starting. Unless what they "typed" is
+                    // the CLI's own record of an escape, which ends one.
+                    if text.hasPrefix("[Request interrupted") {
+                        verdict = true
+                        return false
+                    }
+                    if line["isMeta"] as? Bool == true { return true }
+                    // `<local-command-stdout>`, `<task-notification>` and the rest of the CLI's
+                    // angle-bracket bookkeeping are written as user lines and are not somebody
+                    // typing. If one of them did start a turn, the answer is a newer line and
+                    // decides; as the newest line it proves nothing but that nothing answered.
+                    if text.hasPrefix("<") { return true }
+                    verdict = false
+                    return false
+                }
+                // A tool came back, so the model is about to be called again: still running.
+                if let blocks = message["content"] as? [[String: Any]],
+                    blocks.contains(where: { $0["type"] as? String == "tool_result" })
+                {
+                    verdict = false
+                    return false
+                }
+                verdict = false
                 return false
             default:
-                break
+                return true
             }
-            return true
         }
-        return closed
+        return verdict
     }
 
     /// Folds appended sidecar bytes into a progress accumulator. The last TodoWrite wins whole;
