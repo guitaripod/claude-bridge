@@ -67,7 +67,27 @@ Or update it from your phone: `GET /update` reports the state, `POST /update` fe
 and restarts, reporting progress through a state file that outlives the restart.
 [Tailscode](https://github.com/guitaripod/Tailscode) exposes this as a button on the server
 screen, so the machine never needs an ssh session to keep current. An update refuses to run on a
-checkout with uncommitted changes, and says so.
+checkout with uncommitted changes, and names the files rather than only saying so.
+
+**The restart never takes a turn with it.** Stopping this process is how the new binary gets
+loaded, and on Linux the supervisor tears down the whole control group — every `claude` the bridge
+started dies with it. A check taken when the build *starts* says nothing about the machine four
+minutes later when it ends, so the quiet test is a barrier at the exit: the bridge waits until
+nothing is running on that machine (a turn it is running, a transcript somebody is growing in a
+terminal, a sign-in halfway through its handshake), flushes, and only then exits. The wait is
+reported as phase `waiting` rather than as silence, and it is given up rather than held forever.
+
+**It can keep itself current.** `POST /update/auto {"enabled":true}` turns unattended updating on —
+off by default, and the setting lives on the machine rather than on whichever device asked, so
+every client reads back the same answer. It takes an update only when it can finish the job end to
+end: a real supervisor, a clean checkout, a fetch that actually succeeded, and the same quiet
+barrier. A commit that fails to build is not tried again until a newer one exists or an exponential
+backoff runs out, and `automation.holdingOff` says which in words.
+
+**A build that landed and was never started is one press.** `POST /update/restart` loads a binary
+already on disk — no fetch, no rebuild — behind the same barrier. It refuses (`409`) on a machine
+with no supervisor, because a bridge that exits with nothing to bring it back is a machine no
+client can reach.
 
 `UpdateStatus` is deliberately hard to misread: it reports the checkout's `version` *and* the
 stamp of the binary actually **running** (`running`, `builtAt` — the installer writes a
@@ -109,8 +129,10 @@ All request/response bodies are JSON. When `BRIDGE_PASSWORD` is set, every route
 | POST | `/auth/login` | — | starts `claude auth login` on a pseudo-terminal and answers with the URL it printed |
 | POST | `/auth/code` | `{code}` | types the code the browser produced; answers with the status once the machine is signed in (`400` with `error` if it wasn't accepted) |
 | POST | `/auth/cancel` | — | drops a sign-in that was left waiting |
-| GET | `/update` | `?check=false` to skip the remote fetch | `UpdateStatus` — checkout version, the running binary's own stamp, `restartRequired`, newer commits and their subjects, whether this install can update itself, an explicit `remote` block, and the phase of the last update |
-| POST | `/update` | — | `202 UpdateStatus` once the update is running (`409` when it cannot, with `reason`); poll `GET /update` for `phase`: `running` → `building` → `restarting` → `succeeded`/`failed` |
+| GET | `/update` | `?check=false` to skip the remote fetch | `UpdateStatus` — checkout version, the running binary's own stamp, `restartRequired`/`canRestart`, newer commits and their subjects, whether this install can update itself, the `obstacle` in the way named file by file, what the machine is `busy` with, its `automation` policy, the `toolchain` that would build it, an explicit `remote` block, and the phase of the last update |
+| POST | `/update` | — | `202 UpdateStatus` once the update is running (`409` when it cannot, with `reason`); poll `GET /update` for `phase`: `running` → `building` → `waiting` → `restarting` → `succeeded`/`failed` |
+| POST | `/update/restart` | — | `202 UpdateStatus` — loads a build already on disk, behind the quiet barrier; `409` without a supervisor or with nothing to load |
+| POST | `/update/auto` | `{enabled}` | `UpdateStatus` — turns unattended updating on or off on this machine |
 | GET | `/sessions` | — | `[SessionSummary]`, newest first, store + discovered transcripts merged |
 | POST | `/sessions` | `{title?, directory?, model?, effort?}` | the created `Session`; `directory` sets the project directory its turns run in |
 | GET | `/sessions/:id` | — | `Session` (404 if unknown), including the turn in flight |

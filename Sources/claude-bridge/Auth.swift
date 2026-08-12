@@ -73,6 +73,13 @@ actor AuthService {
         self.workdir = workdir
     }
 
+    /// A sign-in halfway through its two-machine handshake. It is a pseudo-terminal waiting on a
+    /// code somebody is reading off a browser, and a restart takes the code they are about to paste
+    /// with it — so it counts as work in flight even though no turn is running.
+    func isSigningIn() -> Bool {
+        session?.isRunning == true
+    }
+
     func status(refreshing: Bool = false) async -> AuthStatus {
         var status = await current(refreshing: refreshing)
         if let session, session.isRunning, let url = session.url {

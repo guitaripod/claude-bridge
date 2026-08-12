@@ -119,8 +119,21 @@ await store.pusher.endOrphans()
 // stopped. A client that connects first would otherwise be told a cut-off conversation is idle.
 await store.recoverJournaledTurns()
 let updater = UpdateService(stateDirectory: storeURL.deletingLastPathComponent())
-await updater.resume()
 let auth = AuthService(claudePath: claudePath, workdir: workdir)
+// What a restart would destroy, and what has to reach disk before one. Composed here because no
+// single part of the bridge knows all of it, and answered as one value so the ticker that decides
+// to restart and the barrier that performs it can never disagree.
+await updater.attach(
+    quiet: {
+        MachineQuiet.read(
+            turns: await store.turnsInFlight(
+                activeClaudeIDs: await index.activeIDs(within: TranscriptIndex.activityWindow)),
+            signingIn: await auth.isSigningIn(),
+            swept: await observer.hasSwept)
+    },
+    settle: { await store.flush() })
+await updater.resume()
+await updater.startAutomation()
 registerRoutes(
     router, store: store, index: index, watcher: watcher, updater: updater, auth: auth,
     hub: hub, observer: observer, defaults: machineDefaults, hasAuth: !password.isEmpty,

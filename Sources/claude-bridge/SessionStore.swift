@@ -627,6 +627,18 @@ actor SessionStore {
         inFlight.contains(id)
     }
 
+    /// How many conversations have work in flight on this machine, counting a turn this bridge is
+    /// running and a transcript somebody is growing in a terminal as one thing each.
+    ///
+    /// The two facts have to be unioned rather than picked between: a bridge-run turn whose single
+    /// tool has been quiet for four minutes is invisible on disk, and a `claude` somebody started at
+    /// the desk is invisible in here. A restart ends both.
+    func turnsInFlight(activeClaudeIDs: Set<String>) -> Int {
+        var busy = Set<String>()
+        for id in inFlight { busy.insert(sessions[id]?.claudeSessionID ?? id) }
+        return busy.union(activeClaudeIDs).count
+    }
+
     func hasRunnerTurnInFlight(claudeSessionID: String) -> Bool {
         runnerTurnClaudeIDs[claudeSessionID] != nil
     }

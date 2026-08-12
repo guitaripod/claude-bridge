@@ -106,6 +106,10 @@ struct AuthCodeRequest: Decodable {
     let code: String
 }
 
+struct AutoUpdateRequest: Decodable {
+    let enabled: Bool
+}
+
 func registerRoutes(
     _ router: Router<BasicRequestContext>, store: SessionStore, index: TranscriptIndex,
     watcher: TranscriptWatcher, updater: UpdateService, auth: AuthService, hub: Hub,
@@ -247,6 +251,21 @@ func registerRoutes(
     router.post("update") { _, _ in
         let (accepted, status) = await updater.start()
         return jsonResponse(status, status: accepted ? .accepted : .conflict)
+    }
+
+    /// Loads a build that is already on disk. No fetch, no rebuild — the bridge waits for the
+    /// machine to go quiet and then exits, and its supervisor brings it back on the new binary.
+    /// Refused outright without a supervisor: nothing would start it again.
+    router.post("update/restart") { _, _ in
+        let (accepted, status) = await updater.restart()
+        return jsonResponse(status, status: accepted ? .accepted : .conflict)
+    }
+
+    /// Whether this machine keeps itself current on its own. The setting belongs to the machine
+    /// rather than to whichever device last asked, so every client reads back the same answer.
+    router.post("update/auto") { request, _ in
+        let body = try await decodeBody(AutoUpdateRequest.self, request)
+        return jsonResponse(await updater.setAutomation(enabled: body.enabled))
     }
 
     router.get("usage") { _, _ in

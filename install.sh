@@ -49,10 +49,12 @@ say() {
 }
 
 # The bridge polls this file to report progress to a client whose server is about to restart under
-# it, so every phase change lands here before the work starts.
+# it, so every phase change lands here before the work starts. The pid is what makes a second
+# installer refusable on liveness rather than on a clock: a cold build on a small machine outlives
+# any timeout worth setting, and two builds in one checkout end as a binary nobody can start.
 phase() {
   [ "$MODE" = "update" ] || return 0
-  printf '{"phase":"%s","startedAt":"%s"%s}\n' "$1" "${STARTED_AT:-$(now)}" \
+  printf '{"phase":"%s","startedAt":"%s","pid":%s%s}\n' "$1" "${STARTED_AT:-$(now)}" "$$" \
     "$( [ -n "${2:-}" ] && printf ',"finishedAt":"%s"' "$2" )" >"$STATE_FILE"
 }
 
@@ -68,7 +70,12 @@ STARTED_AT="$(now)"
 need() { command -v "$1" >/dev/null 2>&1 || fail "$1 is required but not installed"; }
 
 need git
-if ! command -v swift >/dev/null 2>&1; then
+# BRIDGE_SWIFT is the toolchain the bridge told the client it would build with. Honouring it is what
+# keeps a one-press promise from failing on a PATH the status never saw.
+if [ -n "${BRIDGE_SWIFT:-}" ] && [ -x "$BRIDGE_SWIFT" ]; then
+  PATH="$(dirname "$BRIDGE_SWIFT"):$PATH"
+  export PATH
+elif ! command -v swift >/dev/null 2>&1; then
   for candidate in "$HOME/.local/share/swiftly/bin" /usr/local/swift/usr/bin /opt/swift/usr/bin; do
     [ -x "$candidate/swift" ] && PATH="$candidate:$PATH" && export PATH && break
   done
@@ -97,9 +104,40 @@ fetch_source() {
   fi
 }
 
+# A build failure reaches a phone as one sentence, so it is worth saying what actually went wrong
+# rather than handing over the last twelve lines of a linker's opinion.
+build_reason() {
+  local tail
+  tail="$(tail -c 4000 "$LOG" 2>/dev/null || true)"
+  case "$tail" in
+    *"No space left on device"*) printf 'the disk on that machine filled up during the build' ;;
+    *"Killed"*|*"signal 9"*) printf 'the build was killed — that machine ran out of memory' ;;
+    *"module compiled with Swift"*|*"module file format"*)
+      printf 'the checkout needs a different Swift than the one installed there' ;;
+    *) printf 'build failed — see %s' "$LOG" ;;
+  esac
+}
+
+# Enough room to build. A disk that fills mid-link reports itself as an unreadable linker error, and
+# the number is the one thing that makes it actionable.
+check_space() {
+  local free
+  free="$(df -Pk "$SRC" 2>/dev/null | awk 'NR==2 {print $4}')" || return 0
+  [ -n "$free" ] || return 0
+  [ "$free" -ge 2000000 ] ||
+    fail "only $(( free / 1024 )) MB free where the checkout lives; the build needs about 2 GB"
+}
+
 build() {
+  check_space
   say "building (this takes a few minutes the first time)"
-  ( cd "$SRC" && swift build -c release ) >>"$LOG" 2>&1 || fail "build failed — see $LOG"
+  if ! ( cd "$SRC" && swift build -c release ) >>"$LOG" 2>&1; then
+    # A toolchain upgraded under a stale .build produces the same failure forever, and one clean is
+    # the difference between an update that heals itself and a machine that never updates again.
+    say "build failed; cleaning and trying once more"
+    ( cd "$SRC" && swift package clean ) >>"$LOG" 2>&1 || true
+    ( cd "$SRC" && swift build -c release ) >>"$LOG" 2>&1 || fail "$(build_reason)"
+  fi
   stamp_build
 }
 
@@ -146,7 +184,22 @@ EOF
   chmod 600 "$CONFIG"
 }
 
+checksum() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+# The runner is where a machine's own arrangements live — a toolchain on the PATH, a claude
+# somewhere unusual, a store pointed elsewhere — and an update that rewrote it unattended would
+# un-configure the bridge at three in the morning and look like the CLI breaking. So it is replaced
+# only while it is still the file this script last wrote.
 write_runner() {
+  local stamp="$STATE_DIR/run.sh.sha"
+  if [ -f "$RUNNER" ] && [ -f "$stamp" ] && [ "$(checksum "$RUNNER")" != "$(cat "$stamp")" ]; then
+    say "keeping $RUNNER — it has been edited since this script wrote it"
+    return 0
+  fi
   cat >"$RUNNER" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -157,6 +210,7 @@ export BRIDGE_STATE_DIR="$STATE_DIR"
 exec "$SRC/.build/release/claude-bridge"
 EOF
   chmod 755 "$RUNNER"
+  checksum "$RUNNER" >"$stamp"
 }
 
 install_service_linux() {

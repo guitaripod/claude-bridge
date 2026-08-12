@@ -122,6 +122,9 @@ actor ObserverLoop {
     private var suppressedUntil: [String: Date] = [:]
     private static let runnerGrace: TimeInterval = 5
     private var tick = 0
+    /// Whether this loop has counted the world even once. Before it has, "nothing is running" is
+    /// something nobody has established rather than something anybody knows.
+    var hasSwept: Bool { tick > 0 }
     private var lastActivity: [String: AgentActivity] = [:]
 
     init(index: TranscriptIndex, store: SessionStore, hub: Hub) {
