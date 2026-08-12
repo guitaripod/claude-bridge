@@ -92,75 +92,89 @@ struct SpendReport: Codable, Sendable {
     var estimated = true
 }
 
+/// Where one walk through a transcript stopped, everything mid-flight carried with it, so the next
+/// look at a file that only ever grows parses only the lines that are new. The state machine is
+/// line-sequential, which is what makes resuming it exactly equivalent to starting over.
+struct SpendScan: Sendable {
+    var offset: UInt64 = 0
+    var size: UInt64 = 0
+    var mtime: Date = .distantPast
+    /// Bytes after the last newline read — the line the CLI is still writing. Never parsed and
+    /// never advanced past, so a line that arrives in two reads is read once, whole.
+    var carry = Data()
+    var turns: [SpendTurn] = []
+    var open: SpendTurn?
+    var lastAt: Date?
+    var pendingPrompt: String?
+    var pendingPromptAt: Date?
+    var chargedMessages: Set<String> = []
+}
+
 /// Reads a session's spend out of the transcript the CLI writes anyway.
 ///
-/// Nothing is stored and nothing is accumulated in memory: the file *is* the ledger, so a session
-/// that ran in a terminal, on another client, or before this bridge was installed reports exactly
-/// as well as one this bridge ran itself.
+/// Nothing durable is stored: the file *is* the ledger, so a session that ran in a terminal, on
+/// another client, or before this bridge was installed reports exactly as well as one this bridge
+/// ran itself. What `SpendLedger` keeps is only where the last walk stopped — the clients poll
+/// this every few seconds through a live turn, and re-parsing fifty megabytes to price one new
+/// line was most of what this route cost.
 enum SpendReader {
     /// A hard ceiling on turns returned, newest kept. A months-old session can hold thousands and
     /// no chart can draw them; the totals are still computed over everything.
     static let maxTurns = 400
+    private static let readChunk = 4 * 1024 * 1024
 
     static func read(transcriptPath: String) -> SpendReport? {
-        guard let handle = FileHandle(forReadingAtPath: transcriptPath) else { return nil }
+        var scan = SpendScan()
+        guard advance(&scan, transcriptPath: transcriptPath) else { return nil }
+        return report(from: scan)
+    }
+
+    /// Catches a scan up with its file. Answers false when the file is gone; a file that shrank —
+    /// rotated, rewritten — starts the scan over rather than trusting stale state.
+    static func advance(_ scan: inout SpendScan, transcriptPath: String) -> Bool {
+        guard
+            let facts = try? FileManager.default.attributesOfItem(atPath: transcriptPath),
+            let size = (facts[.size] as? NSNumber)?.uint64Value
+        else { return false }
+        let mtime = facts[.modificationDate] as? Date ?? .distantPast
+        if size < scan.offset { scan = SpendScan() }
+        if size == scan.size, mtime == scan.mtime { return true }
+        guard let handle = FileHandle(forReadingAtPath: transcriptPath) else { return false }
         defer { try? handle.close() }
-        guard let data = try? handle.readToEnd() else { return nil }
+        guard (try? handle.seek(toOffset: scan.offset)) != nil else { return false }
 
-        var turns: [SpendTurn] = []
-        var open: SpendTurn?
-        var lastAt: Date?
-        var pendingPrompt: String?
-        var pendingPromptAt: Date?
-        var chargedMessages = Set<String>()
+        let dates = DateReader()
+        while let chunk = try? handle.read(upToCount: readChunk), !chunk.isEmpty {
+            scan.offset += UInt64(chunk.count)
+            var buffer = scan.carry
+            buffer.append(chunk)
+            var start = buffer.startIndex
+            while let mark = buffer[start...].firstIndex(of: UInt8(ascii: "\n")) {
+                consume(line: buffer[start..<mark], into: &scan, dates: dates)
+                start = buffer.index(after: mark)
+            }
+            scan.carry = Data(buffer[start...])
+        }
+        scan.size = size
+        scan.mtime = mtime
+        return true
+    }
 
-        func close() {
-            guard var turn = open else { return }
-            if let lastAt { turn.seconds = max(0, lastAt.timeIntervalSince(turn.at)) }
+    /// The report as of where the scan stands. A turn still open is closed into the report only —
+    /// the scan keeps it open, because the file will say more about it; the same is true of a
+    /// final line with no newline yet, read here from a copy and never advanced past.
+    static func report(from scan: SpendScan) -> SpendReport? {
+        var scan = scan
+        if !scan.carry.isEmpty {
+            consume(line: scan.carry[...], into: &scan, dates: DateReader())
+        }
+        var turns = scan.turns
+        if var turn = scan.open {
+            if let lastAt = scan.lastAt {
+                turn.seconds = max(0, lastAt.timeIntervalSince(turn.at))
+            }
             turns.append(turn)
-            open = nil
         }
-
-        for line in data.split(separator: UInt8(ascii: "\n")) {
-            guard !line.isEmpty,
-                let entry = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any]
-            else { continue }
-            let type = entry["type"] as? String
-            if type == "user", entry["isMeta"] as? Bool != true,
-                entry["isSidechain"] as? Bool != true
-            {
-                if let text = prompt(in: entry) {
-                    close()
-                    pendingPrompt = text
-                    pendingPromptAt = date(entry["timestamp"])
-                }
-                continue
-            }
-            guard type == "assistant", let message = entry["message"] as? [String: Any],
-                let usage = message["usage"] as? [String: Any]
-            else { continue }
-            let at = date(entry["timestamp"]) ?? lastAt ?? Date()
-            lastAt = at
-            let model = message["model"] as? String
-            if open == nil {
-                open = SpendTurn(
-                    at: pendingPromptAt ?? at, model: model, calls: 0, tokens: TokenCounts(),
-                    costUSD: 0, prompt: pendingPrompt)
-                pendingPrompt = nil
-                pendingPromptAt = nil
-            }
-            var turn = open ?? SpendTurn(
-                at: at, model: model, calls: 0, tokens: TokenCounts(), costUSD: 0, prompt: nil)
-            if (message["id"] as? String).map({ chargedMessages.insert($0).inserted }) ?? true {
-                let counts = tokens(in: usage)
-                turn.calls += 1
-                turn.tokens = turn.tokens + counts
-                turn.costUSD += Rate.forModel(model ?? "").cost(of: counts)
-            }
-            if turn.model == nil { turn.model = model }
-            open = turn
-        }
-        close()
         guard !turns.isEmpty else { return nil }
 
         var byModel: [String: SpendModel] = [:]
@@ -183,6 +197,53 @@ enum SpendReader {
             turns: Array(turns.suffix(maxTurns)),
             byModel: byModel.values.sorted { $0.costUSD > $1.costUSD },
             startedAt: turns.first?.at, endedAt: turns.last?.at)
+    }
+
+    private static func consume(line: Data.SubSequence, into scan: inout SpendScan, dates: DateReader)
+    {
+        guard !line.isEmpty,
+            let entry = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any]
+        else { return }
+        let type = entry["type"] as? String
+        if type == "user", entry["isMeta"] as? Bool != true,
+            entry["isSidechain"] as? Bool != true
+        {
+            if let text = prompt(in: entry) {
+                if var turn = scan.open {
+                    if let lastAt = scan.lastAt {
+                        turn.seconds = max(0, lastAt.timeIntervalSince(turn.at))
+                    }
+                    scan.turns.append(turn)
+                    scan.open = nil
+                }
+                scan.pendingPrompt = text
+                scan.pendingPromptAt = dates.read(entry["timestamp"])
+            }
+            return
+        }
+        guard type == "assistant", let message = entry["message"] as? [String: Any],
+            let usage = message["usage"] as? [String: Any]
+        else { return }
+        let at = dates.read(entry["timestamp"]) ?? scan.lastAt ?? Date()
+        scan.lastAt = at
+        let model = message["model"] as? String
+        if scan.open == nil {
+            scan.open = SpendTurn(
+                at: scan.pendingPromptAt ?? at, model: model, calls: 0, tokens: TokenCounts(),
+                costUSD: 0, prompt: scan.pendingPrompt)
+            scan.pendingPrompt = nil
+            scan.pendingPromptAt = nil
+        }
+        var turn = scan.open ?? SpendTurn(
+            at: at, model: model, calls: 0, tokens: TokenCounts(), costUSD: 0, prompt: nil)
+        if (message["id"] as? String).map({ scan.chargedMessages.insert($0).inserted }) ?? true {
+            let counts = tokens(in: usage)
+            turn.calls += 1
+            turn.tokens = turn.tokens + counts
+            turn.costUSD += Rate.forModel(model ?? "").cost(of: counts)
+        }
+        if turn.model == nil { turn.model = model }
+        scan.open = turn
     }
 
     /// The words the person typed, not a tool result the CLI writes back as a user entry.
@@ -221,12 +282,49 @@ enum SpendReader {
         return counts
     }
 
-    /// The CLI stamps every line with fractional seconds; a formatter is cheap next to the JSON
-    /// parse this walk already does, and a shared one would need locking for no gain.
-    private static func date(_ raw: Any?) -> Date? {
+}
+
+/// Two ISO8601 formatters made once per walk and never shared across threads — an ICU formatter
+/// per line was a measurable share of pricing a large transcript.
+final class DateReader {
+    private let fractional: ISO8601DateFormatter
+    private let plain = ISO8601DateFormatter()
+
+    init() {
+        fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    }
+
+    func read(_ raw: Any?) -> Date? {
         guard let text = raw as? String else { return nil }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: text) ?? ISO8601DateFormatter().date(from: text)
+        return fractional.date(from: text) ?? plain.date(from: text)
+    }
+}
+
+/// The scans in progress, one per transcript this bridge has been asked about, so the poll that
+/// rides every live turn prices only what the file gained since the last poll. Bounded and
+/// LRU-evicted: an evicted session is not wrong, only slow again on its next first ask.
+actor SpendLedger {
+    static let shared = SpendLedger()
+    private static let capacity = 48
+
+    private var scans: [String: SpendScan] = [:]
+    private var order: [String] = []
+
+    func report(transcriptPath: String) -> SpendReport? {
+        var scan = scans[transcriptPath] ?? SpendScan()
+        guard SpendReader.advance(&scan, transcriptPath: transcriptPath) else {
+            scans[transcriptPath] = nil
+            order.removeAll { $0 == transcriptPath }
+            return nil
+        }
+        scans[transcriptPath] = scan
+        order.removeAll { $0 == transcriptPath }
+        order.append(transcriptPath)
+        while order.count > Self.capacity, let oldest = order.first {
+            order.removeFirst()
+            scans[oldest] = nil
+        }
+        return SpendReader.report(from: scan)
     }
 }

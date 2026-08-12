@@ -132,4 +132,10 @@ let app = Application(
     configuration: .init(address: .hostname(bindAddress, port: port), serverName: "claude-bridge"))
 
 print("claude-bridge listening on \(bindAddress):\(port) — workdir \(workdir), claude \(claudePath)")
-try await app.runService()
+do {
+    try await app.runService()
+    await store.flush()
+} catch {
+    await store.flush()
+    throw error
+}

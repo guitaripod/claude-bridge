@@ -73,8 +73,8 @@ actor AuthService {
         self.workdir = workdir
     }
 
-    func status(refreshing: Bool = false) -> AuthStatus {
-        var status = current(refreshing: refreshing)
+    func status(refreshing: Bool = false) async -> AuthStatus {
+        var status = await current(refreshing: refreshing)
         if let session, session.isRunning, let url = session.url {
             status.pending = AuthStatus.PendingLogin(url: url, startedAt: session.startedAt)
         }
@@ -83,7 +83,7 @@ actor AuthService {
 
     /// Starts the sign-in and waits for the URL the CLI prints. Returns the status carrying it.
     func beginLogin() async throws -> AuthStatus {
-        if let session, session.isRunning, session.url != nil { return status() }
+        if let session, session.isRunning, session.url != nil { return await status() }
         session?.cancel()
         let session = LoginSession(claudePath: claudePath, workdir: workdir)
         self.session = session
@@ -99,7 +99,7 @@ actor AuthService {
             throw AuthError.noURL(session.transcriptTail())
         }
         cached = nil
-        return status()
+        return await status()
     }
 
     /// Types the code the browser gave the user, then waits for the CLI to actually be signed in —
@@ -111,7 +111,7 @@ actor AuthService {
         session.send(trimmed)
         for _ in 0..<40 {
             try? await Task.sleep(for: .milliseconds(750))
-            let status = current(refreshing: true)
+            let status = await current(refreshing: true)
             if status.loggedIn {
                 session.cancel()
                 self.session = nil
@@ -131,17 +131,32 @@ actor AuthService {
         session = nil
     }
 
-    private func current(refreshing: Bool) -> AuthStatus {
-        if !refreshing, let cached, Date().timeIntervalSince(cached.at) < 15 {
+    /// Asking the CLI who is signed in forks a process and waits on it, and `/status` — which
+    /// every client polls — used to do that inside this actor: one cold read held every other
+    /// auth call for as long as the fork took. The fork now happens off the actor and only once
+    /// at a time, and a caller with a fresh enough answer never waits at all.
+    private func current(refreshing: Bool) async -> AuthStatus {
+        if !refreshing, let cached, Date().timeIntervalSince(cached.at) < Self.freshSeconds {
             return cached.status
         }
-        let output = Shell.run(claudePath, ["auth", "status", "--json"], cwd: workdir, timeout: 20)
-        let status =
-            AuthStatus(cliJSON: Data(output.utf8))
-            ?? AuthStatus(loggedIn: false, method: "unknown")
+        if let probe { return await probe.value }
+        let path = claudePath
+        let directory = workdir
+        let probe = Task.detached(priority: .userInitiated) { () -> AuthStatus in
+            let output = Shell.run(
+                path, ["auth", "status", "--json"], cwd: directory, timeout: 20)
+            return AuthStatus(cliJSON: Data(output.utf8))
+                ?? AuthStatus(loggedIn: false, method: "unknown")
+        }
+        self.probe = probe
+        let status = await probe.value
+        self.probe = nil
         cached = (status, Date())
         return status
     }
+
+    private static let freshSeconds: TimeInterval = 15
+    private var probe: Task<AuthStatus, Never>?
 }
 
 enum AuthError: Error {

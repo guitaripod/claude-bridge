@@ -279,6 +279,13 @@ enum TranscriptSearch {
         for line in data.split(separator: UInt8(ascii: "\n")) where !line.isEmpty {
             lines += 1
             if lines % heartbeat == 0, Task.isCancelled || Date() >= deadline { break }
+            // The same skip-table scan that rejects a whole file, applied per line: a file is
+            // admitted because one line in ten thousand says the word, and decoding the other
+            // nine thousand nine hundred and ninety-nine into dictionaries is the whole cost of
+            // a search. A row still has to be named and placed, so lines are read whole until the
+            // conversation's directory and opening words are known.
+            let identified = directory != nil && (title != nil || file.isSubagent)
+            guard !identified || offset(of: query.rarest, in: line) != nil else { continue }
             guard let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any]
             else { continue }
             if directory == nil { directory = object["cwd"] as? String }

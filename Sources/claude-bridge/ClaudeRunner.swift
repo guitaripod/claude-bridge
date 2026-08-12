@@ -341,7 +341,11 @@ private struct Assembler {
             guard let toolID = block["tool_use_id"] as? String, var call = tools[toolID] else {
                 continue
             }
-            call.output = Self.flatten(block["content"])
+            // The same ceiling the transcript reader applies, so a `cat` of something enormous
+            // does not lodge megabytes in the session store for the life of the process — and so
+            // a turn read live and the same turn read back off disk say the same thing.
+            call.output = String(
+                Self.flatten(block["content"]).prefix(TranscriptParser.toolOutputLimit))
             call.status = (block["is_error"] as? Bool == true) ? .error : .completed
             tools[toolID] = call
             emit(.toolUpserted(messageID: messageID, call))

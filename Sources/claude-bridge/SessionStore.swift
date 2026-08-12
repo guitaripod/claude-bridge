@@ -12,9 +12,18 @@ final class Broadcaster: @unchecked Sendable {
         lock.withLock { !continuations.isEmpty }
     }
 
+    /// A subscriber that stops reading — a phone that slept, a tunnel that hung — used to hold
+    /// every frame of the turn it is missing, unbounded, for as long as the connection stayed
+    /// nominally open: one wedged client could pin the whole of a long turn's deltas in memory.
+    /// The buffer is bounded to the newest `backlog` frames instead. A client far enough behind
+    /// to lose frames has already lost the thread and refetches the turn whole, which every
+    /// client does anyway when a stream goes stale.
+    static let backlog = 2_048
+
     func subscribe() -> (id: UUID, stream: AsyncStream<BridgeEvent>) {
         let id = UUID()
-        let stream = AsyncStream<BridgeEvent> { continuation in
+        let stream = AsyncStream<BridgeEvent>(bufferingPolicy: .bufferingNewest(Self.backlog)) {
+            continuation in
             lock.withLock { continuations[id] = continuation }
             continuation.onTermination = { [weak self] _ in
                 self?.lock.withLock { _ = self?.continuations.removeValue(forKey: id) }
@@ -190,7 +199,7 @@ actor SessionStore {
         if let existing = sessions[session.id] { return existing }
         sessions[session.id] = session
         order.insert(session.id, at: 0)
-        persist()
+        persistNow()
         return session
     }
 
@@ -212,7 +221,7 @@ actor SessionStore {
             pendingFork: nil)
         sessions[session.id] = session
         order.insert(session.id, at: 0)
-        persist()
+        persistNow()
         return session
     }
 
@@ -234,7 +243,7 @@ actor SessionStore {
             pendingFork: source.claudeSessionID != nil ? true : nil)
         sessions[session.id] = session
         order.insert(session.id, at: 0)
-        persist()
+        persistNow()
         return session
     }
 
@@ -243,7 +252,7 @@ actor SessionStore {
         session.title = title
         session.customTitle = true
         sessions[id] = session
-        persist()
+        persistNow()
         return true
     }
 
@@ -251,7 +260,7 @@ actor SessionStore {
         sessions[id] = nil
         order.removeAll { $0 == id }
         broadcasters[id] = nil
-        persist()
+        persistNow()
     }
 
     /// Every transcript id a session has owned — its current and prior Claude
@@ -276,7 +285,7 @@ actor SessionStore {
         session.autoTitled = nil
         session.updatedAt = Date()
         sessions[id] = session
-        persist()
+        persistNow()
     }
 
     /// The store session whose conversation lives in the given CLI transcript, if any — the id
@@ -1101,7 +1110,53 @@ actor SessionStore {
         return path
     }
 
+    /// Marks the store dirty and lets one write cover the burst.
+    ///
+    /// The store is every message of every session in one file — tens of megabytes on a machine
+    /// that has been running a while — and one turn rewrites it several times as it lands:
+    /// accepting the prompt, closing the turn, titling it, settling it against the transcript.
+    /// The cost of finishing a turn therefore scaled with every conversation the machine had ever
+    /// held. What settles here is only the *content* of a turn, which the CLI's own transcript is
+    /// the real record of and `recoverJournaledTurns` rebuilds from; anything that changes which
+    /// sessions exist writes on the spot through ``persistNow``, because that is the fact another
+    /// reader of this file — a restart, a second process — cannot reconstruct.
     private func persist() {
+        pendingWrite = true
+        guard persistTask == nil else { return }
+        persistTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.settleSeconds))
+            await self?.writeIfDirty()
+        }
+    }
+
+    private static let settleSeconds = 2.0
+    private var pendingWrite = false
+    private var persistTask: Task<Void, Never>?
+
+    private func writeIfDirty() {
+        persistTask = nil
+        guard pendingWrite else { return }
+        pendingWrite = false
+        writeNow()
+    }
+
+    /// The store on disk before this call returns: a session created, adopted, forked, renamed,
+    /// deleted or cleared is a fact the next reader of the file cannot infer from anywhere else.
+    private func persistNow() {
+        pendingWrite = true
+        flush()
+    }
+
+    /// Everything owed, written on the spot. Also the way out at shutdown.
+    func flush() {
+        persistTask?.cancel()
+        persistTask = nil
+        guard pendingWrite else { return }
+        pendingWrite = false
+        writeNow()
+    }
+
+    private func writeNow() {
         let snapshot = order.compactMap { sessions[$0] }
         let url = storeURL
         guard let data = try? JSONCoding.encoder.encode(snapshot) else { return }

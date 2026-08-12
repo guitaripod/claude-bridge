@@ -50,9 +50,35 @@ private func rawResponse(
     var headers = HTTPFields()
     headers[.contentType] = mime
     headers[.cacheControl] = cacheControl
-    var buffer = ByteBuffer()
+    var buffer = ByteBufferAllocator().buffer(capacity: data.count)
     buffer.writeBytes(data)
     return Response(status: .ok, headers: headers, body: .init(byteBuffer: buffer))
+}
+
+/// A file streamed off disk in chunks rather than held whole in memory twice. A phone asking for
+/// a screenshot used to cost the bridge two copies of it — one read, one buffer — for as long as
+/// the write took; this costs one chunk.
+private func fileResponse(
+    path: String, size: Int, mime: String?, cacheControl: String = "private, max-age=60"
+) -> Response {
+    var headers = HTTPFields()
+    headers[.contentType] = mime
+    headers[.cacheControl] = cacheControl
+    headers[.contentLength] = String(size)
+    let stream = ResponseBody { writer in
+        guard let handle = FileHandle(forReadingAtPath: path) else {
+            try await writer.finish(nil)
+            return
+        }
+        defer { try? handle.close() }
+        while let chunk = try handle.read(upToCount: 512 * 1024), !chunk.isEmpty {
+            var buffer = ByteBufferAllocator().buffer(capacity: chunk.count)
+            buffer.writeBytes(chunk)
+            try await writer.write(buffer)
+        }
+        try await writer.finish(nil)
+    }
+    return Response(status: .ok, headers: headers, body: stream)
 }
 
 private func decodeBody<T: Decodable>(
@@ -349,9 +375,10 @@ func registerRoutes(
         }
         let root = FileManager.default.homeDirectoryForCurrentUser.path
         let path = FileBrowsing.resolve(String(raw), home: root)
-        if let data = FileBrowsing.bytes(path) {
-            return rawResponse(
-                data, mime: mimeType(forExtension: (path as NSString).pathExtension))
+        if let size = FileBrowsing.readableSize(path) {
+            return fileResponse(
+                path: path, size: size,
+                mime: mimeType(forExtension: (path as NSString).pathExtension))
         }
         if let tool = request.uri.queryParameters.get("tool"),
             let session = request.uri.queryParameters.get("session"),
@@ -416,16 +443,13 @@ func registerRoutes(
         let session = context.parameters.get("session") ?? ""
         let name = context.parameters.get("name") ?? ""
         guard let url = store.attachmentURL(session: session, name: name),
-            let data = try? Data(contentsOf: url)
+            let size = FileBrowsing.readableSize(url.path)
         else {
             return jsonResponse(["error": "not found"], status: .notFound)
         }
-        var headers = HTTPFields()
-        headers[.contentType] = mimeType(forExtension: url.pathExtension)
-        headers[.cacheControl] = "private, max-age=31536000, immutable"
-        var buffer = ByteBuffer()
-        buffer.writeBytes(data)
-        return Response(status: .ok, headers: headers, body: .init(byteBuffer: buffer))
+        return fileResponse(
+            path: url.path, size: size, mime: mimeType(forExtension: url.pathExtension),
+            cacheControl: "private, max-age=31536000, immutable")
     }
 
     router.post("sessions/:id/live-activity") { request, context in
@@ -492,7 +516,7 @@ func registerRoutes(
         var found = await index.path(for: claudeID)
         if found == nil { found = await index.path(for: id) }
         guard let path = found,
-            let report = SpendReader.read(transcriptPath: path)
+            let report = await SpendLedger.shared.report(transcriptPath: path)
         else {
             return jsonResponse(["error": "not found"], status: .notFound)
         }

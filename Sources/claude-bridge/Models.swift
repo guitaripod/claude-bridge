@@ -346,12 +346,19 @@ enum FileBrowsing {
     /// Raw bytes of a regular file, refusing directories and anything past the
     /// cap — this feeds an inline image in a phone client, not a file transfer.
     static func bytes(_ path: String, cap: Int = 40 * 1024 * 1024) -> Data? {
+        guard readableSize(path, cap: cap) != nil else { return nil }
+        return try? Data(contentsOf: URL(fileURLWithPath: path))
+    }
+
+    /// How big a file is, when it is a regular file this bridge will serve at all — the same
+    /// question `bytes` asks, answered without reading it, so a route can stream instead.
+    static func readableSize(_ path: String, cap: Int = 40 * 1024 * 1024) -> Int? {
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
             !isDirectory.boolValue,
             let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size]) as? Int,
             size <= cap
         else { return nil }
-        return try? Data(contentsOf: URL(fileURLWithPath: path))
+        return size
     }
 }

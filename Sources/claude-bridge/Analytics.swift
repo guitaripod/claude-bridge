@@ -149,6 +149,16 @@ actor AnalyticsLedger {
     private let index: TranscriptIndex
     private var cache: [String: Slot] = [:]
     private static let parseWidth = 8
+
+    /// The cache is a parse-avoidance layer, not a ledger — the files are the ledger — so it is
+    /// allowed to forget. Everything a report just used stays; what no recent window has touched
+    /// goes once the cache holds twice the current window, which keeps months of per-line stats
+    /// from sitting resident because one 365-day report once asked for them.
+    private func pruneCache(keeping jobs: [Job]) {
+        guard cache.count > max(256, jobs.count * 2) else { return }
+        let wanted = Set(jobs.map(\.path))
+        cache = cache.filter { wanted.contains($0.key) }
+    }
     /// A gap between a prompt and its last answer past this is a `--resume` days later, not a
     /// turn anyone sat through; it must not win "longest turn".
     static let plausibleTurnSeconds: Double = 7_200
@@ -186,6 +196,7 @@ actor AnalyticsLedger {
         for (path, slot) in await Self.parse(jobs: pending) {
             cache[path] = slot
         }
+        pruneCache(keeping: jobs)
 
         var perSource: [(source: TranscriptIndex.AnalyticsSource, stats: AnalyticsFileStats)] = []
         var subagentRuns: [Int: Int] = [:]
@@ -459,10 +470,12 @@ actor AnalyticsLedger {
 /// the same grammar wearing a different meaning, so its lines become sidechain entries: real
 /// money and real tool calls that are also not something the person typed.
 enum AnalyticsWalker {
+    private static let readChunk = 4 * 1024 * 1024
+
     static func read(transcriptPath: String, asSidecar: Bool = false) -> AnalyticsFileStats {
-        guard let handle = FileHandle(forReadingAtPath: transcriptPath),
-            let data = try? handle.readToEnd()
-        else { return AnalyticsFileStats() }
+        guard let handle = FileHandle(forReadingAtPath: transcriptPath) else {
+            return AnalyticsFileStats()
+        }
         defer { try? handle.close() }
 
         var stats = AnalyticsFileStats()
@@ -470,6 +483,7 @@ enum AnalyticsWalker {
         var lastAt: Date?
         var pendingPrompt: String?
         var pendingPromptAt: Date?
+        let date = DateReader()
 
         func close() {
             guard var turn = open else { return }
@@ -478,10 +492,10 @@ enum AnalyticsWalker {
             open = nil
         }
 
-        for line in data.split(separator: UInt8(ascii: "\n")) {
+        func walk(line: Data.SubSequence) {
             guard !line.isEmpty,
                 let entry = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any]
-            else { continue }
+            else { return }
             let type = entry["type"] as? String
             if type == "system", entry["subtype"] as? String == "compact_boundary",
                 let metadata = entry["compactMetadata"] as? [String: Any],
@@ -490,26 +504,26 @@ enum AnalyticsWalker {
                 let after = metadata["postTokens"] as? Int ?? 0
                 stats.compactions.append(
                     AnalyticsFileStats.Compaction(
-                        at: date(entry["timestamp"]) ?? lastAt ?? Date(),
+                        at: date.read(entry["timestamp"]) ?? lastAt ?? Date(),
                         reclaimed: max(0, before - after)))
-                continue
+                return
             }
             let sidechain = asSidecar || entry["isSidechain"] as? Bool == true
             if type == "user", entry["isMeta"] as? Bool != true, !sidechain {
                 if let text = prompt(in: entry) {
                     close()
                     pendingPrompt = text
-                    pendingPromptAt = date(entry["timestamp"])
+                    pendingPromptAt = date.read(entry["timestamp"])
                 }
-                continue
+                return
             }
             guard type == "assistant", let message = entry["message"] as? [String: Any] else {
-                continue
+                return
             }
             let model = message["model"] as? String
-            if model == "<synthetic>" { continue }
+            if model == "<synthetic>" { return }
             let usage = message["usage"] as? [String: Any] ?? [:]
-            let at = date(entry["timestamp"]) ?? lastAt ?? Date()
+            let at = date.read(entry["timestamp"]) ?? lastAt ?? Date()
             let counts = tokens(in: usage)
             let line = AnalyticsFileStats.Line(
                 messageID: message["id"] as? String,
@@ -522,7 +536,7 @@ enum AnalyticsWalker {
                     AnalyticsFileStats.Turn(
                         at: at, seconds: nil, model: model, sidechain: true, prompt: nil,
                         lines: [line]))
-                continue
+                return
             }
             lastAt = at
             if open == nil {
@@ -532,11 +546,24 @@ enum AnalyticsWalker {
                 pendingPrompt = nil
                 pendingPromptAt = nil
             }
-            guard var turn = open else { continue }
+            guard var turn = open else { return }
             turn.lines.append(line)
             if turn.model == nil { turn.model = model }
             open = turn
         }
+
+        var carry = Data()
+        while let chunk = try? handle.read(upToCount: readChunk), !chunk.isEmpty {
+            var buffer = carry
+            buffer.append(chunk)
+            var start = buffer.startIndex
+            while let mark = buffer[start...].firstIndex(of: UInt8(ascii: "\n")) {
+                walk(line: buffer[start..<mark])
+                start = buffer.index(after: mark)
+            }
+            carry = Data(buffer[start...])
+        }
+        if !carry.isEmpty { walk(line: carry[...]) }
         close()
         return stats
     }
@@ -584,10 +611,4 @@ enum AnalyticsWalker {
         return counts
     }
 
-    private static func date(_ raw: Any?) -> Date? {
-        guard let text = raw as? String else { return nil }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: text) ?? ISO8601DateFormatter().date(from: text)
-    }
 }

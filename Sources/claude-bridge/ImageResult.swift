@@ -87,7 +87,64 @@ enum TranscriptImage {
         return image(in: buffer[...], needle: needle, toolID: toolID)
     }
 
+    /// Where every picture in a transcript lives, by the id of the tool call that read it.
+    ///
+    /// A gallery asks for one picture per tap, and a transcript is scanned front to back to find
+    /// one line: opening ten pictures scanned the same file ten times. One pass records them all,
+    /// by byte scan — no line is parsed as JSON — so the second picture onwards is a seek.
+    static func index(transcriptPath: String) -> [String: UInt64] {
+        guard let handle = FileHandle(forReadingAtPath: transcriptPath) else { return [:] }
+        defer { try? handle.close() }
+        var offsets: [String: UInt64] = [:]
+        var lineStart: UInt64 = 0
+        var buffer = Data()
+        func harvest(_ line: Data.SubSequence, at offset: UInt64) {
+            guard !line.isEmpty,
+                line.range(of: base64Marker) != nil || line.range(of: inlineMarker) != nil
+            else { return }
+            for id in TranscriptParser.toolUseIDs(in: Data(line)) where offsets[id] == nil {
+                offsets[id] = offset
+            }
+        }
+        while let chunk = try? handle.read(upToCount: chunkSize), !chunk.isEmpty {
+            buffer.append(chunk)
+            var cursor = buffer.startIndex
+            while let newline = buffer[cursor...].firstIndex(of: 0x0A) {
+                harvest(buffer[cursor..<newline], at: lineStart)
+                lineStart += UInt64(buffer.distance(from: cursor, to: newline)) + 1
+                cursor = buffer.index(after: newline)
+            }
+            buffer = cursor > buffer.startIndex ? Data(buffer[cursor...]) : buffer
+        }
+        harvest(buffer[...], at: lineStart)
+        return offsets
+    }
+
+    /// One line, read where the index said it was. A file that changed under the offset simply
+    /// fails to parse and answers nothing, which sends the caller back to a full scan.
+    static func bytes(transcriptPath: String, toolID: String, at offset: UInt64) -> (
+        data: Data, mime: String
+    )? {
+        guard let handle = FileHandle(forReadingAtPath: transcriptPath) else { return nil }
+        defer { try? handle.close() }
+        guard (try? handle.seek(toOffset: offset)) != nil else { return nil }
+        var line = Data()
+        while line.count < maxLine {
+            guard let chunk = try? handle.read(upToCount: lineChunk), !chunk.isEmpty else { break }
+            if let newline = chunk.firstIndex(of: 0x0A) {
+                line.append(chunk[chunk.startIndex..<newline])
+                break
+            }
+            line.append(chunk)
+        }
+        return image(in: line[...], needle: Data(toolID.utf8), toolID: toolID)
+    }
+
     private static let chunkSize = 4 * 1024 * 1024
+    private static let lineChunk = 256 * 1024
+    private static let maxLine = 64 * 1024 * 1024
+    private static let base64Marker = Data("\"base64\"".utf8)
+    private static let inlineMarker = Data("\"type\":\"image\"".utf8)
 
     private static func image(in line: Data.SubSequence, needle: Data, toolID: String) -> (
         data: Data, mime: String

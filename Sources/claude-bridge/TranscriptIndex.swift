@@ -195,6 +195,21 @@ actor TranscriptIndex {
 
     private var resolvedCache: [String: (offset: Int, ids: Set<String>)] = [:]
     private var progressCache: [String: SubagentProgress] = [:]
+    private var journalCache: [String: (offset: Int, ids: Set<String>)] = [:]
+
+    /// These three are parse-avoidance for files that only grow, so they hold ids for every
+    /// session and sidecar ever polled. A machine left running for weeks reaches thousands; the
+    /// sweep drops the ones whose file is gone and, past a ceiling, everything — a cold cache
+    /// costs one scan, and one scan is what the incremental readers were built to survive.
+    private func pruneParseCaches() {
+        let ceiling = 4_000
+        resolvedCache = resolvedCache.filter { FileManager.default.fileExists(atPath: $0.key) }
+        progressCache = progressCache.filter { FileManager.default.fileExists(atPath: $0.key) }
+        journalCache = journalCache.filter { FileManager.default.fileExists(atPath: $0.key) }
+        if resolvedCache.count > ceiling { resolvedCache = [:] }
+        if progressCache.count > ceiling { progressCache = [:] }
+        if journalCache.count > ceiling { journalCache = [:] }
+    }
 
     /// Incremental like ``resolvedTools``: only appended bytes are parsed, so polling a fan-out
     /// of forty sidecars every few seconds costs what changed, not forty full files.
@@ -235,19 +250,40 @@ actor TranscriptIndex {
     /// Agent ids a workflow run's journal records a result for — the
     /// completion signal for workflow agents, which have no spawning Task
     /// tool call in the parent transcript.
+    /// Incremental like ``resolvedTools``: a journal is append-only and this is asked for on every
+    /// subagent poll, so only the bytes since the last look are parsed. A result already recorded
+    /// stays recorded.
     private func journalCompletedAgentIDs(in dir: URL) -> Set<String> {
-        let journal = dir.appendingPathComponent("journal.jsonl")
-        guard let data = try? Data(contentsOf: journal) else { return [] }
-        var ids = Set<String>()
-        for line in String(decoding: data, as: UTF8.self).split(separator: "\n") {
-            guard let object = try? JSONSerialization.jsonObject(with: Data(line.utf8))
-                    as? [String: Any],
-                object["type"] as? String == "result",
-                let agentID = object["agentId"] as? String
-            else { continue }
-            ids.insert(agentID)
+        let path = dir.appendingPathComponent("journal.jsonl").path
+        var cached = journalCache[path] ?? (0, [])
+        guard let handle = FileHandle(forReadingAtPath: path) else { return cached.ids }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
+        if size < cached.offset { cached = (0, []) }
+        guard size > cached.offset else { return cached.ids }
+        try? handle.seek(toOffset: UInt64(cached.offset))
+        guard let data = try? handle.read(upToCount: size - cached.offset) else {
+            return cached.ids
         }
-        return ids
+        TranscriptParser.forEachJSONLine(in: data, dropIncompleteTail: false) { object in
+            if object["type"] as? String == "result",
+                let agentID = object["agentId"] as? String
+            {
+                cached.ids.insert(agentID)
+            }
+            return true
+        }
+        cached.offset += completeBytes(in: data)
+        journalCache[path] = cached
+        return cached.ids
+    }
+
+    /// How much of a read ends on a line boundary. A trailing partial line is read for what it
+    /// already says and then left behind the offset, so the next look reads it whole; the ids are
+    /// a set, so seeing the same result twice costs nothing.
+    private func completeBytes(in data: Data) -> Int {
+        guard let last = data.lastIndex(of: 0x0A) else { return 0 }
+        return data.distance(from: data.startIndex, to: last) + 1
     }
 
     private func subagents(in dir: URL, threshold: Date, resolved: Set<String>)
@@ -331,24 +367,54 @@ actor TranscriptIndex {
     func imageBytes(session: String, toolID: String) async -> (data: Data, mime: String)? {
         if pathByID[session] == nil { scan() }
         guard let path = pathByID[session] else { return nil }
+        let size = fileSize(path)
+        if let known = imageOffsets[session], known.size == size,
+            let mark = known.offsets[toolID],
+            let found = TranscriptImage.bytes(
+                transcriptPath: mark.path, toolID: toolID, at: mark.offset)
+        {
+            return found
+        }
         let sidecars = Self.sidecarDirs(transcriptPath: path)
-        return await Task.detached(priority: .userInitiated) {
-            if let found = TranscriptImage.bytes(transcriptPath: path, toolID: toolID) {
-                return found
+        let mapped = await Task.detached(priority: .userInitiated) {
+            var offsets: [String: (path: String, offset: UInt64)] = [:]
+            for (id, offset) in TranscriptImage.index(transcriptPath: path) {
+                offsets[id] = (path, offset)
             }
             for dir in sidecars {
                 let files =
                     (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
                 for name in files where name.hasPrefix("agent-") && name.hasSuffix(".jsonl") {
-                    if let found = TranscriptImage.bytes(
-                        transcriptPath: dir.appendingPathComponent(name).path, toolID: toolID)
-                    {
-                        return found
+                    let sidecar = dir.appendingPathComponent(name).path
+                    for (id, offset) in TranscriptImage.index(transcriptPath: sidecar)
+                    where offsets[id] == nil {
+                        offsets[id] = (sidecar, offset)
                     }
                 }
             }
-            return nil
+            return offsets
         }.value
+        imageOffsets[session] = (size: size, offsets: mapped)
+        pruneImageOffsets()
+        guard let mark = mapped[toolID] else { return nil }
+        return TranscriptImage.bytes(
+            transcriptPath: mark.path, toolID: toolID, at: mark.offset)
+    }
+
+    /// Where every picture of a conversation sits in the files that hold it. Built by one scan and
+    /// spent by every later tap: a gallery is a walk through pictures the transcript already
+    /// mentioned. Rebuilt whole when the transcript has grown, because a new turn's pictures are
+    /// past the end of what was mapped.
+    private var imageOffsets: [String: (size: UInt64, offsets: [String: (path: String, offset: UInt64)])] = [:]
+
+    private func pruneImageOffsets() {
+        guard imageOffsets.count > 24 else { return }
+        imageOffsets = [:]
+    }
+
+    private func fileSize(_ path: String) -> UInt64 {
+        ((try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber)?
+            .uint64Value ?? 0
     }
 
     /// Latest transcript mtime per session id, for freshening stored sessions
@@ -708,6 +774,7 @@ actor TranscriptIndex {
             cache[stale] = nil
             sidecarProbes[stale] = nil
         }
+        pruneParseCaches()
     }
 
     private func refresh(_ file: URL, id: String) {
@@ -773,7 +840,7 @@ enum TranscriptParser {
         var title: String?
         var commandTitle: String?
 
-        for line in jsonLines(in: data, dropIncompleteTail: data.count == summaryScanLimit) {
+        forEachJSONLine(in: data, dropIncompleteTail: data.count == summaryScanLimit) { line in
             if directory == nil, let cwd = line["cwd"] as? String { directory = cwd }
             if createdAt == nil, let stamp = line["timestamp"] as? String {
                 createdAt = parseTimestamp(stamp)
@@ -784,13 +851,13 @@ enum TranscriptParser {
             }
             guard title == nil, isRealLine(line), line["type"] as? String == "user",
                 let content = message?["content"] as? String
-            else { continue }
+            else { return true }
             if let typed = typedText(content) {
                 title = deriveTitle(typed)
             } else if commandTitle == nil, let command = commandText(content) {
                 commandTitle = deriveTitle(command)
             }
-            if title != nil, directory != nil, model != nil { break }
+            return !(title != nil && directory != nil && model != nil)
         }
 
         guard let heading = title ?? commandTitle else { return nil }
@@ -810,12 +877,12 @@ enum TranscriptParser {
         let window = min(size, 64 * 1024)
         try? handle.seek(toOffset: UInt64(size - window))
         guard let data = try? handle.read(upToCount: window) else { return nil }
-        for line in jsonLines(in: data, dropIncompleteTail: false).reversed() {
-            if let stamp = (line["timestamp"] as? String).flatMap(parseTimestamp) {
-                return stamp
-            }
+        var found: Date?
+        forEachJSONLineReversed(in: data) { line in
+            found = (line["timestamp"] as? String).flatMap(parseTimestamp)
+            return found == nil
         }
-        return nil
+        return found
     }
 
     /// The model and effort of the transcript's last real answer. Read from the tail because a
@@ -830,14 +897,17 @@ enum TranscriptParser {
             let span = min(size, window)
             try? handle.seek(toOffset: UInt64(size - span))
             guard let data = try? handle.read(upToCount: span) else { break }
-            for line in jsonLines(in: data, dropIncompleteTail: false).reversed() {
+            var settings: TranscriptSettings?
+            forEachJSONLineReversed(in: data) { line in
                 guard line["type"] as? String == "assistant",
                     line["isSidechain"] as? Bool != true,
                     let model = (line["message"] as? [String: Any])?["model"] as? String,
                     model != "<synthetic>"
-                else { continue }
-                return TranscriptSettings(model: model, effort: line["effort"] as? String)
+                else { return true }
+                settings = TranscriptSettings(model: model, effort: line["effort"] as? String)
+                return false
             }
+            if let settings { return settings }
             if span == size { break }
         }
         return TranscriptSettings()
@@ -849,16 +919,18 @@ enum TranscriptParser {
         guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? handle.close() }
         let data = (try? handle.read(upToCount: 32 * 1024)) ?? Data()
-        for line in jsonLines(in: data, dropIncompleteTail: true) {
+        var found: String?
+        forEachJSONLine(in: data, dropIncompleteTail: true) { line in
             guard line["type"] as? String == "user",
                 let content = (line["message"] as? [String: Any])?["content"] as? String
-            else { continue }
+            else { return true }
             let first = content.split(separator: "\n").first.map(String.init) ?? content
             let trimmed = first.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty, !trimmed.hasPrefix("<") else { continue }
-            return String(trimmed.prefix(80))
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("<") else { return true }
+            found = String(trimmed.prefix(80))
+            return false
         }
-        return nil
+        return found
     }
 
     /// Whether the transcript's last meaningful line closes the turn: the CLI
@@ -872,59 +944,67 @@ enum TranscriptParser {
         let window = min(size, 64 * 1024)
         try? handle.seek(toOffset: UInt64(size - window))
         guard let data = try? handle.read(upToCount: window) else { return false }
-        for line in jsonLines(in: data, dropIncompleteTail: false).reversed() {
+        var closed = false
+        forEachJSONLineReversed(in: data) { line in
             switch line["type"] as? String {
             case "system":
-                if line["subtype"] as? String == "turn_duration" { return true }
+                if line["subtype"] as? String == "turn_duration" {
+                    closed = true
+                    return false
+                }
             case "user":
                 if let content = (line["message"] as? [String: Any])?["content"] as? String,
                     content.hasPrefix("[Request interrupted")
                 {
-                    return true
+                    closed = true
                 }
                 return false
             case "assistant":
                 return false
             default:
-                continue
+                break
             }
+            return true
         }
-        return false
+        return closed
     }
 
-    /// Tool-use ids that already have a result recorded in the transcript —
-    /// a subagent whose spawning Task call is resolved has finished. Byte
-    /// scan, never a String walk: grapheme-aware searching of a transcript
-    /// this size takes minutes.
     /// Folds appended sidecar bytes into a progress accumulator. The last TodoWrite wins whole;
     /// every other tool bumps the count and becomes "current" with a one-line description.
     static func accumulateProgress(_ progress: inout SubagentProgress, data: Data) {
-        for line in jsonLines(in: data, dropIncompleteTail: false) {
-            if progress.startedAt == nil,
-                let stamp = (line["timestamp"] as? String).flatMap(parseTimestamp)
-            {
-                progress.startedAt = stamp
+        var carried = progress
+        forEachJSONLine(in: data, dropIncompleteTail: false) { line in
+            accumulate(&carried, line: line)
+            return true
+        }
+        progress = carried
+    }
+
+    private static func accumulate(_ progress: inout SubagentProgress, line: [String: Any]) {
+        if progress.startedAt == nil,
+            let stamp = (line["timestamp"] as? String).flatMap(parseTimestamp)
+        {
+            progress.startedAt = stamp
+        }
+        guard line["type"] as? String == "assistant",
+            let blocks = (line["message"] as? [String: Any])?["content"] as? [[String: Any]]
+        else { return }
+        for block in blocks where block["type"] as? String == "tool_use" {
+            guard let name = block["name"] as? String else { continue }
+            let input = block["input"] as? [String: Any]
+            if name == "TodoWrite" {
+                guard let todos = input?["todos"] as? [[String: Any]] else { continue }
+                progress.todosTotal = todos.count
+                progress.todosDone = todos.count { $0["status"] as? String == "completed" }
+                progress.currentTodo =
+                    todos.first { $0["status"] as? String == "in_progress" }?["content"]
+                    as? String
+                    ?? todos.first { $0["status"] as? String == "pending" }?["content"]
+                    as? String
+                continue
             }
-            guard line["type"] as? String == "assistant",
-                let blocks = (line["message"] as? [String: Any])?["content"] as? [[String: Any]]
-            else { continue }
-            for block in blocks where block["type"] as? String == "tool_use" {
-                guard let name = block["name"] as? String else { continue }
-                let input = block["input"] as? [String: Any]
-                if name == "TodoWrite" {
-                    guard let todos = input?["todos"] as? [[String: Any]] else { continue }
-                    progress.todosTotal = todos.count
-                    progress.todosDone = todos.count { $0["status"] as? String == "completed" }
-                    progress.currentTodo =
-                        todos.first { $0["status"] as? String == "in_progress" }?["content"]
-                        as? String
-                        ?? todos.first { $0["status"] as? String == "pending" }?["content"]
-                        as? String
-                    continue
-                }
-                progress.toolCount += 1
-                progress.currentTool = describeTool(name: name, input: input)
-            }
+            progress.toolCount += 1
+            progress.currentTool = describeTool(name: name, input: input)
         }
     }
 
@@ -945,6 +1025,9 @@ enum TranscriptParser {
         text.split(separator: "\n").first.map(String.init) ?? text
     }
 
+    /// Tool-use ids that already have a result recorded in the transcript — a subagent whose
+    /// spawning Task call is resolved has finished. Byte scan, never a String walk:
+    /// grapheme-aware searching of a transcript this size takes minutes.
     static func toolUseIDs(in data: Data) -> Set<String> {
         let marker = Data("\"tool_use_id\":\"".utf8)
         var ids = Set<String>()
@@ -991,19 +1074,51 @@ enum TranscriptParser {
 
     private static func jsonLines(in data: Data, dropIncompleteTail: Bool) -> [[String: Any]] {
         var lines: [[String: Any]] = []
+        forEachJSONLine(in: data, dropIncompleteTail: dropIncompleteTail) { line in
+            lines.append(line)
+            return true
+        }
+        return lines
+    }
+
+    /// Every line in order, parsed one at a time and abandoned the moment the caller has what it
+    /// came for. Materializing the window first defeated every early exit above it: a prefix scan
+    /// that stops at the title still paid for half a megabyte of dictionaries.
+    /// - Parameter body: answers whether to keep going.
+    static func forEachJSONLine(
+        in data: Data, dropIncompleteTail: Bool, _ body: ([String: Any]) -> Bool
+    ) {
         var start = data.startIndex
         while start < data.endIndex {
             let end = data[start...].firstIndex(of: 0x0A) ?? data.endIndex
-            if end == data.endIndex, dropIncompleteTail { break }
+            if end == data.endIndex, dropIncompleteTail { return }
             if end > start,
                 let object = try? JSONSerialization.jsonObject(with: data[start..<end])
-                    as? [String: Any]
+                    as? [String: Any], !body(object)
             {
-                lines.append(object)
+                return
             }
             start = end < data.endIndex ? data.index(after: end) : data.endIndex
         }
-        return lines
+    }
+
+    /// The same, newest first. Every tail reader in this file wants the last line that answers
+    /// some question, so walking back from the end parses one or two lines where reading the
+    /// window forward and reversing it parsed hundreds.
+    static func forEachJSONLineReversed(in data: Data, _ body: ([String: Any]) -> Bool) {
+        var end = data.endIndex
+        while end > data.startIndex {
+            let previous = data[data.startIndex..<end].lastIndex(of: 0x0A)
+            let start = previous.map { data.index(after: $0) } ?? data.startIndex
+            if end > start,
+                let object = try? JSONSerialization.jsonObject(with: data[start..<end])
+                    as? [String: Any], !body(object)
+            {
+                return
+            }
+            guard let previous else { return }
+            end = previous
+        }
     }
 
     static func isRealLine(_ line: [String: Any]) -> Bool {
