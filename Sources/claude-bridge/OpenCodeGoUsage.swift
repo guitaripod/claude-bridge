@@ -1,41 +1,117 @@
 import Foundation
 
-/// Estimated opencode Go subscription usage. opencode's console shows the real numbers behind a
-/// browser session and offers no key-authed API, but every Go turn this machine ran is in
-/// opencode's local database with its list-price cost — the same quantity the subscription
-/// windows meter. Summing it over the published windows ($12 per rolling 5 h, $30 per week,
-/// $60 per month) reproduces the console's picture for a single-machine account, so the
-/// snapshot says "estimated" and counts only this machine.
+#if canImport(FoundationNetworking)
+    import FoundationNetworking
+#endif
+
+/// Live OpenCode Go subscription usage from opencode's own usage API, read with this machine's
+/// Go key. The same numbers sit behind the console at opencode.ai, but the endpoint answers to
+/// the Go key directly — account-wide, every machine's spend folded server-side, with the exact
+/// reset moment of each window (the monthly reset is the billing-cycle anchor). The endpoint is
+/// undocumented, so a bridge that cannot reach it falls back to the opencode.db estimate: the
+/// same windows summed from the turns this machine ran.
 enum OpenCodeGoUsage {
     private static let cache = UsageSnapshotCache(name: "opencode-go")
+    private static let usageURL = URL(string: "https://opencode.ai/zen/go/v1/usage")!
 
     static func snapshot() async -> UsageSnapshot {
-        guard hasGoAccount() else {
+        guard let key = goKey() else {
             return unavailable("no opencode Go account on this machine")
         }
         if let fresh = await cache.fresh(within: 60) { return fresh }
         do {
-            let snapshot = try measure()
+            let snapshot = try await fetchLive(key: key)
             await cache.store(snapshot)
             return snapshot
         } catch {
-            if var stale = await cache.fresh(within: 24 * 3600) {
-                stale.source += " · cached"
-                return stale
+            do {
+                let estimate = try estimate()
+                await cache.store(estimate)
+                return estimate
+            } catch {
+                if var stale = await cache.fresh(within: 24 * 3600) {
+                    stale.source += " · cached"
+                    return stale
+                }
+                return unavailable("\(error)")
             }
-            return unavailable("\(error)")
         }
     }
 
-    private static func hasGoAccount() -> Bool {
+    /// The Go key opencode itself uses, from the same auth file the CLI keeps its logins in.
+    static func goKey() -> String? {
         let path = dataHome().appendingPathComponent("opencode/auth.json")
         guard let data = try? Data(contentsOf: path),
-            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return false }
-        return json["opencode-go"] != nil
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let block = json["opencode-go"] as? [String: Any],
+            let key = block["key"] as? String, !key.isEmpty
+        else { return nil }
+        return key
     }
 
-    private static func measure() throws -> UsageSnapshot {
+    private static func fetchLive(key: String) async throws -> UsageSnapshot {
+        var request = URLRequest(url: usageURL)
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "authorization")
+        request.setValue("application/json", forHTTPHeaderField: "accept")
+        request.setValue(
+            "claude-bridge (+https://github.com/guitaripod/claude-bridge)",
+            forHTTPHeaderField: "user-agent")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            throw Failure.message("usage endpoint returned \(status)")
+        }
+        guard
+            let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let usage = json["usage"] as? [String: Any]
+        else { throw Failure.message("usage endpoint returned no usage block") }
+        return try parseLive(usage)
+    }
+
+    /// One gauge per published window, dollars against the plan's caps, each reset exactly as
+    /// opencode's server states it. A window whose status says the account is walled reads as
+    /// exhausted whatever its percentage; anything else renders the server's number.
+    static func parseLive(_ usage: [String: Any]) throws -> UsageSnapshot {
+        let limits = configuredLimits()
+        let windows: [(key: String, label: String, cap: Double)] = [
+            ("rolling", "5-hour", limits.rolling),
+            ("weekly", "Weekly", limits.weekly),
+            ("monthly", "Monthly", limits.monthly),
+        ]
+        var gauges: [UsageGauge] = []
+        for window in windows {
+            guard let block = usage[window.key] as? [String: Any],
+                let percent = (block["percent"] as? NSNumber)?.doubleValue
+            else { continue }
+            let status = block["status"] as? String
+            let fraction = ["limit", "blocked"].contains(status ?? "")
+                ? 1
+                : min(1, max(0, percent / 100))
+            gauges.append(
+                UsageGauge(
+                    key: window.key, label: window.label,
+                    fraction: fraction,
+                    resetsAt: normalizedReset(block["resetsAt"]),
+                    trustedReset: true,
+                    usedUSD: rounded(percent * window.cap / 100),
+                    limitUSD: window.cap))
+        }
+        guard !gauges.isEmpty else {
+            throw Failure.message("usage endpoint returned no windows")
+        }
+        return UsageSnapshot(
+            providerName: "opencode go",
+            subtitle: "Go",
+            source: "opencode.ai Go usage API · live",
+            live: true,
+            gauges: gauges,
+            details: [
+                UsageDetail(key: "Counted by", value: "opencode.ai · account-wide")
+            ],
+            error: nil)
+    }
+
+    private static func estimate() throws -> UsageSnapshot {
         let database = databasePath()
         guard FileManager.default.fileExists(atPath: database.path) else {
             throw Failure.message("opencode database not found")
@@ -45,12 +121,12 @@ enum OpenCodeGoUsage {
             ("rolling", 5 * 3600.0), ("weekly", 7 * 86400.0), ("monthly", 30 * 86400.0),
         ])
         let gauges = [
-            gauge(key: "rolling", label: "5-hour window", used: spent["rolling"] ?? 0, limit: limits.rolling),
+            gauge(key: "rolling", label: "5-hour", used: spent["rolling"] ?? 0, limit: limits.rolling),
             gauge(key: "weekly", label: "Weekly", used: spent["weekly"] ?? 0, limit: limits.weekly),
             gauge(key: "monthly", label: "Monthly", used: spent["monthly"] ?? 0, limit: limits.monthly),
         ]
         return UsageSnapshot(
-            providerName: "opencode",
+            providerName: "opencode go",
             subtitle: "Go",
             source: "opencode.db · this machine · estimated",
             live: true,
@@ -138,9 +214,30 @@ enum OpenCodeGoUsage {
         return (12, 30, 60)
     }
 
+    /// Re-emits opencode's fractional-seconds timestamp as plain `.withInternetDateTime` ISO8601,
+    /// which the client's `.iso8601` `JSONDecoder` can parse.
+    private static func normalizedReset(_ value: Any?) -> String? {
+        guard let raw = value as? String, let date = parseTimestamp(raw) else { return nil }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime]
+        return iso.string(from: date)
+    }
+
+    private static func parseTimestamp(_ raw: String) -> Date? {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = iso.date(from: raw) { return date }
+        iso.formatOptions = [.withInternetDateTime]
+        return iso.date(from: raw)
+    }
+
+    private static func rounded(_ value: Double) -> Double {
+        (value * 100).rounded() / 100
+    }
+
     private static func unavailable(_ reason: String) -> UsageSnapshot {
         UsageSnapshot(
-            providerName: "opencode", subtitle: "Go",
+            providerName: "opencode go", subtitle: "Go",
             source: "opencode.db", live: false, gauges: [], details: [], error: reason)
     }
 
