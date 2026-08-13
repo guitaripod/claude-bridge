@@ -12,6 +12,7 @@ import Testing
         ])
         #expect(snapshot.live)
         #expect(snapshot.providerName == "opencode go")
+        #expect(snapshot.subtitle == "$10/mo")
         #expect(snapshot.source.contains("live"))
         #expect(snapshot.gauges.count == 3)
 

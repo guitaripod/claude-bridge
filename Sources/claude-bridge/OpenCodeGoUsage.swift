@@ -101,7 +101,7 @@ enum OpenCodeGoUsage {
         }
         return UsageSnapshot(
             providerName: "opencode go",
-            subtitle: "Go",
+            subtitle: "$10/mo",
             source: "opencode.ai Go usage API · live",
             live: true,
             gauges: gauges,
@@ -127,7 +127,7 @@ enum OpenCodeGoUsage {
         ]
         return UsageSnapshot(
             providerName: "opencode go",
-            subtitle: "Go",
+            subtitle: "$10/mo",
             source: "opencode.db · this machine · estimated",
             live: true,
             gauges: gauges,
@@ -237,7 +237,7 @@ enum OpenCodeGoUsage {
 
     private static func unavailable(_ reason: String) -> UsageSnapshot {
         UsageSnapshot(
-            providerName: "opencode go", subtitle: "Go",
+            providerName: "opencode go", subtitle: "$10/mo",
             source: "opencode.db", live: false, gauges: [], details: [], error: reason)
     }
 
