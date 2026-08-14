@@ -72,10 +72,40 @@ enum BridgeVersion {
             }
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent(".claude-bridge").path
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: "\(directory)/build.json"))
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: "\(directory)/build.json")),
+            let stamp = try? JSONCoding.decoder.decode(Stamp.self, from: data)
         else { return nil }
-        return try? JSONCoding.decoder.decode(Stamp.self, from: data)
+        return describesThisBinary(stamp) ? stamp : nil
     }()
+
+    /// Whether the stamp is about the binary that is actually running.
+    ///
+    /// The installer writes it immediately after the build it describes, so a binary newer than
+    /// its own stamp was produced by some other hand — a plain `swift build` in the checkout — and
+    /// the stamp is now describing a build nobody is running. That is not a cosmetic wrong number:
+    /// the stamp is read once, at startup, and a commit in it that will never match HEAD makes
+    /// `restartRequired` permanently true, so every restart taken to clear it re-reads the same
+    /// lie and lands in the same state. A machine that keeps itself current then restarts on a
+    /// loop, forever, over work no restart can do.
+    ///
+    /// Disowning it costs only the one thing the stamp was for — noticing a build that has landed
+    /// and not started — and leaves the checkout's own `describe` answering for the version, which
+    /// is what the contract said before the stamp existed.
+    private static func describesThisBinary(_ stamp: Stamp) -> Bool {
+        let executable = Bundle.main.executableURL?.resolvingSymlinksInPath()
+        let modified = executable.flatMap {
+            try? FileManager.default.attributesOfItem(atPath: $0.path)[.modificationDate] as? Date
+        }
+        return stampDescribes(builtAt: stamp.builtAt, executableModified: modified ?? nil)
+    }
+
+    /// The comparison itself, where it can be read and tested: a stamp with nothing to compare
+    /// against is believed, because refusing every stamp we cannot date would throw away the
+    /// signal on every machine whose filesystem answers oddly.
+    static func stampDescribes(builtAt: Date?, executableModified: Date?) -> Bool {
+        guard let builtAt, let executableModified else { return true }
+        return executableModified <= builtAt
+    }
 }
 
 /// Runs a command and collects its output, bounded by a timeout: every caller here talks to the

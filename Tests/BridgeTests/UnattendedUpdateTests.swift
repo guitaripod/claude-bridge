@@ -99,3 +99,32 @@ import Testing
         #expect(policy.lastTarget == "abc1234")
     }
 }
+
+/// The stamp says what this *process* is, and it is read once, at startup — so a stamp that is not
+/// about this binary is a wrong answer no restart can correct. The installer writes it after the
+/// build it describes; a binary newer than its stamp came from some other hand, and believing it
+/// there is what made a machine restart on a loop over a build that was already loaded.
+@Suite struct BuildStampTests {
+    private static let built = Date(timeIntervalSince1970: 1_770_000_000)
+
+    @Test func aBinaryNewerThanItsStampIsNotTheBinaryTheStampDescribes() {
+        #expect(
+            !BridgeVersion.stampDescribes(
+                builtAt: Self.built, executableModified: Self.built.addingTimeInterval(60)))
+    }
+
+    @Test func theInstallersOwnOrderIsBelieved() {
+        #expect(
+            BridgeVersion.stampDescribes(
+                builtAt: Self.built, executableModified: Self.built.addingTimeInterval(-3)))
+        #expect(
+            BridgeVersion.stampDescribes(builtAt: Self.built, executableModified: Self.built))
+    }
+
+    /// Nothing to compare against is not evidence of a lie: a stamp from a bridge too old to date
+    /// itself, or a filesystem that will not answer, keeps the signal it was written for.
+    @Test func anUndatableStampKeepsItsSignal() {
+        #expect(BridgeVersion.stampDescribes(builtAt: nil, executableModified: Self.built))
+        #expect(BridgeVersion.stampDescribes(builtAt: Self.built, executableModified: nil))
+    }
+}
