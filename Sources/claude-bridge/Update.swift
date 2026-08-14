@@ -99,12 +99,21 @@ enum BridgeVersion {
         return stampDescribes(builtAt: stamp.builtAt, executableModified: modified ?? nil)
     }
 
-    /// The comparison itself, where it can be read and tested: a stamp with nothing to compare
-    /// against is believed, because refusing every stamp we cannot date would throw away the
-    /// signal on every machine whose filesystem answers oddly.
+    /// The comparison itself, where it can be read and tested.
+    ///
+    /// The slack is not fuzziness about which build this is: the installer stamps seconds after
+    /// the link, and it writes whole seconds, so a binary modified at 11:49:15.8 against a stamp
+    /// reading 11:49:15 would fail a strict comparison on every correct install there has ever
+    /// been. What it is separating is builds seconds apart from builds days apart, and a stamp
+    /// left behind by a hand-built binary is never within a minute of it.
+    ///
+    /// A stamp with nothing to compare against is believed: a bridge too old to date itself, or a
+    /// filesystem that will not answer, is not evidence of a lie.
+    static let stampSlack: TimeInterval = 60
+
     static func stampDescribes(builtAt: Date?, executableModified: Date?) -> Bool {
         guard let builtAt, let executableModified else { return true }
-        return executableModified <= builtAt
+        return executableModified <= builtAt.addingTimeInterval(stampSlack)
     }
 }
 

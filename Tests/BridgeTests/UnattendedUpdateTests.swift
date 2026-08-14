@@ -110,15 +110,24 @@ import Testing
     @Test func aBinaryNewerThanItsStampIsNotTheBinaryTheStampDescribes() {
         #expect(
             !BridgeVersion.stampDescribes(
-                builtAt: Self.built, executableModified: Self.built.addingTimeInterval(60)))
+                builtAt: Self.built, executableModified: Self.built.addingTimeInterval(3_600)))
+        #expect(
+            !BridgeVersion.stampDescribes(
+                builtAt: Self.built, executableModified: Self.built.addingTimeInterval(86_400 * 5)))
     }
 
+    /// The installer stamps after the link and writes whole seconds, so the binary is routinely a
+    /// fraction of a second "newer" than the stamp that describes it. A strict comparison would
+    /// disown every correct install ever made.
     @Test func theInstallersOwnOrderIsBelieved() {
         #expect(
             BridgeVersion.stampDescribes(
                 builtAt: Self.built, executableModified: Self.built.addingTimeInterval(-3)))
         #expect(
             BridgeVersion.stampDescribes(builtAt: Self.built, executableModified: Self.built))
+        #expect(
+            BridgeVersion.stampDescribes(
+                builtAt: Self.built, executableModified: Self.built.addingTimeInterval(0.9)))
     }
 
     /// Nothing to compare against is not evidence of a lie: a stamp from a bridge too old to date
