@@ -99,7 +99,9 @@ actor TranscriptIndex {
             guard let entry = slot.entry else { continue }
             let lastContent = slot.contentDate ?? slot.mtime
             let turnOpen = !slot.turnClosed && lastContent > threshold
-            if turnOpen || isSidecarActive(transcriptPath: path, after: threshold) {
+            if turnOpen || isSidecarActive(transcriptPath: path, after: threshold)
+                || openFanoutAgents(transcriptPath: path) > 0
+            {
                 ids.insert(entry.id)
             }
         }
@@ -123,7 +125,8 @@ actor TranscriptIndex {
         var activity: [String: AgentActivity] = [:]
         for (path, slot) in cache {
             guard let entry = slot.entry,
-                isSidecarActive(transcriptPath: path, after: threshold),
+                isSidecarActive(transcriptPath: path, after: threshold)
+                    || openFanoutAgents(transcriptPath: path) > 0,
                 let detail = agentActivity(transcriptPath: path)
             else { continue }
             activity[entry.id] = detail
@@ -136,13 +139,18 @@ actor TranscriptIndex {
         guard let path = path(for: id) else { return false }
         return isSidecarActive(
             transcriptPath: path, after: Date().addingTimeInterval(-Self.subagentActivityWindow))
+            || openFanoutAgents(transcriptPath: path) > 0
     }
 
     private func agentActivity(transcriptPath: String) -> AgentActivity? {
         let threshold = Date().addingTimeInterval(-Self.subagentActivityWindow)
+        let runThreshold = Date().addingTimeInterval(-Self.fanoutRunWindow)
         let resolved = resolvedTools(transcriptPath: transcriptPath)
         let working = Self.sidecarDirs(transcriptPath: transcriptPath)
-            .flatMap { subagents(in: $0, threshold: threshold, resolved: resolved) }
+            .flatMap {
+                subagents(
+                    in: $0, threshold: threshold, runThreshold: runThreshold, resolved: resolved)
+            }
             .filter(\.active)
         guard !working.isEmpty else { return nil }
         return AgentActivity(
@@ -184,18 +192,28 @@ actor TranscriptIndex {
     func subagents(for id: String) -> [SubagentSummary] {
         guard let transcriptPath = path(for: id) else { return [] }
         let threshold = Date().addingTimeInterval(-Self.subagentActivityWindow)
+        let runThreshold = Date().addingTimeInterval(-Self.fanoutRunWindow)
         let resolved = resolvedTools(transcriptPath: transcriptPath)
         return Self.sidecarDirs(transcriptPath: transcriptPath).flatMap { dir in
-            subagents(in: dir, threshold: threshold, resolved: resolved)
+            subagents(
+                in: dir, threshold: threshold, runThreshold: runThreshold, resolved: resolved)
         }
         .sorted { $0.updatedAt > $1.updatedAt }
     }
 
     static let subagentActivityWindow: TimeInterval = 90
 
+    /// How long a fan-out whose ledger says agents are still out may go quiet and still be called
+    /// alive. Ninety seconds is a tool's scale, not a run's: measured across every workflow run
+    /// recorded on a working machine, a third of them go quiet for longer than that between
+    /// writes while demonstrably still alive, and the longest such silence was near half an hour.
+    /// The bound exists at all because a harness that died leaves its ledger unbalanced forever.
+    static let fanoutRunWindow: TimeInterval = 30 * 60
+
     private var resolvedCache: [String: (offset: Int, ids: Set<String>)] = [:]
     private var progressCache: [String: SubagentProgress] = [:]
-    private var journalCache: [String: (offset: Int, ids: Set<String>)] = [:]
+    private var journalCache: [String: (offset: Int, started: Set<String>, completed: Set<String>)] =
+        [:]
 
     /// These three are parse-avoidance for files that only grow, so they hold ids for every
     /// session and sidecar ever polled. A machine left running for weeks reaches thousands; the
@@ -247,35 +265,90 @@ actor TranscriptIndex {
         return cached.ids
     }
 
-    /// Agent ids a workflow run's journal records a result for — the
-    /// completion signal for workflow agents, which have no spawning Task
-    /// tool call in the parent transcript.
+    /// What a fan-out's own journal records: which agents it started, and which have reported a
+    /// result. The difference is a timestamp-free proof that work is still out — the only one
+    /// available for a workflow agent, which has no spawning Task tool call in the parent
+    /// transcript to resolve against.
+    ///
     /// Incremental like ``resolvedTools``: a journal is append-only and this is asked for on every
-    /// subagent poll, so only the bytes since the last look are parsed. A result already recorded
+    /// subagent poll, so only the bytes since the last look are parsed. A line already recorded
     /// stays recorded.
-    private func journalCompletedAgentIDs(in dir: URL) -> Set<String> {
+    private func journalLedger(in dir: URL) -> (started: Set<String>, completed: Set<String>) {
         let path = dir.appendingPathComponent("journal.jsonl").path
-        var cached = journalCache[path] ?? (0, [])
-        guard let handle = FileHandle(forReadingAtPath: path) else { return cached.ids }
+        var cached = journalCache[path] ?? (0, [], [])
+        guard let handle = FileHandle(forReadingAtPath: path) else {
+            return (cached.started, cached.completed)
+        }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
-        if size < cached.offset { cached = (0, []) }
-        guard size > cached.offset else { return cached.ids }
+        if size < cached.offset { cached = (0, [], []) }
+        guard size > cached.offset else { return (cached.started, cached.completed) }
         try? handle.seek(toOffset: UInt64(cached.offset))
         guard let data = try? handle.read(upToCount: size - cached.offset) else {
-            return cached.ids
+            return (cached.started, cached.completed)
         }
         TranscriptParser.forEachJSONLine(in: data, dropIncompleteTail: false) { object in
-            if object["type"] as? String == "result",
-                let agentID = object["agentId"] as? String
-            {
-                cached.ids.insert(agentID)
+            guard let agentID = object["agentId"] as? String else { return true }
+            switch object["type"] as? String {
+            case "started": cached.started.insert(agentID)
+            case "result": cached.completed.insert(agentID)
+            default: break
             }
             return true
         }
         cached.offset += completeBytes(in: data)
         journalCache[path] = cached
-        return cached.ids
+        return (cached.started, cached.completed)
+    }
+
+    /// The file the harness writes only once a run has ended. Its absence is a one-`stat` proof
+    /// that the run has not.
+    nonisolated static func completionMarker(transcriptPath: String, runID: String) -> String? {
+        guard transcriptPath.hasSuffix(".jsonl") else { return nil }
+        return String(transcriptPath.dropLast(".jsonl".count)) + "/workflows/\(runID).json"
+    }
+
+    /// How many agents a session's fan-outs still have out.
+    ///
+    /// A background run is the one kind of work whose parent turn genuinely closes at second one —
+    /// the launch answers within milliseconds and the model stops speaking — so neither of the two
+    /// mtime facts liveness was built on can see it: the parent's turn is closed, and a run whose
+    /// agents are thinking writes nothing for minutes at a time. The run's own ledger can, and it
+    /// says so without a clock. The window is only the bound on a harness that died mid-run.
+    private func unfinishedFanoutAgents(transcriptPath: String) -> Int {
+        let threshold = Date().addingTimeInterval(-Self.fanoutRunWindow)
+        var open = 0
+        for dir in Self.sidecarDirs(transcriptPath: transcriptPath) {
+            let runID = dir.lastPathComponent
+            guard runID != "subagents" else { continue }
+            if let marker = Self.completionMarker(transcriptPath: transcriptPath, runID: runID),
+                Self.statMtime(marker) != nil
+            {
+                continue
+            }
+            let ledger = journalLedger(in: dir)
+            let unfinished = ledger.started.subtracting(ledger.completed)
+            guard !unfinished.isEmpty else { continue }
+            guard let latest = Self.newestJSONL(in: dir), latest > threshold else { continue }
+            open += unfinished.count
+        }
+        return open
+    }
+
+    nonisolated private static func newestJSONL(in dir: URL) -> Date? {
+        guard
+            let files = try? FileManager.default.contentsOfDirectory(
+                at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
+                options: .skipsHiddenFiles)
+        else { return nil }
+        return
+            files
+            .filter { $0.pathExtension == "jsonl" }
+            .compactMap {
+                (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate
+            }
+            .max()
     }
 
     /// How much of a read ends on a line boundary. A trailing partial line is read for what it
@@ -286,10 +359,14 @@ actor TranscriptIndex {
         return data.distance(from: data.startIndex, to: last) + 1
     }
 
-    private func subagents(in dir: URL, threshold: Date, resolved: Set<String>)
-        -> [SubagentSummary]
-    {
-        let journalCompleted = journalCompletedAgentIDs(in: dir)
+    /// - Parameter runThreshold: the scale a *fan-out's* agent is judged on. An agent the run's own
+    ///   journal started and has no result for is out until the journal says otherwise, however
+    ///   long it thinks; the tool-scale `threshold` is for the agents no ledger accounts for.
+    private func subagents(
+        in dir: URL, threshold: Date, runThreshold: Date, resolved: Set<String>
+    ) -> [SubagentSummary] {
+        let ledger = journalLedger(in: dir)
+        let journalCompleted = ledger.completed
         guard
             let files = try? FileManager.default.contentsOfDirectory(
                 at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
@@ -326,7 +403,9 @@ actor TranscriptIndex {
                 let completed =
                     toolUseID.map(resolved.contains) ?? false
                     || journalCompleted.contains(agentID)
-                let active = !completed && lastContent > threshold
+                let active =
+                    !completed
+                    && lastContent > (ledger.started.contains(agentID) ? runThreshold : threshold)
                 var summary = SubagentSummary(
                     id: agentID,
                     title: title, agentType: agentType, toolUseID: toolUseID,
@@ -487,7 +566,9 @@ actor TranscriptIndex {
 
     private struct SidecarProbe {
         var latest: Date?
+        var openAgents: Int
         var dirStamps: [String: Date]
+        var journalSizes: [String: Int]
         var checkedAt: ContinuousClock.Instant
         var walkedAt: ContinuousClock.Instant
     }
@@ -507,27 +588,69 @@ actor TranscriptIndex {
     /// directory mtime can betray (an old file appended with no new neighbour), so even that
     /// heals inside two minutes.
     private func sidecarLatest(transcriptPath: String) -> Date? {
+        probe(transcriptPath: transcriptPath).latest
+    }
+
+    /// How many agents this session's fan-outs still have out, from the same memoized walk.
+    private func openFanoutAgents(transcriptPath: String) -> Int {
+        probe(transcriptPath: transcriptPath).openAgents
+    }
+
+    /// A journal that grew is work that happened, whatever the directory mtimes say: an agent
+    /// appending to a file it already created stamps nothing, and a run whose last write was
+    /// minutes ago is cold by the sidecar rule while still very much alive. Reading the ledgers'
+    /// sizes costs one `stat` each and is what keeps a cold-trusted probe from outliving the truth.
+    nonisolated private static func journalSizes(transcriptPath: String) -> [String: Int] {
+        var sizes: [String: Int] = [:]
+        for dir in sidecarDirs(transcriptPath: transcriptPath) where
+            dir.lastPathComponent != "subagents"
+        {
+            let path = dir.appendingPathComponent("journal.jsonl").path
+            if let size = statSize(path) { sizes[path] = size }
+        }
+        return sizes
+    }
+
+    private func probe(transcriptPath: String) -> SidecarProbe {
         let now = ContinuousClock.now
         if let probe = sidecarProbes[transcriptPath] {
-            if now - probe.checkedAt < Self.sidecarProbeDebounce { return probe.latest }
+            if now - probe.checkedAt < Self.sidecarProbeDebounce { return probe }
             let warm =
-                probe.latest.map {
+                probe.openAgents > 0
+                || probe.latest.map {
                     Date().timeIntervalSince($0) < Self.subagentActivityWindow * 3
                 } ?? false
             if !warm, now - probe.walkedAt < Self.sidecarColdRecheck,
-                Self.sidecarDirStamps(transcriptPath: transcriptPath) == probe.dirStamps
+                Self.sidecarDirStamps(transcriptPath: transcriptPath) == probe.dirStamps,
+                Self.journalSizes(transcriptPath: transcriptPath) == probe.journalSizes
             {
                 sidecarProbes[transcriptPath]?.checkedAt = now
-                return probe.latest
+                return probe
             }
         }
         let stamps = Self.sidecarDirStamps(transcriptPath: transcriptPath)
         let latest =
             stamps.isEmpty
             ? nil : TranscriptParser.sidecarActivity(transcriptPath: transcriptPath)
-        sidecarProbes[transcriptPath] = SidecarProbe(
-            latest: latest, dirStamps: stamps, checkedAt: now, walkedAt: now)
-        return latest
+        let fresh = SidecarProbe(
+            latest: latest,
+            openAgents: stamps.isEmpty ? 0 : unfinishedFanoutAgents(transcriptPath: transcriptPath),
+            dirStamps: stamps,
+            journalSizes: stamps.isEmpty ? [:] : Self.journalSizes(transcriptPath: transcriptPath),
+            checkedAt: now, walkedAt: now)
+        sidecarProbes[transcriptPath] = fresh
+        return fresh
+    }
+
+    /// The sessions whose fan-outs still have agents out, keyed like the rest of the sweep. Read
+    /// from the same memoized probe, so asking costs nothing the sweep was not already paying.
+    func openFanoutIDs() -> Set<String> {
+        scan()
+        var ids = Set<String>()
+        for (id, path) in pathByID where openFanoutAgents(transcriptPath: path) > 0 {
+            ids.insert(id)
+        }
+        return ids
     }
 
     /// The memoized probe for every known session at once, keyed by session id — one actor call
@@ -725,6 +848,7 @@ actor TranscriptIndex {
         let active =
             (!turnClosed && entry.updatedAt > threshold)
             || isSidecarActive(transcriptPath: entry.path, after: threshold)
+            || openFanoutAgents(transcriptPath: entry.path) > 0
         let agents = active ? agentActivity(transcriptPath: entry.path) : nil
         return SessionSummary(
             id: entry.id,

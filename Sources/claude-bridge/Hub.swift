@@ -224,11 +224,12 @@ actor ObserverLoop {
     private func publishAgentChanges() async {
         let threshold = Date().addingTimeInterval(-TranscriptIndex.subagentActivityWindow)
         let latests = await index.sidecarLatestsByID()
+        let fanouts = await index.openFanoutIDs()
         let paths = await index.pathsByID()
         for (claudeID, _) in paths {
             let hasRecent = latests[claudeID].map { $0 > threshold } ?? false
             let hadAgents = !(lastAgents[claudeID] ?? []).isEmpty
-            guard hasRecent || hadAgents else { continue }
+            guard hasRecent || hadAgents || fanouts.contains(claudeID) else { continue }
             let agents = await index.subagents(for: claudeID)
             let live = agents.filter { $0.active == true }
             guard live != (lastAgents[claudeID] ?? []) else { continue }
