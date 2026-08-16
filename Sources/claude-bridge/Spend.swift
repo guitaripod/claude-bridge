@@ -265,7 +265,10 @@ enum SpendReader {
         return String(value.prefix(160))
     }
 
-    private static func tokens(in usage: [String: Any]) -> TokenCounts {
+    /// The tiers out of one API call's `usage` block. Shared with the transcript fold, which
+    /// prices each turn as it builds it so a client can show what one answer cost without asking
+    /// for the whole conversation's ledger.
+    static func tokens(in usage: [String: Any]) -> TokenCounts {
         var counts = TokenCounts()
         counts.input = usage["input_tokens"] as? Int ?? 0
         counts.output = usage["output_tokens"] as? Int ?? 0

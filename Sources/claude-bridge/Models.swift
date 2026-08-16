@@ -92,6 +92,22 @@ struct Message: Codable, Sendable {
     var role: Role
     var parts: [Part]
     var createdAt: Date
+    /// How long the turn took: from the moment the person pressed return to the last thing the
+    /// turn wrote, which is the wait they actually had rather than the model's own share of it.
+    /// It grows while the turn does and stops because the turn stopped. Deliberately not a second
+    /// timestamp — a message that carries an end stamp reads as finished to everything that has
+    /// to tell a live turn from a settled one, and this bridge stamps no completion.
+    var seconds: Double?
+    /// What answered, as the CLI recorded it on the turn's own API calls — never the session's
+    /// configured model, which is what it would run *next* rather than what it just ran.
+    var model: String?
+    /// Everything the turn's calls consumed, added up with each API message charged exactly once:
+    /// the CLI repeats a call's usage on every line it writes for that call, so counting lines
+    /// inflates a turn by nearly two.
+    var usage: TokenCounts?
+    /// Priced from the same rate table the spend report uses, so a turn's own account and the
+    /// conversation's total can never disagree. An estimate, and every surface says so.
+    var costUSD: Double?
 }
 
 struct Session: Codable, Sendable {

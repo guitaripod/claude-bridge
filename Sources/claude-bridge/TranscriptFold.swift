@@ -54,6 +54,13 @@ struct TranscriptFold: Sendable {
     private var pending = Data()
     /// The compaction boundary still waiting for the summary record that always follows it.
     private var openCompactionIndex: Int?
+    /// API message ids already charged, so a call whose usage the CLI repeats on every line it
+    /// writes is counted once. Held for the whole fold rather than per turn: the same id never
+    /// spans two turns, and a set that outlives them cannot be reset in the wrong place.
+    private var chargedMessages: Set<String> = []
+    /// When the person last pressed return. A turn begins there rather than at its own first line,
+    /// because the queue and the model's first thought are part of what the wait was.
+    private var lastPromptAt: Date?
     private let includeSidechain: Bool
     /// The session whose transcript this is, carried into image URLs so the
     /// bytes can be recovered from the transcript when the file is gone.
@@ -131,6 +138,7 @@ struct TranscriptFold: Sendable {
                         ?? TranscriptParser.commandText(content)
                 else { return }
                 flushTurn()
+                lastPromptAt = stamp
                 messages.append(
                     Message(
                         id: uuid, role: .user, parts: Self.userParts(text), createdAt: stamp))
@@ -160,6 +168,7 @@ struct TranscriptFold: Sendable {
                 }
                 if !texts.isEmpty {
                     flushTurn()
+                    lastPromptAt = stamp
                     messages.append(
                         Message(
                             id: uuid, role: .user,
@@ -173,6 +182,7 @@ struct TranscriptFold: Sendable {
             if turn == nil {
                 turn = Message(id: uuid, role: .assistant, parts: [], createdAt: stamp)
             }
+            charge(message, at: stamp, changed: &changed)
             for block in blocks {
                 switch block["type"] as? String {
                 case "thinking":
@@ -370,6 +380,27 @@ struct TranscriptFold: Sendable {
 
     private mutating func markTurnChanged(_ changed: inout Set<String>) {
         if let id = turn?.id { changed.insert(id) }
+    }
+
+    /// What the open turn's API calls consumed, priced, with each call charged exactly once.
+    ///
+    /// The CLI writes a line per content block and repeats that call's `usage` on every one of
+    /// them, so a turn counted line by line reads nearly twice what it cost. The API message id is
+    /// what identifies a call; a line without one is charged, because a call seen once is closer
+    /// to the truth than a call dropped.
+    private mutating func charge(_ message: [String: Any], at stamp: Date, changed: inout Set<String>) {
+        guard var open = turn else { return }
+        open.seconds = max(0, stamp.timeIntervalSince(lastPromptAt ?? open.createdAt))
+        let model = message["model"] as? String
+        if open.model == nil, let model { open.model = model }
+        defer { turn = open }
+        guard let usage = message["usage"] as? [String: Any],
+            (message["id"] as? String).map({ chargedMessages.insert($0).inserted }) ?? true
+        else { return }
+        let counts = SpendReader.tokens(in: usage)
+        open.usage = (open.usage ?? TokenCounts()) + counts
+        open.costUSD = (open.costUSD ?? 0) + Rate.forModel(model ?? "").cost(of: counts)
+        changed.insert(open.id)
     }
 
     private mutating func flushTurn() {
