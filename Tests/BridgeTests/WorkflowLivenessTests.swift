@@ -67,13 +67,14 @@ import Testing
             to: journalURL, atomically: true, encoding: .utf8)
 
         let stamp = Date().addingTimeInterval(-agentAge)
+        let stampText = ISO8601DateFormatter().string(from: stamp)
         try FileManager.default.setAttributes(
             [.modificationDate: stamp], ofItemAtPath: journalURL.path)
         for index in 0..<started {
             let file = runDir.appendingPathComponent("agent-a\(index).jsonl")
             try line([
                 "type": "assistant", "uuid": "s\(index)",
-                "timestamp": "2026-08-15T09:00:03.000Z",
+                "timestamp": stampText,
                 "message": ["role": "assistant", "content": [["type": "text", "text": "working"]]],
             ]).write(to: file, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes(
