@@ -11,7 +11,7 @@ import Testing
             "monthly": ["status": "ok", "percent": 47, "resetsAt": "2026-09-07T21:43:55.405Z"],
         ])
         #expect(snapshot.live)
-        #expect(snapshot.providerName == "opencode go")
+        #expect(snapshot.providerName == "opencode")
         #expect(snapshot.subtitle == "$10/mo")
         #expect(snapshot.source.contains("live"))
         #expect(snapshot.gauges.count == 3)
