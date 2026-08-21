@@ -100,13 +100,14 @@ enum OpenCodeGoUsage {
             throw Failure.message("usage endpoint returned no windows")
         }
         return UsageSnapshot(
-            providerName: "opencode",
+            providerName: "opencode go",
             subtitle: "$10/mo",
             source: "opencode.ai Go usage API · live",
             live: true,
             gauges: gauges,
             details: [
-                UsageDetail(key: "Counted by", value: "opencode.ai · account-wide")
+                UsageDetail(key: "Counted by", value: "opencode.ai · account-wide"),
+                UsageDetail(key: "Not counted", value: "zen free models bill nothing to this plan")
             ],
             error: nil)
     }
@@ -126,7 +127,7 @@ enum OpenCodeGoUsage {
             gauge(key: "monthly", label: "Monthly", used: spent["monthly"] ?? 0, limit: limits.monthly),
         ]
         return UsageSnapshot(
-            providerName: "opencode",
+            providerName: "opencode go",
             subtitle: "$10/mo",
             source: "opencode.db · this machine · estimated",
             live: true,
@@ -237,7 +238,7 @@ enum OpenCodeGoUsage {
 
     private static func unavailable(_ reason: String) -> UsageSnapshot {
         UsageSnapshot(
-            providerName: "opencode", subtitle: "$10/mo",
+            providerName: "opencode go", subtitle: "$10/mo",
             source: "opencode.db", live: false, gauges: [], details: [], error: reason)
     }
 
