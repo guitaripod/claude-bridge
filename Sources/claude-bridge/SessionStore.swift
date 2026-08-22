@@ -771,7 +771,8 @@ actor SessionStore {
         let attempts = autoContinues[id] ?? 0
         guard attempts < AutoContinue.limit else { return }
         let pending = BackgroundScan.pending(
-            claudeSessionID: session.claudeSessionID, directory: session.directory)
+            claudeSessionID: session.claudeSessionID,
+            directory: session.directory ?? runner.workdir)
         let fresh = pending.workflows.filter { !(handledOrphans[id]?.contains($0) ?? false) }
         guard !fresh.isEmpty else {
             autoContinues[id] = 0
