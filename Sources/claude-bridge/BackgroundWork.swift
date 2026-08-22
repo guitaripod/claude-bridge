@@ -72,9 +72,12 @@ enum BackgroundScan {
         return PendingBackground(workflows: orphans.sorted { $0.id < $1.id })
     }
 
-    /// A journal holding more `started` lines than `result` lines never delivered every agent it
-    /// launched. Comparing the two counts is deliberate: a run that legitimately returned early
-    /// still balances, and a run killed mid-fan-out cannot.
+    /// An agent that started and has no result under the same key never came back.
+    ///
+    /// Keys, not line counts. Resuming a run re-emits `started` for every agent it replays from
+    /// cache without writing a second `result`, so a finished run that was resumed twice reads as
+    /// twenty starts against seven results — and counting lines would call it orphaned forever.
+    /// The key is the call's own identity, so matching on it survives any number of resumes.
     private static func orphanProgress(_ run: URL, now: Date) -> Int? {
         let journal = run.appendingPathComponent("journal.jsonl")
         guard let modified = try? journal.resourceValues(forKeys: [.contentModificationDateKey])
@@ -82,14 +85,21 @@ enum BackgroundScan {
             now.timeIntervalSince(modified) < recency,
             let text = try? String(contentsOf: journal, encoding: .utf8)
         else { return nil }
-        var started = 0
-        var finished = 0
+        var started = Set<String>()
+        var finished = Set<String>()
         for line in text.split(separator: "\n") {
-            if line.contains("\"type\":\"started\"") { started += 1 }
-            if line.contains("\"type\":\"result\"") { finished += 1 }
+            guard let data = line.data(using: .utf8),
+                let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let key = row["key"] as? String
+            else { continue }
+            switch row["type"] as? String {
+            case "started": started.insert(key)
+            case "result": finished.insert(key)
+            default: continue
+            }
         }
-        guard started > finished else { return nil }
-        return started + finished
+        guard !started.subtracting(finished).isEmpty else { return nil }
+        return started.count + finished.count
     }
 }
 
