@@ -165,6 +165,10 @@ struct SessionSummary: Codable, Sendable, Equatable {
     /// thing a list can say about it.
     var agents: Int?
     var agentTask: String?
+    /// This turn is one the bridge started by itself to finish background work the previous turn
+    /// was killed in the middle of. A row that cannot say this shows a conversation apparently
+    /// talking to itself.
+    var resuming: Bool?
 }
 
 /// The agents working for one session, as a list row can describe them.

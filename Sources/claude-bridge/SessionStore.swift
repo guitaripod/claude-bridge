@@ -68,6 +68,14 @@ actor SessionStore {
     /// a second `claude -p --resume` against the same transcript in the same working directory.
     private var inFlight: Set<String> = []
     private var pendingPrompts: [String: [QueuedPrompt]] = [:]
+    /// How many turns in a row this bridge has started on its own to finish background work the
+    /// previous turn left running. Reset by any prompt a person sends, so the cap only ever counts
+    /// unattended continuations.
+    private var autoContinues: [String: Int] = [:]
+    /// Workflow runs this bridge has already offered to pick up, per session. A run stays orphaned
+    /// on disk forever once it is abandoned, so without this the same dead workflow would restart
+    /// the session every time a person sent anything.
+    private var handledOrphans: [String: Set<String>] = [:]
     /// The same two facts — what is running, what is waiting — written where they survive the
     /// process. Everything above this line is lost the moment the machine stops, which is exactly
     /// when it matters most.
@@ -173,6 +181,9 @@ actor SessionStore {
             }
             if let interruption = session.interruption, !interruption.isResumed {
                 summary.interrupted = true
+            }
+            if (autoContinues[id] ?? 0) > 0, summary.active == true {
+                summary.resuming = true
             }
             return summary
         }
@@ -323,6 +334,7 @@ actor SessionStore {
     /// still has to exist in the transcript.
     @discardableResult
     func send(_ id: String, request: SendRequest) -> SendOutcome {
+        autoContinues[id] = 0
         let upload = storeAttachments(for: request, sessionID: id)
         return accept(
             id, display: request.text, runnerPrompt: upload.prompt, files: upload.files,
@@ -698,7 +710,10 @@ actor SessionStore {
             releaseRunnerTurn(newID)
             lastRunnerFinish[newID] = Date()
         }
-        defer { advanceQueue(id) }
+        defer {
+            queueBackgroundContinuation(id)
+            advanceQueue(id)
+        }
         guard var session = sessions[id] else { return }
         if let existing = session.messages.firstIndex(where: { $0.id == outcome.message.id }) {
             session.messages[existing] = outcome.message
@@ -739,6 +754,41 @@ actor SessionStore {
                 sessionID: id, title: title, toolCount: toolCount, failed: false,
                 duration: turnDuration, goal: goal)
         }
+    }
+
+    /// Queues one more turn when the one that just ended left background work running.
+    ///
+    /// A headless `claude -p` is one process per turn, so a workflow or a background command still
+    /// going when the turn's answer lands is killed with the process. The harness records the
+    /// orphans and picks them up on the next prompt — which, without this, has to be a person
+    /// noticing a session that looks finished and typing something. Sending that prompt here is
+    /// what makes an unattended run actually unattended. It queues rather than starts: the turn
+    /// slot is still held at this point and ``advanceQueue`` runs immediately after.
+    private func queueBackgroundContinuation(_ id: String) {
+        guard pendingPrompts[id]?.isEmpty ?? true else { return }
+        guard let session = sessions[id] else { return }
+        guard session.interruption == nil else { return }
+        let attempts = autoContinues[id] ?? 0
+        guard attempts < AutoContinue.limit else { return }
+        let pending = BackgroundScan.pending(
+            claudeSessionID: session.claudeSessionID, directory: session.directory)
+        let fresh = pending.workflows.filter { !(handledOrphans[id]?.contains($0) ?? false) }
+        guard !fresh.isEmpty else {
+            autoContinues[id] = 0
+            return
+        }
+        handledOrphans[id, default: []].formUnion(fresh)
+        autoContinues[id] = attempts + 1
+        let pendingFresh = PendingBackground(workflows: fresh)
+        let message = Message(
+            id: UUID().uuidString, role: .user,
+            parts: [.text(pendingFresh.reason + " Picking it back up.")], createdAt: Date())
+        sessions[id]?.messages.append(message)
+        broadcaster(for: id).send(.messageUpserted(message))
+        pendingPrompts[id, default: []].append(
+            QueuedPrompt(
+                prompt: AutoContinue.prompt, displayPrompt: pendingFresh.reason + " Picking it back up.",
+                model: nil, effort: nil))
     }
 
     /// Starts whatever queued behind the turn that just ended, or gives the session's turn slot
