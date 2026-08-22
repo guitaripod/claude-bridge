@@ -8,9 +8,18 @@ import Foundation
 /// person watching from a phone sees a session that looks finished, and has to send something,
 /// anything, before the work picks itself back up. Naming the orphans here is what lets the bridge
 /// send that something on their behalf.
+/// One workflow run that outlived nothing, and how far its journal had got when we looked.
+///
+/// The progress mark is what separates a run still worth continuing from one that is simply
+/// stuck: offered once and unchanged since, it is abandoned; longer than last time, it moved.
+struct OrphanedRun: Sendable, Equatable {
+    var id: String
+    var progress: Int
+}
+
 struct PendingBackground: Sendable, Equatable {
-    /// Workflow run ids whose journal records agents that started and never returned.
-    var workflows: [String]
+    /// Workflow runs whose journal records agents that started and never returned.
+    var workflows: [OrphanedRun]
 
     var isEmpty: Bool { workflows.isEmpty }
 
@@ -56,27 +65,31 @@ enum BackgroundScan {
         guard let runs = try? FileManager.default.contentsOfDirectory(
             at: root, includingPropertiesForKeys: [.contentModificationDateKey])
         else { return .none }
-        return PendingBackground(
-            workflows: runs.filter { isOrphaned($0, now: now) }.map(\.lastPathComponent).sorted())
+        let orphans = runs.compactMap { run -> OrphanedRun? in
+            guard let progress = orphanProgress(run, now: now) else { return nil }
+            return OrphanedRun(id: run.lastPathComponent, progress: progress)
+        }
+        return PendingBackground(workflows: orphans.sorted { $0.id < $1.id })
     }
 
     /// A journal holding more `started` lines than `result` lines never delivered every agent it
     /// launched. Comparing the two counts is deliberate: a run that legitimately returned early
     /// still balances, and a run killed mid-fan-out cannot.
-    private static func isOrphaned(_ run: URL, now: Date) -> Bool {
+    private static func orphanProgress(_ run: URL, now: Date) -> Int? {
         let journal = run.appendingPathComponent("journal.jsonl")
         guard let modified = try? journal.resourceValues(forKeys: [.contentModificationDateKey])
             .contentModificationDate,
             now.timeIntervalSince(modified) < recency,
             let text = try? String(contentsOf: journal, encoding: .utf8)
-        else { return false }
+        else { return nil }
         var started = 0
         var finished = 0
         for line in text.split(separator: "\n") {
             if line.contains("\"type\":\"started\"") { started += 1 }
             if line.contains("\"type\":\"result\"") { finished += 1 }
         }
-        return started > finished
+        guard started > finished else { return nil }
+        return started + finished
     }
 }
 

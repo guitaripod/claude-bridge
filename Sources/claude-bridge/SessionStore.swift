@@ -72,10 +72,11 @@ actor SessionStore {
     /// previous turn left running. Reset by any prompt a person sends, so the cap only ever counts
     /// unattended continuations.
     private var autoContinues: [String: Int] = [:]
-    /// Workflow runs this bridge has already offered to pick up, per session. A run stays orphaned
-    /// on disk forever once it is abandoned, so without this the same dead workflow would restart
-    /// the session every time a person sent anything.
-    private var handledOrphans: [String: Set<String>] = [:]
+    /// How far each workflow run had got the last time this bridge picked it up, per session. A
+    /// run stays orphaned on disk forever once it is abandoned, so a run that has not moved since
+    /// it was last continued is left alone — while a long one that keeps advancing keeps being
+    /// continued, which is the whole point.
+    private var handledOrphans: [String: [String: Int]] = [:]
     /// The same two facts — what is running, what is waiting — written where they survive the
     /// process. Everything above this line is lost the moment the machine stops, which is exactly
     /// when it matters most.
@@ -773,12 +774,12 @@ actor SessionStore {
         let pending = BackgroundScan.pending(
             claudeSessionID: session.claudeSessionID,
             directory: session.directory ?? runner.workdir)
-        let fresh = pending.workflows.filter { !(handledOrphans[id]?.contains($0) ?? false) }
+        let fresh = pending.workflows.filter { handledOrphans[id]?[$0.id] != $0.progress }
         guard !fresh.isEmpty else {
             autoContinues[id] = 0
             return
         }
-        handledOrphans[id, default: []].formUnion(fresh)
+        for run in fresh { handledOrphans[id, default: [:]][run.id] = run.progress }
         autoContinues[id] = attempts + 1
         let pendingFresh = PendingBackground(workflows: fresh)
         let message = Message(
