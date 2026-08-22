@@ -77,6 +77,8 @@ actor SessionStore {
     /// it was last continued is left alone — while a long one that keeps advancing keeps being
     /// continued, which is the whole point.
     private var handledOrphans: [String: [String: Int]] = [:]
+    /// Sessions asleep until the account has quota again, and when that is.
+    private var cooldowns: [String: Date] = [:]
     /// The same two facts — what is running, what is waiting — written where they survive the
     /// process. Everything above this line is lost the moment the machine stops, which is exactly
     /// when it matters most.
@@ -336,6 +338,7 @@ actor SessionStore {
     @discardableResult
     func send(_ id: String, request: SendRequest) -> SendOutcome {
         autoContinues[id] = 0
+        cooldowns[id] = nil
         let upload = storeAttachments(for: request, sessionID: id)
         return accept(
             id, display: request.text, runnerPrompt: upload.prompt, files: upload.files,
@@ -711,8 +714,9 @@ actor SessionStore {
             releaseRunnerTurn(newID)
             lastRunnerFinish[newID] = Date()
         }
+        let answer = Self.plainText(outcome.message)
         defer {
-            queueBackgroundContinuation(id)
+            queueBackgroundContinuation(id, answer: answer)
             advanceQueue(id)
         }
         guard var session = sessions[id] else { return }
@@ -765,12 +769,16 @@ actor SessionStore {
     /// noticing a session that looks finished and typing something. Sending that prompt here is
     /// what makes an unattended run actually unattended. It queues rather than starts: the turn
     /// slot is still held at this point and ``advanceQueue`` runs immediately after.
-    private func queueBackgroundContinuation(_ id: String) {
+    private func queueBackgroundContinuation(_ id: String, answer: String = "") {
         guard pendingPrompts[id]?.isEmpty ?? true else { return }
         guard let session = sessions[id] else { return }
         guard session.interruption == nil else { return }
         let attempts = autoContinues[id] ?? 0
         guard attempts < AutoContinue.limit else { return }
+        if let lifts = Cooldown.resetsAt(answer) {
+            waitOutCooldown(id, until: lifts)
+            return
+        }
         let pending = BackgroundScan.pending(
             claudeSessionID: session.claudeSessionID,
             directory: session.directory ?? runner.workdir)
@@ -791,6 +799,41 @@ actor SessionStore {
             QueuedPrompt(
                 prompt: AutoContinue.prompt, displayPrompt: pendingFresh.reason + " Picking it back up.",
                 model: nil, effort: nil))
+    }
+
+    /// Sleeps until the account has quota again, then picks the work back up.
+    ///
+    /// A turn that ends on the session limit has not failed at anything except timing, and the
+    /// refusal says when the limit lifts. Queueing a continuation immediately would spend the
+    /// whole cap discovering the limit is still there, so the wait is the fix; a person sending
+    /// anything in the meantime takes the session back and this lets go of it.
+    private func waitOutCooldown(_ id: String, until moment: Date) {
+        guard cooldowns[id] == nil else { return }
+        let generation = (autoContinues[id] ?? 0)
+        cooldowns[id] = moment
+        let notice = Cooldown.notice(moment)
+        let message = Message(
+            id: UUID().uuidString, role: .user, parts: [.text(notice)], createdAt: Date())
+        sessions[id]?.messages.append(message)
+        broadcaster(for: id).send(.messageUpserted(message))
+        Task { [weak self] in
+            let delay = max(0, moment.timeIntervalSinceNow + Cooldown.margin)
+            try? await Task.sleep(for: .seconds(delay))
+            await self?.cooldownLifted(id, generation: generation)
+        }
+    }
+
+    private func cooldownLifted(_ id: String, generation: Int) {
+        guard cooldowns[id] != nil, (autoContinues[id] ?? 0) == generation else { return }
+        cooldowns[id] = nil
+        guard !inFlight.contains(id), sessions[id] != nil else { return }
+        autoContinues[id] = generation + 1
+        inFlight.insert(id)
+        startTurn(
+            id,
+            QueuedPrompt(
+                prompt: AutoContinue.prompt, displayPrompt: AutoContinue.prompt, model: nil,
+                effort: nil))
     }
 
     /// Starts whatever queued behind the turn that just ended, or gives the session's turn slot

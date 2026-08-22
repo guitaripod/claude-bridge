@@ -1,13 +1,5 @@
 import Foundation
 
-/// Work a turn started in the background and did not live long enough to finish.
-///
-/// A headless `claude -p` is one process per turn: workflows, subagents and background shell
-/// commands all live inside it, and the runner terminates it once its output reaches EOF. Anything
-/// still running dies there. The harness notices on the *next* turn and says so — which is why a
-/// person watching from a phone sees a session that looks finished, and has to send something,
-/// anything, before the work picks itself back up. Naming the orphans here is what lets the bridge
-/// send that something on their behalf.
 /// One workflow run that outlived nothing, and how far its journal had got when we looked.
 ///
 /// The progress mark is what separates a run still worth continuing from one that is simply
@@ -17,6 +9,14 @@ struct OrphanedRun: Sendable, Equatable {
     var progress: Int
 }
 
+/// Work a turn started in the background and did not live long enough to finish.
+///
+/// A headless `claude -p` is one process per turn: workflows, subagents and background shell
+/// commands all live inside it, and the runner terminates it once its output reaches EOF. Anything
+/// still running dies there. The harness notices on the *next* turn and says so — which is why a
+/// person watching from a phone sees a session that looks finished, and has to send something,
+/// anything, before the work picks itself back up. Naming the orphans here is what lets the bridge
+/// send that something on their behalf.
 struct PendingBackground: Sendable, Equatable {
     /// Workflow runs whose journal records agents that started and never returned.
     var workflows: [OrphanedRun]
@@ -107,4 +107,66 @@ enum AutoContinue {
         rather than finished. Pick it back up: check what was left unfinished, resume it where it \
         can be resumed, and carry on with the task that started it. Do not start over.
         """
+}
+
+/// A turn that ended because the account ran out of session quota rather than because the work
+/// finished.
+///
+/// This is not an error to report and forget: the work is still there, and the only thing standing
+/// between it and finishing is time. The refusal names the hour it lifts, so the bridge can wait
+/// exactly that long and carry on by itself — which is the difference between a run that pauses
+/// overnight and a run that ends there.
+enum Cooldown {
+    /// A little past the stated minute, because a reset announced for 11:10pm is not reliably
+    /// spendable at 11:10:00pm.
+    static let margin: TimeInterval = 90
+
+    static func mentionsLimit(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        return lowered.contains("session limit") || lowered.contains("usage limit")
+            || lowered.contains("rate limit")
+    }
+
+    /// The next moment the stated clock time comes around. A reset "at 11:10pm" written at 8pm is
+    /// tonight; the same words written at 11:30pm mean tomorrow.
+    static func resetsAt(_ text: String, now: Date = Date(), calendar: Calendar = .current) -> Date? {
+        guard mentionsLimit(text), let clock = clock(in: text) else { return nil }
+        var components = calendar.dateComponents([.year, .month, .day], from: now)
+        components.hour = clock.hour
+        components.minute = clock.minute
+        components.second = 0
+        guard let candidate = calendar.date(from: components) else { return nil }
+        if candidate > now { return candidate }
+        return calendar.date(byAdding: .day, value: 1, to: candidate)
+    }
+
+    private static func clock(in text: String) -> (hour: Int, minute: Int)? {
+        let pattern = #"resets\s+(\d{1,2})(?::(\d{2}))?\s*([ap]m)"#
+        guard let expression = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]),
+            let match = expression.firstMatch(
+                in: text, range: NSRange(text.startIndex..., in: text))
+        else { return nil }
+        func group(_ index: Int) -> String? {
+            guard let range = Range(match.range(at: index), in: text) else { return nil }
+            return String(text[range])
+        }
+        guard let rawHour = group(1).flatMap(Int.init), let suffix = group(3)?.lowercased()
+        else { return nil }
+        let minute = group(2).flatMap(Int.init) ?? 0
+        var hour = rawHour % 12
+        if suffix == "pm" { hour += 12 }
+        guard (0..<24).contains(hour), (0..<60).contains(minute) else { return nil }
+        return (hour, minute)
+    }
+
+    static func notice(_ moment: Date, formatter: DateFormatter = Cooldown.formatter) -> String {
+        "The session limit was reached. Picking the work back up at \(formatter.string(from: moment))."
+    }
+
+    static let formatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.timeStyle = .short
+        formatter.dateStyle = .none
+        return formatter
+    }()
 }
