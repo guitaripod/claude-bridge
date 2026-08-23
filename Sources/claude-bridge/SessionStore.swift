@@ -916,6 +916,21 @@ actor SessionStore {
     /// Takes a finished turn back out of the transcript the CLI wrote while nothing was listening,
     /// then drains whatever was queued behind it. Those prompts were accepted and never started —
     /// nothing about them is half-done — so running them is what the session was already promised.
+    /// Takes down a card whose resumed turn ended somewhere other than ``finishTurn``.
+    ///
+    /// A turn picked back up can finish while this bridge is not the thing watching it — the
+    /// process outlived a restart, or the transcript closed and recovery read the answer off disk.
+    /// Those paths clear the journal and the turn slot but used to leave the resumed record
+    /// standing, so the card came back after the work it described was already over and every
+    /// press of it was refused. The record is the promise that a decision is still owed; once the
+    /// decision has been carried out, however the turn ended, the promise is kept.
+    private func settleResumedInterruption(_ id: String) {
+        guard sessions[id]?.interruption?.isResumed == true else { return }
+        sessions[id]?.interruption = nil
+        persist()
+        broadcaster(for: id).send(.interrupted(nil))
+    }
+
     private func settleFromTranscript(_ record: TurnRecord) async {
         let id = record.sessionID
         let claudeID = record.claudeSessionID ?? id
@@ -936,6 +951,7 @@ actor SessionStore {
         turnProcessIDs[id] = nil
         liveTurns[id] = nil
         clearJournal(id)
+        settleResumedInterruption(id)
         let owed = record.queued.map(QueuedPrompt.init)
         guard let first = owed.first else {
             inFlight.remove(id)
