@@ -1355,6 +1355,67 @@ enum TranscriptParser {
         return args.isEmpty ? name : "\(name) \(args)"
     }
 
+    /// Whether a line is one of the harness's background-work reports at all, answered without
+    /// building anything — this is asked of every user line in every transcript.
+    static func isTaskNotification(_ content: String) -> Bool {
+        content.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("<task-notification")
+    }
+
+    /// The report a `<task-notification>` line actually makes, kept whole.
+    ///
+    /// ``taskNotificationSummary`` renders the same line as the one sentence a reader wants in the
+    /// transcript, and in doing so throws away the two ids and the returned value — which are the
+    /// only proof that background work ended and the only way to say which call it belonged to.
+    /// This reads them out instead of paraphrasing them, so the fold can seat the ending on the
+    /// call that started it.
+    ///
+    /// A report naming several tasks at once is the harness sweeping up orphans from a previous
+    /// process; it names no call, so every task it lists is bound by task id alone.
+    static func taskNotification(_ content: String) -> TaskNotification? {
+        guard isTaskNotification(content) else { return nil }
+        let result = tagValue("result", in: content).map(unwrappedJSONString)
+        let taskIDs = tagValues("task-id", in: content).filter { !$0.hasPrefix("__orphan_summary") }
+        return TaskNotification(
+            taskIDs: taskIDs, toolUseID: tagValue("tool-use-id", in: content),
+            status: status(named: tagValue("status", in: content), hasResult: result != nil),
+            summary: tagValue("summary", in: content), result: result)
+    }
+
+    /// A report with no status word said what happened by whether it returned anything; a word this
+    /// bridge does not know means the work ended without claiming success, which is a failure.
+    private static func status(named raw: String?, hasResult: Bool) -> BackgroundOutcome.Status {
+        guard let raw = raw?.lowercased() else { return hasResult ? .completed : .failed }
+        switch raw {
+        case "completed", "success", "succeeded", "ok": return .completed
+        case "stopped", "cancelled", "canceled", "killed", "timeout": return .stopped
+        default: return .failed
+        }
+    }
+
+    /// The harness writes a returned value as JSON, so work answering in prose arrives wrapped in
+    /// quotes with its newlines escaped. A value that is not a JSON string is already its own.
+    private static func unwrappedJSONString(_ body: String) -> String {
+        guard body.hasPrefix("\""), let data = body.data(using: .utf8),
+            let decoded = try? JSONDecoder().decode(String.self, from: data)
+        else { return body }
+        return decoded
+    }
+
+    private static func tagValues(_ tag: String, in content: String) -> [String] {
+        var found: [String] = []
+        var search = content.startIndex
+        while let open = content.range(of: "<\(tag)>", range: search..<content.endIndex),
+            let close = content.range(
+                of: "</\(tag)>", range: open.upperBound..<content.endIndex)
+        {
+            let value = content[open.upperBound..<close.lowerBound]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !value.isEmpty { found.append(value) }
+            search = close.upperBound
+        }
+        return found
+    }
+
     private static func tagValue(_ tag: String, in content: String) -> String? {
         guard let open = content.range(of: "<\(tag)>"),
             let close = content.range(of: "</\(tag)>", range: open.upperBound..<content.endIndex)

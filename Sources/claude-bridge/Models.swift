@@ -19,6 +19,32 @@ struct ToolCall: Codable, Sendable {
     var input: String
     var output: String?
     var status: ToolStatus
+    /// How the work this call handed to the background ended. A tool that starts a workflow or a
+    /// background command answers within milliseconds and the work runs for minutes, so the call's
+    /// own `output` is a receipt for a launch and says nothing about an ending. The harness reports
+    /// the ending in its own line later, naming the call; this is that report seated back on it.
+    var background: BackgroundOutcome?
+}
+
+/// The end of work a tool call handed to the background, as the harness reported it.
+///
+/// The report is a `<task-notification>` line in the transcript, which is condensed to one human
+/// sentence before a client ever sees it — the ids and the returned value inside it are the only
+/// proof a run ended, and prose is not a place to keep proof. So it travels as this instead.
+struct BackgroundOutcome: Codable, Sendable, Equatable {
+    enum Status: String, Codable, Sendable {
+        case completed
+        case failed
+        /// Killed rather than finished — a timeout, a teardown, someone pressing stop. Over, with
+        /// no answer, which is a different fact from a failure.
+        case stopped
+    }
+
+    var taskID: String?
+    var status: Status
+    var summary: String?
+    var result: String?
+    var reportedAt: Date?
 }
 
 /// A file in a conversation: one that travelled with a prompt, or one the agent
@@ -108,6 +134,23 @@ struct Message: Codable, Sendable {
     /// Priced from the same rate table the spend report uses, so a turn's own account and the
     /// conversation's total can never disagree. An estimate, and every surface says so.
     var costUSD: Double?
+}
+
+/// One `<task-notification>` line read whole: which work it reports on, which call started that
+/// work, and how it ended. Internal to the fold — a client is handed the ``BackgroundOutcome`` this
+/// resolves to, seated on the call, rather than a notification it would have to match up itself.
+struct TaskNotification: Sendable, Equatable {
+    var taskIDs: [String]
+    var toolUseID: String?
+    var status: BackgroundOutcome.Status
+    var summary: String?
+    var result: String?
+
+    func outcome(taskID: String?, at reportedAt: Date) -> BackgroundOutcome {
+        BackgroundOutcome(
+            taskID: taskID ?? taskIDs.first, status: status, summary: summary, result: result,
+            reportedAt: reportedAt)
+    }
 }
 
 struct Session: Codable, Sendable {

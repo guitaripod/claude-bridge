@@ -58,6 +58,10 @@ struct TranscriptFold: Sendable {
     /// writes is counted once. Held for the whole fold rather than per turn: the same id never
     /// spans two turns, and a set that outlives them cannot be reset in the wrong place.
     private var chargedMessages: Set<String> = []
+    /// Which call launched which piece of background work, read off the launch banner the tool
+    /// answered with. A report that names the call needs none of this; one sweeping up orphaned
+    /// tasks from a dead process names only their ids, and this is how those still find their call.
+    private var taskLaunches: [String: String] = [:]
     /// When the person last pressed return. A turn begins there rather than at its own first line,
     /// because the queue and the model's first thought are part of what the wait was.
     private var lastPromptAt: Date?
@@ -134,6 +138,7 @@ struct TranscriptFold: Sendable {
         switch type {
         case "user":
             if let content = message["content"] as? String {
+                ingestTaskNotification(content, at: stamp, changed: &changed)
                 guard let text = TranscriptParser.typedText(content)
                         ?? TranscriptParser.commandText(content)
                 else { return }
@@ -157,11 +162,9 @@ struct TranscriptFold: Sendable {
                             mime: ImageResult.mime(block: block, result: line["toolUseResult"]),
                             changed: &changed)
                     case "text":
-                        if let text = (block["text"] as? String)
-                            .flatMap(TranscriptParser.typedText)
-                        {
-                            texts.append(text)
-                        }
+                        guard let raw = block["text"] as? String else { continue }
+                        ingestTaskNotification(raw, at: stamp, changed: &changed)
+                        if let text = TranscriptParser.typedText(raw) { texts.append(text) }
                     default:
                         break
                     }
@@ -416,10 +419,69 @@ struct TranscriptFold: Sendable {
         _ toolID: String, output: String, isError: Bool, changed: inout Set<String>
     ) {
         guard let location = toolLocation[toolID] else { return }
+        rememberLaunchedTask(in: output, of: toolID)
         let update: (inout Message) -> Void = { message in
             guard case .tool(var call) = message.parts[location.partIndex] else { return }
             call.output = String(output.prefix(TranscriptParser.toolOutputLimit))
             call.status = isError ? .error : .completed
+            message.parts[location.partIndex] = .tool(call)
+        }
+        if let index = location.messageIndex {
+            update(&messages[index])
+            changed.insert(messages[index].id)
+        } else if turn != nil {
+            update(&turn!)
+            markTurnChanged(&changed)
+        }
+    }
+
+    /// A tool that hands its work to the background answers with a banner naming the task it just
+    /// started. Reading that one line here is what lets a report arriving minutes later — possibly
+    /// in another process, naming no call at all — find the call it belongs to.
+    private mutating func rememberLaunchedTask(in output: String, of toolID: String) {
+        let banner = output.prefix(Self.launchBannerLimit)
+        guard let range = banner.range(of: "Task ID:") else { return }
+        let id = banner[range.upperBound...].prefix { $0 != "\n" }
+            .trimmingCharacters(in: .whitespaces)
+        guard !id.isEmpty else { return }
+        taskLaunches[id] = toolID
+    }
+
+    /// How far into a tool's output a launch banner is looked for. Every tool result in every
+    /// transcript is offered to this, and a banner announces itself in its first line or two — so
+    /// the bound is what keeps a megabyte of `Read` output from being scanned for a phrase that
+    /// only ever appears at the top of something else.
+    private static let launchBannerLimit = 2_048
+
+    /// The harness's report that background work ended, seated back on the call that started it.
+    ///
+    /// The line itself still becomes the one sentence a reader wants — this runs beside that, not
+    /// instead of it. What it adds is the part prose cannot carry: which call ended, and with what.
+    private mutating func ingestTaskNotification(
+        _ content: String, at stamp: Date, changed: inout Set<String>
+    ) {
+        guard TranscriptParser.isTaskNotification(content),
+            let notification = TranscriptParser.taskNotification(content)
+        else { return }
+        if let toolID = notification.toolUseID, toolLocation[toolID] != nil {
+            resolveBackground(
+                toolID, outcome: notification.outcome(taskID: nil, at: stamp), changed: &changed)
+            return
+        }
+        for taskID in notification.taskIDs {
+            guard let toolID = taskLaunches[taskID] else { continue }
+            resolveBackground(
+                toolID, outcome: notification.outcome(taskID: taskID, at: stamp), changed: &changed)
+        }
+    }
+
+    private mutating func resolveBackground(
+        _ toolID: String, outcome: BackgroundOutcome, changed: inout Set<String>
+    ) {
+        guard let location = toolLocation[toolID] else { return }
+        let update: (inout Message) -> Void = { message in
+            guard case .tool(var call) = message.parts[location.partIndex] else { return }
+            call.background = outcome
             message.parts[location.partIndex] = .tool(call)
         }
         if let index = location.messageIndex {

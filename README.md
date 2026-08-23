@@ -175,7 +175,15 @@ autoTitled?, goal?, interruption?, autoResume?}`.
 transcript boundaries such as compactions.
 `Part` is `{kind: "text"|"reasoning", text}`, `{kind: "tool", tool: ToolCall}`,
 `{kind: "file", file: FileRef}` or `{kind: "compaction", compaction: Compaction}`.
-`ToolCall`: `{id, name, input, output?, status: "running"|"completed"|"error"}`.
+`ToolCall`: `{id, name, input, output?, status: "running"|"completed"|"error", background?}`.
+`background` is `{taskID?, status: "completed"|"failed"|"stopped", summary?, result?, reportedAt?}` —
+how work this call handed to the background ended. A Workflow launch or a `run_in_background`
+command answers within milliseconds and then runs for minutes, so `status` says only that the
+launch worked; the ending arrives later as the harness's own `<task-notification>` line, which the
+transcript renders down to one sentence for the reader and which is read here for the two ids and
+the returned value that sentence cannot carry. The report is matched to its call by
+`<tool-use-id>`, or — for a sweep of orphaned tasks from a dead process, which names no call — by
+the task id the launch banner announced. Absent while the work is still out.
 Dates are ISO 8601. Sessions persist to `BRIDGE_STORE` across restarts. After a session's first
 exchange, a one-shot haiku-model `claude -p` call writes it a 3–6 word title.
 
