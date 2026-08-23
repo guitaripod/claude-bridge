@@ -859,9 +859,21 @@ actor SessionStore {
     }
 
     /// What a resume did with the briefing it composed.
+    ///
+    /// "Already picked up" is its own answer rather than a shade of "nothing to pick up": a client
+    /// whose card raced the resume — a second press, or a card drawn before the broadcast landed —
+    /// is not out of luck, it is out of date, and the two want opposite things done about the card.
     enum ResumeOutcome: Sendable, Equatable {
         case started
         case queued(position: Int)
+        case alreadyResumed(Interruption)
+        case noInterruption
+        case unknownSession
+    }
+
+    /// What letting an interruption go found to let go of.
+    enum DismissOutcome: Sendable, Equatable {
+        case dismissed
         case noInterruption
         case unknownSession
     }
@@ -1027,9 +1039,8 @@ actor SessionStore {
     @discardableResult
     func resumeInterrupted(_ id: String) -> ResumeOutcome {
         guard var session = sessions[id] else { return .unknownSession }
-        guard var interruption = session.interruption, !interruption.isResumed else {
-            return .noInterruption
-        }
+        guard var interruption = session.interruption else { return .noInterruption }
+        guard !interruption.isResumed else { return .alreadyResumed(interruption) }
         interruption.resumedAt = Date()
         session.interruption = interruption
         sessions[id] = session
@@ -1051,13 +1062,14 @@ actor SessionStore {
     /// Lets go of an interruption without continuing it — the work is no longer wanted, or was
     /// done by hand. The record goes; the transcript keeps whatever actually happened.
     @discardableResult
-    func dismissInterruption(_ id: String) -> Bool {
-        guard var session = sessions[id], session.interruption != nil else { return false }
+    func dismissInterruption(_ id: String) -> DismissOutcome {
+        guard var session = sessions[id] else { return .unknownSession }
+        guard session.interruption != nil else { return .noInterruption }
         session.interruption = nil
         sessions[id] = session
         persist()
         broadcaster(for: id).send(.interrupted(nil))
-        return true
+        return .dismissed
     }
 
     @discardableResult

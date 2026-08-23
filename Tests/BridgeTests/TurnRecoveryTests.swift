@@ -335,13 +335,49 @@ struct ResumeTests {
         #expect(session.interruption?.isResumed == true)
     }
 
-    @Test("It is only picked up once")
+    @Test("It is only picked up once, and the second press is told which conflict it hit")
     func resumeIsIdempotent() async throws {
         let wreck = try Wreckage()
         defer { wreck.cleanup() }
         let (store, id) = try await interrupted(wreck)
         #expect(await store.resumeInterrupted(id) == .started)
-        #expect(await store.resumeInterrupted(id) == .noInterruption)
+        let second = await store.resumeInterrupted(id)
+        guard case .alreadyResumed(let record) = second else {
+            Issue.record("a second press is already-resumed, not nothing-to-resume: \(second)")
+            return
+        }
+        #expect(record.isResumed)
+        #expect(record.prompt == (await store.interruption(id))?.prompt)
+    }
+
+    @Test("A refused press states a reason and the state the card was wrong about")
+    func refusalIsMachineReadable() async throws {
+        let wreck = try Wreckage()
+        defer { wreck.cleanup() }
+        let (store, id) = try await interrupted(wreck)
+        #expect(await store.resumeInterrupted(id) == .started)
+        let record = try #require(await store.interruption(id))
+
+        let resumed = InterruptionRefused(
+            error: "That turn is already being picked back up.",
+            reason: InterruptionRefused.alreadyResumed, interruption: record)
+        let resumedJSON = String(
+            decoding: try JSONCoding.encoder.encode(resumed), as: UTF8.self)
+        #expect(resumedJSON.contains("\"reason\":\"already_resumed\""))
+        #expect(resumedJSON.contains("\"turnID\""))
+
+        let gone = InterruptionRefused(
+            error: "Nothing to pick up — no turn in this session was interrupted.",
+            reason: InterruptionRefused.nothingInterrupted, interruption: nil)
+        let goneJSON = String(decoding: try JSONCoding.encoder.encode(gone), as: UTF8.self)
+        #expect(goneJSON.contains("\"reason\":\"nothing_interrupted\""))
+        #expect(goneJSON.contains("\"interruption\":null"))
+        #expect(InterruptionRefused.unknownSession == "unknown_session")
+
+        let accepted = ResumeAccepted(queued: false, position: nil, interruption: record)
+        let acceptedJSON = String(decoding: try JSONCoding.encoder.encode(accepted), as: UTF8.self)
+        #expect(acceptedJSON.contains("\"ok\":true"))
+        #expect(acceptedJSON.contains("\"resumedAt\""))
     }
 
     @Test("Nothing to pick up says so instead of sending an empty briefing")
@@ -359,9 +395,11 @@ struct ResumeTests {
         let wreck = try Wreckage()
         defer { wreck.cleanup() }
         let (store, id) = try await interrupted(wreck)
-        #expect(await store.dismissInterruption(id))
+        #expect(await store.dismissInterruption(id) == .dismissed)
         #expect(await store.interruption(id) == nil)
         #expect(await store.resumeInterrupted(id) == .noInterruption)
+        #expect(await store.dismissInterruption(id) == .noInterruption)
+        #expect(await store.dismissInterruption("nope") == .unknownSession)
     }
 
     @Test("A session told to continue on its own does, without being asked")

@@ -146,8 +146,8 @@ All request/response bodies are JSON. When `BRIDGE_PASSWORD` is set, every route
 | GET | `/sessions/:id/usage` | — | `{costUSD?, tokens?}` for the session's last turn |
 | GET | `/sessions/:id/spend` | — | the whole conversation priced turn by turn from the CLI's own transcript — per-turn token tiers (cache write/read split), per-model, always an API-equivalent estimate |
 | GET | `/sessions/:id/interruption` | — | the state of a turn the machine cut off, as `{"interruption": Interruption\|null}` — `null` when there is none |
-| POST | `/sessions/:id/resume` | — | `202`; resumes an interrupted turn with a composed continuation brief — what its own transcript says it already did — never a blind re-send |
-| POST | `/sessions/:id/interruption/dismiss` | — | sets the interruption aside |
+| POST | `/sessions/:id/resume` (also `/sessions/:id/interruption/resume`) | — | `202 {ok, queued, position?, interruption}`; resumes an interrupted turn with a composed continuation brief — what its own transcript says it already did — never a blind re-send. `409 {error, reason, interruption}` when it will not: `reason` is `nothing_interrupted` (`interruption: null`) or `already_resumed` (the record, so the caller can correct its card without asking again); `404 {error, reason: "unknown_session"}` |
+| POST | `/sessions/:id/interruption/dismiss` | — | sets the interruption aside; same refusal shape — `409 nothing_interrupted`, `404 unknown_session` |
 | POST | `/sessions/:id/auto-resume` | `{enabled}` | resume this session's future interruptions automatically |
 | GET | `/sessions/:id/agents` | — | `[SubagentSummary]` — the subagents this session spawned, with what a live one is doing right now (current tool, todo progress) |
 | GET | `/sessions/:id/agents/:agentID` | — | `SubagentTranscript` — that subagent's own messages |
@@ -221,7 +221,16 @@ files touched, commands issued, how far the answer got — and surfaces on the s
 `POST /sessions/:id/resume` continues the turn with a composed brief telling the model what its
 own transcript says it already did — never a blind re-send of the original prompt. `dismiss` sets
 it aside; `auto-resume` (per session, or `BRIDGE_AUTO_RESUME=1` machine-wide) does the resuming
-without being asked.
+without being asked. **While an interruption stands, unattended continuation is off for that
+session** — nothing carries on by itself until it is resumed or dismissed, which is a cost a
+client is expected to state on its card rather than leave a person to discover.
+
+Both presses answer in a shape a client can act on without guessing. A refusal names a machine-
+readable `reason` beside the sentence — `already_resumed` is not `nothing_interrupted`, and only
+the first means the card should stay and start saying the work is going again — and carries the
+interruption the server actually holds (`null` when there is none), so a conflict corrects the
+client's card instead of dead-ending it. Resume answers on `/sessions/:id/interruption/resume`
+too, because shipped clients post that path.
 
 ## Transcript discovery
 

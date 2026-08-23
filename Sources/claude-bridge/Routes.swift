@@ -38,6 +38,43 @@ private struct SendAccepted: Encodable {
     let position: Int?
 }
 
+/// A press on an interrupted turn that the server would not carry out.
+///
+/// The sentence is for the person and the `reason` is for the client: a conflict proves the card
+/// is out of date, and what to do about it differs by reason — nothing interrupted means the card
+/// goes, already resumed means the card stays and starts saying the work is going again. The
+/// interruption the server actually holds travels with the refusal, `null` included, so no client
+/// has to guess or ask twice about the state it was just told it had wrong.
+struct InterruptionRefused: Encodable {
+    static let nothingInterrupted = "nothing_interrupted"
+    static let alreadyResumed = "already_resumed"
+    static let unknownSession = "unknown_session"
+
+    let error: String
+    let reason: String
+    let interruption: Interruption?
+
+    private enum CodingKeys: String, CodingKey {
+        case error, reason, interruption
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(error, forKey: .error)
+        try container.encode(reason, forKey: .reason)
+        try container.encode(interruption, forKey: .interruption)
+    }
+}
+
+/// An accepted press, carrying the record it just stamped so a client can draw "picking it back
+/// up" from the answer it already has rather than from a race between a refetch and a broadcast.
+struct ResumeAccepted: Encodable {
+    let ok = true
+    let queued: Bool
+    let position: Int?
+    let interruption: Interruption?
+}
+
 private struct AbortResult: Encodable {
     let ok = true
     let stopped: Bool
@@ -607,28 +644,67 @@ func registerRoutes(
         return jsonResponse(["interruption": interruption])
     }
 
-    router.post("sessions/:id/resume") { _, context in
+    /// Picking an interrupted turn back up.
+    ///
+    /// Every answer here is one a client can act on without a second request: an accepted press
+    /// carries the record it just stamped, and a refused one carries both why — as a code, so
+    /// "already being picked up" is never read as "there was nothing there" — and the interruption
+    /// the server actually holds, which is the state the client's card was wrong about.
+    ///
+    /// It answers on two paths. Shipped clients post the interruption's own
+    /// (`sessions/:id/interruption/resume`); serving that alongside `sessions/:id/resume` is what
+    /// keeps a card on a phone nobody is going to update today from dead-ending on a bare 404.
+    @Sendable func pickBackUp(_ request: Request, _ context: BasicRequestContext) async -> Response {
         let id = context.parameters.get("id") ?? ""
         switch await store.resumeInterrupted(id) {
         case .unknownSession:
-            return jsonResponse(["error": "not found"], status: .notFound)
+            return jsonResponse(
+                ["error": "not found", "reason": InterruptionRefused.unknownSession],
+                status: .notFound)
         case .noInterruption:
             return jsonResponse(
-                ["error": "Nothing to pick up — no turn in this session was interrupted."],
+                InterruptionRefused(
+                    error: "Nothing to pick up — no turn in this session was interrupted.",
+                    reason: InterruptionRefused.nothingInterrupted, interruption: nil),
+                status: .conflict)
+        case .alreadyResumed(let interruption):
+            return jsonResponse(
+                InterruptionRefused(
+                    error: "That turn is already being picked back up.",
+                    reason: InterruptionRefused.alreadyResumed, interruption: interruption),
                 status: .conflict)
         case .started:
-            return jsonResponse(SendAccepted(queued: false, position: nil), status: .accepted)
+            return jsonResponse(
+                ResumeAccepted(
+                    queued: false, position: nil, interruption: await store.interruption(id)),
+                status: .accepted)
         case .queued(let position):
-            return jsonResponse(SendAccepted(queued: true, position: position), status: .accepted)
+            return jsonResponse(
+                ResumeAccepted(
+                    queued: true, position: position, interruption: await store.interruption(id)),
+                status: .accepted)
         }
     }
 
+    router.post("sessions/:id/resume", use: pickBackUp)
+    router.post("sessions/:id/interruption/resume", use: pickBackUp)
+
     router.post("sessions/:id/interruption/dismiss") { _, context in
         let id = context.parameters.get("id") ?? ""
-        guard await store.dismissInterruption(id) else {
-            return jsonResponse(["error": "not found"], status: .notFound)
+        switch await store.dismissInterruption(id) {
+        case .dismissed:
+            return jsonResponse(["ok": true])
+        case .noInterruption:
+            return jsonResponse(
+                InterruptionRefused(
+                    error: "Nothing to let go — no turn in this session was interrupted.",
+                    reason: InterruptionRefused.nothingInterrupted, interruption: nil),
+                status: .conflict)
+        case .unknownSession:
+            return jsonResponse(
+                ["error": "not found", "reason": InterruptionRefused.unknownSession],
+                status: .notFound)
         }
-        return jsonResponse(["ok": true])
     }
 
     router.post("sessions/:id/auto-resume") { request, context in

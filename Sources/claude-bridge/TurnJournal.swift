@@ -68,7 +68,7 @@ struct TurnJournal: Codable, Sendable {
 
 /// What a turn had already done when the machine stopped, read off the CLI's own transcript rather
 /// than off anything the bridge remembered — the transcript is the only account that survived.
-struct InterruptionProgress: Codable, Sendable {
+struct InterruptionProgress: Codable, Sendable, Equatable {
     var toolCount: Int = 0
     var lastTool: String?
     var filesTouched: [String] = []
@@ -88,7 +88,7 @@ struct InterruptionProgress: Codable, Sendable {
 /// the whole difference, and a session that cannot tell them apart quietly loses work. It stays on
 /// the session until it is resumed or dismissed, so a client that was not connected at the time
 /// still finds out.
-struct Interruption: Codable, Sendable {
+struct Interruption: Codable, Sendable, Equatable {
     var turnID: String
     var prompt: String
     var startedAt: Date
