@@ -27,6 +27,7 @@ struct ClaudeRunner: Sendable {
         directory: String? = nil,
         onStart: (@Sendable (Int32) -> Void)? = nil,
         onSessionID: (@Sendable (String) -> Void)? = nil,
+        onBackground: (@Sendable (String, BackgroundOutcome) -> Void)? = nil,
         emit: @Sendable @escaping (BridgeEvent) -> Void
     ) async -> Outcome {
         let cwd = directory ?? workdir
@@ -91,7 +92,9 @@ struct ClaudeRunner: Sendable {
             guard let data = line.data(using: .utf8),
                 let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { continue }
-            assembler.ingest(object, emit: emit)
+            assembler.ingest(
+                object, emit: emit,
+                report: { toolID, outcome in onBackground?(toolID, outcome) })
             if let sid = assembler.sessionID, sid != reportedSessionID {
                 reportedSessionID = sid
                 onSessionID?(sid)
@@ -212,12 +215,18 @@ private struct Assembler {
     }
     private var segments: [Segment] = []
     private var tools: [String: ToolCall] = [:]
+    /// Task id to the id of the call that launched it, read out of launch banners. The fold keeps
+    /// the same book for the same reason — see ``rememberLaunchedTask(in:of:)``.
+    private var taskLaunches: [String: String] = [:]
     private var currentBlock: (index: Int, toolID: String?)?
     private var blockBoundary = true
 
     init(messageID: String) { self.messageID = messageID }
 
-    mutating func ingest(_ object: [String: Any], emit: (BridgeEvent) -> Void) {
+    mutating func ingest(
+        _ object: [String: Any], emit: (BridgeEvent) -> Void,
+        report: (String, BackgroundOutcome) -> Void = { _, _ in }
+    ) {
         switch object["type"] as? String {
         case "system":
             switch object["subtype"] as? String {
@@ -231,7 +240,7 @@ private struct Assembler {
         case "stream_event":
             ingestStreamEvent(object["event"] as? [String: Any] ?? [:], emit: emit)
         case "user":
-            ingestToolResults(from: object, emit: emit)
+            ingestUser(object, emit: emit, report: report)
         case "result":
             if let cost = object["total_cost_usd"] as? Double { costUSD = cost }
             if let usage = object["usage"] as? [String: Any] {
@@ -333,19 +342,96 @@ private struct Assembler {
         }
     }
 
-    private mutating func ingestToolResults(from object: [String: Any], emit: (BridgeEvent) -> Void) {
-        guard let message = object["message"] as? [String: Any],
-            let content = message["content"] as? [[String: Any]]
+    /// The CLI writes two different things as a `user` object, told apart by the shape of
+    /// `message.content`: an array of blocks is the tool results of the turn being assembled, and a
+    /// bare string is one of the harness's own lines — among them the `<task-notification>` that
+    /// reports background work ending. Reading only the array shape is what left every live turn's
+    /// launching call with no ending on it, while the same turn read back off disk had one.
+    private mutating func ingestUser(
+        _ object: [String: Any], emit: (BridgeEvent) -> Void,
+        report: (String, BackgroundOutcome) -> Void
+    ) {
+        guard let message = object["message"] as? [String: Any] else { return }
+        if let blocks = message["content"] as? [[String: Any]] {
+            ingestToolResults(blocks, from: object, emit: emit)
+        } else if let text = message["content"] as? String {
+            ingestTaskNotification(
+                text,
+                at: (object["timestamp"] as? String).flatMap(TranscriptParser.parseTimestamp)
+                    ?? Date(),
+                emit: emit, report: report)
+        }
+    }
+
+    /// The harness's report that background work ended, seated back on the call that started it.
+    ///
+    /// Matching is the fold's, not a second rule of this path's own: a report naming a call names
+    /// it outright, and a report naming only tasks is bound through the launch banners this has
+    /// been reading all along. A report for a call this bridge never saw names nothing here and
+    /// nothing in the store, and is simply dropped.
+    private mutating func ingestTaskNotification(
+        _ content: String, at stamp: Date, emit: (BridgeEvent) -> Void,
+        report: (String, BackgroundOutcome) -> Void
+    ) {
+        guard TranscriptParser.isTaskNotification(content),
+            let notification = TranscriptParser.taskNotification(content)
         else { return }
+        if let toolID = notification.toolUseID {
+            seat(toolID, notification.outcome(taskID: nil, at: stamp), emit: emit, report: report)
+            return
+        }
+        for taskID in notification.taskIDs {
+            guard let toolID = taskLaunches[taskID] else { continue }
+            seat(toolID, notification.outcome(taskID: taskID, at: stamp), emit: emit, report: report)
+        }
+    }
+
+    /// The call a report belongs to is usually in an earlier turn, already persisted, and this
+    /// assembler holds only the turn it is building — so the outcome goes both ways. Locally it
+    /// lands on the call if this turn made it; either way it is reported to the store, which is the
+    /// only thing that holds every stored message. Seating it twice writes the same value twice.
+    private mutating func seat(
+        _ toolID: String, _ outcome: BackgroundOutcome, emit: (BridgeEvent) -> Void,
+        report: (String, BackgroundOutcome) -> Void
+    ) {
+        if var call = tools[toolID] {
+            call.background = outcome
+            tools[toolID] = call
+            emit(.toolUpserted(messageID: messageID, call))
+        }
+        report(toolID, outcome)
+    }
+
+    /// A tool that hands its work to the background answers with a banner naming the task it just
+    /// started. Reading that one line is what lets a report arriving minutes later — naming no call
+    /// at all — find the call it belongs to.
+    private mutating func rememberLaunchedTask(in output: String, of toolID: String) {
+        let banner = output.prefix(Self.launchBannerLimit)
+        guard let range = banner.range(of: "Task ID:") else { return }
+        let id = banner[range.upperBound...].prefix { $0 != "\n" }
+            .trimmingCharacters(in: .whitespaces)
+        guard !id.isEmpty else { return }
+        taskLaunches[id] = toolID
+    }
+
+    /// How far into a tool's output a launch banner is looked for. Every tool result of every turn
+    /// is offered to this, and a banner announces itself in its first line or two — so the bound is
+    /// what keeps a megabyte of `Read` output from being scanned for a phrase that only ever
+    /// appears at the top of something else.
+    private static let launchBannerLimit = 2_048
+
+    private mutating func ingestToolResults(
+        _ content: [[String: Any]], from object: [String: Any], emit: (BridgeEvent) -> Void
+    ) {
         for block in content where block["type"] as? String == "tool_result" {
-            guard let toolID = block["tool_use_id"] as? String, var call = tools[toolID] else {
-                continue
-            }
+            guard let toolID = block["tool_use_id"] as? String else { continue }
+            let flattened = Self.flatten(block["content"])
+            rememberLaunchedTask(in: flattened, of: toolID)
+            guard var call = tools[toolID] else { continue }
             // The same ceiling the transcript reader applies, so a `cat` of something enormous
             // does not lodge megabytes in the session store for the life of the process — and so
             // a turn read live and the same turn read back off disk say the same thing.
-            call.output = String(
-                Self.flatten(block["content"]).prefix(TranscriptParser.toolOutputLimit))
+            call.output = String(flattened.prefix(TranscriptParser.toolOutputLimit))
             call.status = (block["is_error"] as? Bool == true) ? .error : .completed
             tools[toolID] = call
             emit(.toolUpserted(messageID: messageID, call))

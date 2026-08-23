@@ -423,6 +423,9 @@ actor SessionStore {
                 directory: directory,
                 onStart: { pid in Task { await self.registerTurnProcess(id, pid: pid) } },
                 onSessionID: { sid in Task { await self.linkClaudeSession(id, claudeSessionID: sid) } },
+                onBackground: { toolID, outcome in
+                    Task { await self.seatBackgroundOutcome(id, toolID: toolID, outcome: outcome) }
+                },
                 emit: { event in
                     caster.send(event)
                     Task {
@@ -578,6 +581,38 @@ actor SessionStore {
             liveTurns[id] = message
         default:
             break
+        }
+    }
+
+    /// The end of background work, seated on the stored call that started it.
+    ///
+    /// The report arrives in the middle of some later turn, so the call it names is nearly always
+    /// in a message this store persisted turns ago — which is why the runner cannot finish the job
+    /// on its own and hands the outcome here. A report for a call this bridge never saw matches
+    /// nothing and is dropped; the same report twice writes the same value twice.
+    ///
+    /// It goes back out as ``BridgeEvent/toolUpserted(messageID:_:)`` rather than a case of its
+    /// own: by the time the message is found there *is* a message id and a whole call to send, and
+    /// every client already knows how to seat one. A new case would say the same thing in a word
+    /// no client speaks yet.
+    private func seatBackgroundOutcome(
+        _ id: String, toolID: String, outcome: BackgroundOutcome
+    ) {
+        guard var session = sessions[id] else { return }
+        for messageIndex in session.messages.indices {
+            guard
+                let partIndex = session.messages[messageIndex].parts.firstIndex(where: { part in
+                    if case .tool(let call) = part { return call.id == toolID }
+                    return false
+                }), case .tool(var call) = session.messages[messageIndex].parts[partIndex]
+            else { continue }
+            call.background = outcome
+            session.messages[messageIndex].parts[partIndex] = .tool(call)
+            sessions[id] = session
+            persist()
+            broadcaster(for: id).send(
+                .toolUpserted(messageID: session.messages[messageIndex].id, call))
+            return
         }
     }
 
