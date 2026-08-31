@@ -7,22 +7,26 @@ func env(_ key: String, _ fallback: String) -> String {
 
 /// Refuses to start when the server would hand out an unauthenticated bypass-permissions Claude:
 /// in that configuration any client that can reach the port can run arbitrary commands as this user.
-func enforceFailClosedStartup(password: String, permissionMode: String) {
-    guard password.isEmpty, permissionMode == "bypassPermissions" else { return }
+/// A tailnet gate that answered at startup counts as authentication — every peer it does not
+/// recognise is refused — so a password is one of two ways to lock the door, not the only one.
+func enforceFailClosedStartup(password: String, permissionMode: String, tailnetGate: Bool) {
+    guard password.isEmpty, !tailnetGate, permissionMode == "bypassPermissions" else { return }
     FileHandle.standardError.write(
         Data(
             """
             claude-bridge: refusing to start.
 
-            BRIDGE_PASSWORD is empty while BRIDGE_PERMISSION=bypassPermissions (the default).
-            In this mode Claude runs with --dangerously-skip-permissions, so any client that
-            can reach this server can execute arbitrary shell commands as this user, with no
-            authentication.
+            BRIDGE_PASSWORD is empty, tailscaled did not answer, and
+            BRIDGE_PERMISSION=bypassPermissions (the default). In this mode Claude runs with
+            --dangerously-skip-permissions, so any client that can reach this server can
+            execute arbitrary shell commands as this user, with no authentication.
 
             Fix one of:
               1. Set BRIDGE_PASSWORD to a secret. Clients authenticate with HTTP Basic auth
                  (username "claude").
-              2. Set BRIDGE_PERMISSION=default so Claude keeps its normal permission prompts.
+              2. Run this machine on a tailnet: peers signed in as the same Tailscale user
+                 are admitted by identity (BRIDGE_TAILNET_AUTH, default same-user).
+              3. Set BRIDGE_PERMISSION=default so Claude keeps its normal permission prompts.
 
             """.utf8))
     exit(1)
@@ -64,7 +68,11 @@ let storeURL = URL(fileURLWithPath: env("BRIDGE_STORE", "\(home)/.claude-bridge/
 let permissionMode = env("BRIDGE_PERMISSION", "bypassPermissions")
 let projectsDir = env("BRIDGE_PROJECTS", "\(home)/.claude/projects")
 
-enforceFailClosedStartup(password: password, permissionMode: permissionMode)
+let tailnetPolicy = TailnetPolicy.parse(ProcessInfo.processInfo.environment["BRIDGE_TAILNET_AUTH"])
+let tailscaleCLI = TailnetGate.locateCLI(override: env("BRIDGE_TAILSCALE", ""))
+let tailnetReady = TailnetGate.probe(policy: tailnetPolicy, cli: tailscaleCLI)
+enforceFailClosedStartup(
+    password: password, permissionMode: permissionMode, tailnetGate: tailnetReady)
 
 /// Read before anything can rewrite it. The stamp names the build that produced *this* process, and
 /// an update landing later replaces the file — so a lazy first read halfway through the day would
@@ -100,9 +108,12 @@ let store = SessionStore(
         devicesURL: storeURL.deletingLastPathComponent().appendingPathComponent("devices.json")),
     autoResumeDefault: env("BRIDGE_AUTO_RESUME", "0") == "1")
 
-let router = Router()
-if !password.isEmpty {
-    router.middlewares.add(BasicAuthMiddleware(username: "claude", password: password))
+let router = Router(context: BridgeRequestContext.self)
+let tailnetGate: TailnetGate? =
+    tailnetPolicy == .off || tailscaleCLI == nil
+    ? nil : TailnetGate(policy: tailnetPolicy, cli: tailscaleCLI)
+if !password.isEmpty || tailnetGate != nil {
+    router.middlewares.add(AccessMiddleware(password: password, gate: tailnetGate))
 }
 let index = TranscriptIndex(root: URL(fileURLWithPath: projectsDir), defaults: machineDefaults)
 let watcher = TranscriptWatcher(index: index, store: store)
@@ -136,7 +147,7 @@ await updater.resume()
 await updater.startAutomation()
 registerRoutes(
     router, store: store, index: index, watcher: watcher, updater: updater, auth: auth,
-    hub: hub, observer: observer, defaults: machineDefaults, hasAuth: !password.isEmpty,
+    hub: hub, observer: observer, defaults: machineDefaults, hasAuth: !password.isEmpty || tailnetGate != nil,
     projectsDir: projectsDir)
 startExternalIdleSweep(index: index, store: store)
 

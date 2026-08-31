@@ -117,8 +117,9 @@ curl -u claude:change-me -X POST http://127.0.0.1:4098/sessions/<id>/message \
 
 ## Endpoints
 
-All request/response bodies are JSON. When `BRIDGE_PASSWORD` is set, every route (including
-`/health`) requires HTTP Basic auth with username `claude`.
+All request/response bodies are JSON. Every route (including `/health`) is behind the door:
+HTTP Basic auth with username `claude` when `BRIDGE_PASSWORD` is set, and the caller's tailnet
+identity when the gate is on — see Security.
 
 | Method | Path | Body | Response |
 |---|---|---|---|
@@ -165,7 +166,7 @@ All request/response bodies are JSON. When `BRIDGE_PASSWORD` is set, every route
 | GET | `/files/raw` | `?path=`, `?tool=`, `?session=` | the file's bytes with its MIME type — what an image part points at; a deleted file falls back to the copy that session's transcript kept for that tool call |
 | GET | `/attachments/:session/:name` | — | the bytes a prompt carried, served back with its MIME type |
 | POST | `/sessions/:id/live-activity` | `LiveActivityRegistration` | registers an ActivityKit push token for this session |
-| POST | `/push/device` | `{token, environment}` | registers a device token for turn-end pushes (requires `BRIDGE_PASSWORD`) |
+| POST | `/push/device` | `{token, environment}` | registers a device token for turn-end pushes (requires an authenticated bridge — a password or the tailnet gate) |
 | POST | `/push/device/unregister` | `{token}` | forgets it |
 
 `Session`: `{id, title, directory?, claudeSessionID?, priorClaudeSessionIDs?, model, effort,
@@ -347,7 +348,8 @@ Everything is environment variables. Empty values fall back to the default.
 |---|---|---|
 | `BRIDGE_PORT` | `4098` | Listen port |
 | `BRIDGE_BIND` | `127.0.0.1` | Bind address. Set `BRIDGE_BIND=0.0.0.0` only when the machine sits behind Tailscale (or an equivalent private overlay) so tailnet clients can reach it |
-| `BRIDGE_PASSWORD` | empty | HTTP Basic auth password (username `claude`). Required unless `BRIDGE_PERMISSION` is changed off `bypassPermissions` — see Security |
+| `BRIDGE_PASSWORD` | empty | HTTP Basic auth password (username `claude`). One of two keys: a request carrying it is admitted whoever sent it. Required only when the tailnet gate is off or tailscaled is not running — see Security |
+| `BRIDGE_TAILNET_AUTH` | `same-user` | Who on the tailnet gets in without a password. `same-user` admits every node signed into the Tailscale account this machine is signed into; a comma-separated list of login names and `tag:` names admits exactly those; `off` disables the gate. Needs the `tailscale` CLI (found automatically; `BRIDGE_TAILSCALE` overrides the path) |
 | `BRIDGE_PERMISSION` | `bypassPermissions` | Claude `--permission-mode`. `bypassPermissions` also passes `--dangerously-skip-permissions` |
 | `BRIDGE_WORKDIR` | `~/agentapi-workdir` | Working directory for sessions that didn't choose one (created if missing, also passed as `--add-dir`); a session created with `directory` runs in its own |
 | `BRIDGE_CLAUDE` | `~/.local/bin/claude` | Path to the `claude` binary |
@@ -376,9 +378,21 @@ send a message to this server can run arbitrary commands as the user the bridge 
 is the point of the tool (an unattended agent has nobody to answer permission prompts), but it
 makes the HTTP surface equivalent to remote shell access.
 
-**Fail-closed startup.** Because of the above, the server refuses to start when
-`BRIDGE_PASSWORD` is empty while `BRIDGE_PERMISSION` is `bypassPermissions`. Either set a
-password or set `BRIDGE_PERMISSION=default`.
+**The tailnet is a credential.** Tailscale already authenticated every node with a device key
+and an account, so the bridge asks tailscaled who is on the other end of each connection
+(`tailscale whois`) and admits a node signed into the same Tailscale account as this machine
+without a password (`BRIDGE_TAILNET_AUTH=same-user`, the default). A LAN neighbour, a Docker
+bridge, a local browser tab, a shared node, a guest and a tagged server are not that account and
+are refused. The password stays a second key for anything that is not on the tailnet, and a
+client is told which door let it in (`/status` → `access`) or, on refusal, that only the tailnet
+would (`401` with `{"error":"tailnet-only"}`), so it never asks for a password that does not
+exist. Every other node on the tailnet is somebody's device: list them by login or tag to admit
+them, or leave the default and hand them the password.
+
+**Fail-closed startup.** The server refuses to start when nothing guards the door:
+`BRIDGE_PASSWORD` empty, tailscaled not answering (or the gate `off`), and `BRIDGE_PERMISSION`
+still `bypassPermissions`. Either set a password, run on a tailnet, or set
+`BRIDGE_PERMISSION=default`.
 
 **Deploy behind Tailscale only.** The default bind is `127.0.0.1`, which is only useful for
 local experiments. The intended deployment is a machine on a

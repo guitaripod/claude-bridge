@@ -134,6 +134,8 @@ struct BridgeStatus: Encodable {
     let model: String
     let version: String
     let authenticated: Bool
+    /// What let this very request in — the password, the caller's tailnet identity, or nothing.
+    let access: AccessGrant?
     /// Protocol 2: this bridge serves `GET /stream` — one sequenced, replayable event stream.
     let proto: Int
     let epoch: String
@@ -148,7 +150,7 @@ struct AutoUpdateRequest: Decodable {
 }
 
 func registerRoutes(
-    _ router: Router<BasicRequestContext>, store: SessionStore, index: TranscriptIndex,
+    _ router: Router<BridgeRequestContext>, store: SessionStore, index: TranscriptIndex,
     watcher: TranscriptWatcher, updater: UpdateService, auth: AuthService, hub: Hub,
     observer: ObserverLoop, defaults: MachineDefaults, hasAuth: Bool, projectsDir: String
 ) {
@@ -159,12 +161,13 @@ func registerRoutes(
 
     router.get("health") { _, _ in "ok" }
 
-    router.get("status") { _, _ in
+    router.get("status") { _, context in
         jsonResponse(
             BridgeStatus(
                 agent: "claude", model: defaults.model(),
                 version: BridgeVersion.describe(source: BridgeVersion.sourceDirectory()),
                 authenticated: await auth.status().loggedIn,
+                access: context.access,
                 proto: 2, epoch: await hub.epoch))
     }
 
@@ -520,7 +523,7 @@ func registerRoutes(
     router.post("push/device") { request, _ in
         guard hasAuth else {
             return jsonResponse(
-                ["error": "device registration requires BRIDGE_PASSWORD to be set"],
+                ["error": "device registration requires an authenticated bridge (BRIDGE_PASSWORD or a tailnet)"],
                 status: .forbidden)
         }
         guard let body = try? await decodeBody(DeviceRegisterRequest.self, request),
@@ -536,7 +539,7 @@ func registerRoutes(
     router.post("push/device/unregister") { request, _ in
         guard hasAuth else {
             return jsonResponse(
-                ["error": "device registration requires BRIDGE_PASSWORD to be set"],
+                ["error": "device registration requires an authenticated bridge (BRIDGE_PASSWORD or a tailnet)"],
                 status: .forbidden)
         }
         guard let body = try? await decodeBody(DeviceRegisterRequest.self, request),
@@ -654,7 +657,7 @@ func registerRoutes(
     /// It answers on two paths. Shipped clients post the interruption's own
     /// (`sessions/:id/interruption/resume`); serving that alongside `sessions/:id/resume` is what
     /// keeps a card on a phone nobody is going to update today from dead-ending on a bare 404.
-    @Sendable func pickBackUp(_ request: Request, _ context: BasicRequestContext) async -> Response {
+    @Sendable func pickBackUp(_ request: Request, _ context: BridgeRequestContext) async -> Response {
         let id = context.parameters.get("id") ?? ""
         switch await store.resumeInterrupted(id) {
         case .unknownSession:
@@ -812,26 +815,5 @@ func registerRoutes(
         headers[.contentType] = "text/event-stream"
         headers[.cacheControl] = "no-cache"
         return Response(status: .ok, headers: headers, body: body)
-    }
-}
-
-struct BasicAuthMiddleware<Context: RequestContext>: RouterMiddleware {
-    private let expected: String
-
-    init(username: String, password: String) {
-        let raw = Data("\(username):\(password)".utf8).base64EncodedString()
-        expected = "Basic \(raw)"
-    }
-
-    func handle(
-        _ request: Request, context: Context,
-        next: (Request, Context) async throws -> Response
-    ) async throws -> Response {
-        guard request.headers[.authorization] == expected else {
-            var headers = HTTPFields()
-            headers[.wwwAuthenticate] = "Basic realm=\"claude-bridge\""
-            return Response(status: .unauthorized, headers: headers)
-        }
-        return try await next(request, context)
     }
 }
