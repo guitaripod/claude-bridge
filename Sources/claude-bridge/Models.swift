@@ -199,6 +199,11 @@ struct SessionSummary: Codable, Sendable, Equatable {
     var createdAt: Date
     var updatedAt: Date
     var active: Bool?
+    /// Whether the session's own turn is open — the transcript is being written and its last turn
+    /// has not closed. `active` is wider: it also counts a sidecar or a fan-out agent still moving,
+    /// which keeps the row live in a list but is not a turn a client should show as running once
+    /// the conversation itself has settled. Nil where the bridge cannot tell them apart.
+    var turnOpen: Bool?
     /// A turn in this session was cut off by the machine and has not been picked back up. A list
     /// that cannot say this shows a conversation that merely looks finished.
     var interrupted: Bool?

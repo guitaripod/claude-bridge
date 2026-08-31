@@ -845,8 +845,9 @@ actor TranscriptIndex {
     /// what it was started with.
     private func summary(for entry: Entry, turnClosed: Bool) -> SessionSummary {
         let threshold = Date().addingTimeInterval(-Self.activityWindow)
+        let turnOpen = !turnClosed && entry.updatedAt > threshold
         let active =
-            (!turnClosed && entry.updatedAt > threshold)
+            turnOpen
             || isSidecarActive(transcriptPath: entry.path, after: threshold)
             || openFanoutAgents(transcriptPath: entry.path) > 0
         let agents = active ? agentActivity(transcriptPath: entry.path) : nil
@@ -859,6 +860,7 @@ actor TranscriptIndex {
             createdAt: entry.createdAt,
             updatedAt: entry.updatedAt,
             active: active,
+            turnOpen: turnOpen,
             agents: agents?.count,
             agentTask: agents?.task)
     }

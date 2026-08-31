@@ -177,10 +177,11 @@ actor ObserverLoop {
         let current = await currentSummaries()
         for (id, summary) in current where lastSummaries[id] != summary {
             await hub.publish(.listUpsert(summary))
-            let wasActive = lastSummaries[id]?.active ?? false
-            if summary.active != wasActive {
-                await hub.publish(
-                    .session(id: id, event: .status(summary.active == true ? "running" : "idle")))
+            let running = summary.turnOpen ?? summary.active ?? false
+            let wasRunning =
+                lastSummaries[id].map { $0.turnOpen ?? $0.active ?? false } ?? false
+            if running != wasRunning {
+                await hub.publish(.session(id: id, event: .status(running ? "running" : "idle")))
             }
         }
         for id in lastSummaries.keys where current[id] == nil {
