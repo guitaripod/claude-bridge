@@ -169,7 +169,7 @@ actor ObserverLoop {
         let (claimed, hidden) = await store.excludedTranscriptIDs()
         let discovered = await index.list(excluding: claimed, hidden: hidden)
         var byID: [String: SessionSummary] = [:]
-        for summary in stored + discovered { byID[summary.id] = summary }
+        for summary in await store.stampingSaved(stored + discovered) { byID[summary.id] = summary }
         return byID
     }
 

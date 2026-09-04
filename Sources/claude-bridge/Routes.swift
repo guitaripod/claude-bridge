@@ -333,7 +333,8 @@ func registerRoutes(
             activeClaudeIDs: active, transcriptDates: dates, agents: agents, settings: settings)
         let (claimed, hidden) = await store.excludedTranscriptIDs()
         let discovered = await index.list(excluding: claimed, hidden: hidden)
-        return jsonResponse((stored + discovered).sorted { $0.updatedAt > $1.updatedAt })
+        return jsonResponse(
+            await store.stampingSaved(stored + discovered).sorted { $0.updatedAt > $1.updatedAt })
     }
 
     router.post("sessions") { request, _ in
@@ -584,13 +585,16 @@ func registerRoutes(
 
     router.patch("sessions/:id") { request, context in
         let id = context.parameters.get("id") ?? ""
-        guard let body = try? await decodeBody(RenameRequest.self, request),
-            !body.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard let body = try? await decodeBody(SessionPatch.self, request), !body.isEmpty
         else {
             return jsonResponse(["error": "bad request"], status: .badRequest)
         }
+        if let saved = body.saved {
+            await store.setSaved(id, saved)
+        }
+        guard let title = body.cleanTitle else { return jsonResponse(["ok": true]) }
         await adoptIfNeeded(id)
-        guard await store.rename(id, title: body.title) else {
+        guard await store.rename(id, title: title) else {
             return jsonResponse(["error": "not found"], status: .notFound)
         }
         return jsonResponse(["ok": true])
