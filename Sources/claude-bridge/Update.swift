@@ -394,6 +394,8 @@ struct UpdatePolicy: Codable, Sendable {
     var failures = 0
     /// When the next unattended attempt is allowed. Cleared by a target that is not the failed one.
     var retryAfter: Date?
+    /// The build an unattended restart was already taken for.
+    var restartedFor: Date?
 
     static let firstBackoff: TimeInterval = 3600
     static let maximumBackoff: TimeInterval = 24 * 3600
@@ -418,6 +420,18 @@ struct UpdatePolicy: Codable, Sendable {
         failedTarget = nil
         failures = 0
         retryAfter = nil
+    }
+
+    /// The build an unattended restart was last taken for, so the same one is never restarted onto
+    /// twice. A restart loads a binary; if the machine still says a build is owed afterwards, the
+    /// claim is wrong and repeating it is a restart loop rather than an update.
+    mutating func noteRestart(of built: Date?) {
+        restartedFor = built
+    }
+
+    func allowsRestart(of built: Date?) -> Bool {
+        guard let built, let restartedFor else { return true }
+        return abs(built.timeIntervalSince(restartedFor)) > 1
     }
 
     /// Whether an unattended attempt at this commit is allowed yet. A commit that is not the one
@@ -932,6 +946,11 @@ actor UpdateService {
         // is gone and only the loading is left. Missing it means running the old binary until
         // somebody opens the app, which is the thing automation exists to stop needing.
         if current.restartRequired, current.canRestart {
+            // A restart that has already been taken for this exact binary and did not settle the
+            // claim is a restart that cannot settle it. Taking it again is the loop, not the fix.
+            guard policy.allowsRestart(of: Self.executableModified()) else { return }
+            policy.noteRestart(of: Self.executableModified())
+            writePolicy()
             beginRestart()
             return
         }
@@ -1083,17 +1102,33 @@ actor UpdateService {
     /// seconds; under `manual` it lasts until somebody starts the bridge again, and for that whole
     /// time the checkout is not what is answering the request.
     ///
-    /// Commits, never `describe` strings: a describe carries `-dirty`, so comparing the one stamped
-    /// at build time against one taken now would announce a build nobody made the moment anybody
-    /// edits a file in that checkout. A dirty tree cannot have produced this binary either way, so
-    /// it answers no rather than guessing.
+    /// A build has landed that this process is not running.
+    ///
+    /// The question is about a *binary*, so it is asked of the binary: the file this process was
+    /// launched from is newer than the launch. Nothing else can be true of a build that landed
+    /// while this one was running, and nothing else stays false once it has been loaded.
+    ///
+    /// It used to be asked of the checkout — the stamped commit against `HEAD` — which is a
+    /// different question with the same answer only when a build follows every checkout move. A
+    /// `git pull` on its own moves HEAD and builds nothing, and the bridge then reported a landed
+    /// build forever: a machine that keeps itself current restarted every two minutes onto the same
+    /// binary, all night, tearing down every client's stream and every turn's cgroup with it, over
+    /// work no restart could do. A restart loads a build; it cannot make one.
     private func restartRequired(source: String?) -> Bool {
-        guard let source, dirt(source) == nil else { return false }
-        guard let built = BridgeVersion.running?.commit, !built.isEmpty,
-            let head = BridgeVersion.commit(source: source)
-        else { return false }
-        return !built.hasPrefix(head) && !head.hasPrefix(built)
+        guard let built = Self.executableModified() else { return false }
+        return built > Self.processStarted.addingTimeInterval(BridgeVersion.stampSlack)
     }
+
+    /// When the file this process is running was last written.
+    static func executableModified() -> Date? {
+        guard let path = Bundle.main.executableURL?.resolvingSymlinksInPath().path,
+            let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        else { return nil }
+        return attributes[.modificationDate] as? Date
+    }
+
+    /// Close enough to when this process began: the actor is built while the server is coming up.
+    static let processStarted = Date()
 
     private func readState() -> UpdateState? {
         guard let data = try? Data(contentsOf: stateURL) else { return nil }

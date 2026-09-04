@@ -136,4 +136,26 @@ import Testing
         #expect(BridgeVersion.stampDescribes(builtAt: nil, executableModified: Self.built))
         #expect(BridgeVersion.stampDescribes(builtAt: Self.built, executableModified: nil))
     }
+
+    /// A restart loads a build; it cannot make one. If the machine still says a build is owed
+    /// after restarting onto that very binary, restarting again is a loop rather than an update —
+    /// which is exactly what ran on a laptop all night, cutting every client's stream every two
+    /// minutes, because a `git pull` had moved the checkout and nothing had been built.
+    @Test func theSameBuildIsNeverRestartedOntoTwice() {
+        var policy = UpdatePolicy()
+        let built = Self.built
+        #expect(policy.allowsRestart(of: built))
+        policy.noteRestart(of: built)
+        #expect(!policy.allowsRestart(of: built))
+        #expect(policy.allowsRestart(of: built.addingTimeInterval(120)))
+    }
+
+    /// Nothing to compare is not a reason to refuse: a filesystem that will not date the binary
+    /// leaves the restart available, which is the state that was always allowed before.
+    @Test func anUndatableBuildIsStillAllowedToRestart() {
+        var policy = UpdatePolicy()
+        policy.noteRestart(of: nil)
+        #expect(policy.allowsRestart(of: nil))
+        #expect(policy.allowsRestart(of: Self.built))
+    }
 }
