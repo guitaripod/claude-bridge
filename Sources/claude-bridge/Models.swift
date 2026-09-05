@@ -131,6 +131,11 @@ struct Message: Codable, Sendable {
     /// the CLI repeats a call's usage on every line it writes for that call, so counting lines
     /// inflates a turn by nearly two.
     var usage: TokenCounts?
+    /// What the turn's *last* API call was handed and wrote back, which is the conversation's
+    /// footprint in the model's context window right now. `usage` adds every call together — the
+    /// right number for a bill, and roughly the call count times too large for a window — so a
+    /// client asking how full the window is reads this one and never the sum.
+    var context: TokenCounts?
     /// Priced from the same rate table the spend report uses, so a turn's own account and the
     /// conversation's total can never disagree. An estimate, and every surface says so.
     var costUSD: Double?

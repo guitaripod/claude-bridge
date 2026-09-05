@@ -101,3 +101,56 @@ struct TurnAccountTests {
         #expect(messages[1].seconds == 5)
     }
 }
+
+@Suite("Context footprint")
+struct ContextFootprintTests {
+    private func fold(_ lines: [String]) -> [Message] {
+        var fold = TranscriptFold()
+        _ = fold.consume(Data(lines.joined(separator: "\n").appending("\n").utf8))
+        return fold.snapshot
+    }
+
+    private func line(_ role: String, _ body: String, at: String) -> String {
+        """
+        {"type":"\(role)","uuid":"\(UUID().uuidString)","timestamp":"\(at)","message":\(body)}
+        """
+    }
+
+    private func call(id: String, input: Int, output: Int, cacheRead: Int, cacheWrite: Int) -> String {
+        """
+        {"id":"\(id)","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"x"}],"usage":{"input_tokens":\(input),"output_tokens":\(output),"cache_read_input_tokens":\(cacheRead),"cache_creation_input_tokens":\(cacheWrite)}}
+        """
+    }
+
+    @Test("A turn's footprint is its last call, not the sum of its calls")
+    func footprintIsTheLastCall() {
+        let messages = fold([
+            line("user", #"{"role":"user","content":"go"}"#, at: "2026-08-16T10:00:00.000Z"),
+            line("assistant", call(id: "m1", input: 100, output: 300, cacheRead: 40_000, cacheWrite: 2_000),
+                at: "2026-08-16T10:00:04.000Z"),
+            line("assistant", call(id: "m2", input: 10, output: 700, cacheRead: 42_300, cacheWrite: 0),
+                at: "2026-08-16T10:00:20.000Z"),
+        ])
+        let turn = messages[1]
+        #expect(turn.usage?.cacheRead == 82_300)
+        #expect(turn.context?.cacheRead == 42_300)
+        #expect(turn.context?.input == 10)
+        #expect(turn.context?.output == 700)
+        #expect(turn.context?.total == 43_010)
+    }
+
+    @Test("Repeated lines for one call refresh the footprint without charging twice")
+    func repeatedLinesRefreshFootprint() {
+        let messages = fold([
+            line("user", #"{"role":"user","content":"go"}"#, at: "2026-08-16T10:00:00.000Z"),
+            line("assistant", call(id: "m1", input: 100, output: 5, cacheRead: 40_000, cacheWrite: 0),
+                at: "2026-08-16T10:00:04.000Z"),
+            line("assistant", call(id: "m1", input: 100, output: 900, cacheRead: 40_000, cacheWrite: 0),
+                at: "2026-08-16T10:00:05.000Z"),
+        ])
+        let turn = messages[1]
+        #expect(turn.usage?.output == 5)
+        #expect(turn.context?.output == 900)
+        #expect(turn.context?.cacheRead == 40_000)
+    }
+}

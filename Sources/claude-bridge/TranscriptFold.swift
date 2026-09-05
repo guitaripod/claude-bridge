@@ -385,7 +385,10 @@ struct TranscriptFold: Sendable {
         if let id = turn?.id { changed.insert(id) }
     }
 
-    /// What the open turn's API calls consumed, priced, with each call charged exactly once.
+    /// What the open turn's API calls consumed, priced, with each call charged exactly once — and,
+    /// beside the sum, what the latest call alone was handed, which is the window's fill. The
+    /// footprint is taken from every line rather than the first, because the CLI's later lines for
+    /// one call carry the fuller output count.
     ///
     /// The CLI writes a line per content block and repeats that call's `usage` on every one of
     /// them, so a turn counted line by line reads nearly twice what it cost. The API message id is
@@ -397,10 +400,12 @@ struct TranscriptFold: Sendable {
         let model = message["model"] as? String
         if open.model == nil, let model { open.model = model }
         defer { turn = open }
-        guard let usage = message["usage"] as? [String: Any],
-            (message["id"] as? String).map({ chargedMessages.insert($0).inserted }) ?? true
-        else { return }
+        guard let usage = message["usage"] as? [String: Any] else { return }
         let counts = SpendReader.tokens(in: usage)
+        open.context = counts
+        changed.insert(open.id)
+        guard (message["id"] as? String).map({ chargedMessages.insert($0).inserted }) ?? true
+        else { return }
         open.usage = (open.usage ?? TokenCounts()) + counts
         open.costUSD = (open.costUSD ?? 0) + Rate.forModel(model ?? "").cost(of: counts)
         changed.insert(open.id)
