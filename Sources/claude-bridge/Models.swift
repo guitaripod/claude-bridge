@@ -193,6 +193,14 @@ struct Session: Codable, Sendable {
     /// stamps a message complete, so a client that lost the one frame saying so reads it here.
     var active: Bool?
     var turnOpen: Bool?
+    /// Stamped when a session is served, never stored: background work the conversation's own
+    /// process is still carrying between turns — a command the model started and stepped back
+    /// from, an agent it backgrounded. No turn is open, the prompt is free, and the machine is
+    /// still working for this chat; the CLI will speak again on its own when the work ends. A
+    /// listing that cannot say this shows a conversation that merely looks finished.
+    var backgroundTasks: Int?
+    /// What the one task is, when exactly one is running, in the CLI's own words.
+    var backgroundTask: String?
 
     var summary: SessionSummary {
         SessionSummary(
@@ -208,6 +216,17 @@ struct SessionRevision: Codable, Sendable {
     var updatedAt: Date
     var active: Bool
     var turnOpen: Bool
+    var backgroundTasks: Int? = nil
+    var backgroundTask: String? = nil
+}
+
+/// Background work a conversation's process is carrying between turns, as the CLI reports it: how
+/// many tasks, and — when there is exactly one — what it is. Absent means none; the CLI's own
+/// level signal (`background_tasks_changed`) replaces the whole set on every change, so a missed
+/// edge can never leave a stale indicator standing.
+struct BackgroundWork: Codable, Sendable, Equatable {
+    var tasks: Int
+    var task: String?
 }
 
 struct SessionSummary: Codable, Sendable, Equatable {
@@ -241,6 +260,10 @@ struct SessionSummary: Codable, Sendable, Equatable {
     /// was killed in the middle of. A row that cannot say this shows a conversation apparently
     /// talking to itself.
     var resuming: Bool?
+    /// Background work the conversation's process is carrying with no turn open — see
+    /// ``Session/backgroundTasks``. Nil when there is none.
+    var backgroundTasks: Int?
+    var backgroundTask: String?
 }
 
 /// The agents working for one session, as a list row can describe them.
@@ -341,9 +364,16 @@ enum BridgeEvent: Codable, Sendable {
     /// ``error`` because an error is something the turn said and this is something that happened
     /// to it, and only one of the two is worth offering to continue.
     case interrupted(Interruption?)
+    /// The background work the conversation's process is carrying changed — a task the model
+    /// started and stepped back from began or ended. `nil` once nothing is running. Separate from
+    /// ``status`` because no turn is open either way: the prompt is free, and the machine is
+    /// still working for the chat, which a client that can only say running or idle has to call
+    /// idle.
+    case background(BackgroundWork?)
 
     private enum CodingKeys: String, CodingKey {
         case type, message, messageID, delta, tool, status, error, goal, phase, interruption
+        case tasks, task
     }
 
     func encode(to encoder: Encoder) throws {
@@ -376,6 +406,10 @@ enum BridgeEvent: Codable, Sendable {
         case .interrupted(let interruption):
             try c.encode("interrupted", forKey: .type)
             try c.encodeIfPresent(interruption, forKey: .interruption)
+        case .background(let work):
+            try c.encode("background", forKey: .type)
+            try c.encode(work?.tasks ?? 0, forKey: .tasks)
+            try c.encodeIfPresent(work?.task, forKey: .task)
         }
     }
 
@@ -399,6 +433,13 @@ enum BridgeEvent: Codable, Sendable {
                 error: try c.decodeIfPresent(String.self, forKey: .error))
         case "interrupted":
             self = .interrupted(try c.decodeIfPresent(Interruption.self, forKey: .interruption))
+        case "background":
+            let tasks = try c.decodeIfPresent(Int.self, forKey: .tasks) ?? 0
+            self = .background(
+                tasks > 0
+                    ? BackgroundWork(
+                        tasks: tasks, task: try c.decodeIfPresent(String.self, forKey: .task))
+                    : nil)
         default: self = .error(try c.decode(String.self, forKey: .error))
         }
     }

@@ -215,6 +215,10 @@ actor SessionStore {
             if (autoContinues[id] ?? 0) > 0, summary.active == true {
                 summary.resuming = true
             }
+            if let work = carriedWork[id] {
+                summary.backgroundTasks = work.tasks
+                summary.backgroundTask = work.task
+            }
             return summary
         }
         .sorted { $0.updatedAt > $1.updatedAt }
@@ -544,7 +548,10 @@ actor SessionStore {
             claudePath: runner.claudePath, permissionMode: runner.permissionMode, launch: launch,
             model: model, effort: effort,
             sink: { [weak self] process, line in await self?.ingest(id, from: process, line: line) },
-            onExit: { [weak self] process in await self?.processExited(id, process) })
+            onExit: { [weak self] process in await self?.processExited(id, process) },
+            onTasksChanged: { [weak self] process, work in
+                await self?.noteBackgroundWork(id, from: process, work)
+            })
         // Registered before it starts: a fast process speaks before `start()` returns, and a line
         // from a process the store does not know is a line from nobody.
         processes[id] = process
@@ -670,8 +677,27 @@ actor SessionStore {
         // exit is its own business and must not close a turn that has just started elsewhere.
         guard processes[id] === process else { return }
         processes[id] = nil
+        setBackgroundWork(id, nil)
         guard openTurns[id] != nil else { return }
         closeTurn(id, fallback: nil)
+    }
+
+    /// Background work the conversation's process is carrying, as last reported — mirrored here
+    /// so a listing, which cannot wait on every process, reads it off the store, and so a change
+    /// goes out on the stream the moment the CLI says so rather than on the next sweep.
+    private var carriedWork: [String: BackgroundWork] = [:]
+
+    func backgroundWork(for id: String) -> BackgroundWork? { carriedWork[id] }
+
+    private func noteBackgroundWork(_ id: String, from process: ClaudeProcess, _ work: BackgroundWork?) {
+        guard processes[id] === process else { return }
+        setBackgroundWork(id, work)
+    }
+
+    private func setBackgroundWork(_ id: String, _ work: BackgroundWork?) {
+        guard carriedWork[id] != work else { return }
+        carriedWork[id] = work
+        publish(id, .background(work))
     }
 
     /// Ends idle processes that have outlived their keep. A process with background work still
@@ -728,6 +754,7 @@ actor SessionStore {
 
     private func dropProcess(_ id: String) {
         guard let process = processes.removeValue(forKey: id) else { return }
+        setBackgroundWork(id, nil)
         Task { await process.close() }
     }
 

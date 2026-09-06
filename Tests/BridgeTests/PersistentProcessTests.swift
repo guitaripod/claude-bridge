@@ -51,8 +51,26 @@ private struct StdinClaude {
                     *)
                       $P '%s\\n' '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}'
                       $P '%s\\n' '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}}'
+                      case "$line" in
+                        *carry*)
+                          $P '%s\\n' '{"type":"system","subtype":"task_started","task_id":"c1","task_type":"local_bash","description":"sleep 60","is_backgrounded":true}'
+                          $P '%s\\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"c1","task_type":"local_bash","description":"sleep 60"}]}'
+                          ;;
+                        *ambient*)
+                          $P '%s\\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"m1","task_type":"local_bash","description":"tail -f log","ambient":true}]}'
+                          ;;
+                      esac
                       $P '%s\\n' '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.01}'
                       case "$line" in
+                        *carry*)
+                          ( sleep 0.5
+                            $P '%s\\n' '{"type":"system","subtype":"task_notification","task_id":"c1","status":"completed","summary":"slept"}'
+                            $P '%s\\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+                            $P '%s\\n' '{"type":"system","subtype":"init","session_id":"persist-session"}'
+                            $P '%s\\n' '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}'
+                            $P '%s\\n' '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"it finished"}}}'
+                            $P '%s\\n' '{"type":"result","subtype":"success","is_error":false}' ) &
+                          ;;
                         *stray*)
                           ( sleep 0.3; $P '%s\\n' '{"type":"result","subtype":"success","is_error":false}' ) &
                           ;;
@@ -165,6 +183,53 @@ struct PersistentProcessTests {
         #expect(fake.starts == 1)
     }
 
+    @Test("Work carried between turns is reported while it runs and cleared when it ends")
+    func carriedWorkIsReported() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+        let caster = await store.broadcaster(for: session.id)
+        let (_, events) = caster.subscribe()
+        let reports = Reports()
+        let watcher = Task {
+            for await event in events {
+                if case .background(let work) = event { await reports.append(work) }
+            }
+        }
+        defer { watcher.cancel() }
+
+        _ = await store.send(session.id, request: SendRequest(text: "carry this on"))
+        await waitUntil { await assistantTexts(store, session.id).count == 1 }
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        let carried = BackgroundWork(tasks: 1, task: "sleep 60")
+        #expect(await store.backgroundWork(for: session.id) == carried)
+        let row = await store.list().first { $0.id == session.id }
+        #expect(row?.backgroundTasks == 1)
+        #expect(row?.backgroundTask == "sleep 60")
+        #expect(row?.active == false)
+
+        await waitUntil { await assistantTexts(store, session.id).count == 2 }
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        #expect(await store.backgroundWork(for: session.id) == nil)
+        #expect(await store.list().first { $0.id == session.id }?.backgroundTasks == nil)
+        #expect(await reports.values == [carried, nil])
+    }
+
+    @Test("An ambient monitor is not work anybody is waiting on")
+    func ambientMonitorIsNotBackgroundWork() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "start the ambient monitor"))
+        await waitUntil { await assistantTexts(store, session.id).count == 1 }
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        #expect(await store.backgroundWork(for: session.id) == nil)
+        #expect(await store.list().first { $0.id == session.id }?.backgroundTasks == nil)
+    }
+
     @Test("Stop interrupts the turn and keeps the process")
     func stopInterruptsWithoutKillingTheProcess() async throws {
         let fake = try StdinClaude()
@@ -222,6 +287,11 @@ struct PersistentProcessTests {
 private actor Statuses {
     private(set) var values: [String] = []
     func append(_ value: String) { values.append(value) }
+}
+
+private actor Reports {
+    private(set) var values: [BackgroundWork?] = []
+    func append(_ value: BackgroundWork?) { values.append(value) }
 }
 
 @Suite("One process per conversation — the edges")

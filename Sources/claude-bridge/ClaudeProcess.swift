@@ -32,9 +32,25 @@ actor ClaudeProcess {
     /// learns it on its first turn; a resumed or forked one may report a different id than it was
     /// handed, and the id it reports is the one the next prompt has to match.
     private(set) var currentSessionID: String?
-    /// Background work the CLI says is still running, by task id — what a reaper must not kill
-    /// and a restart must wait for.
-    private(set) var liveTasks: Set<String> = []
+    /// Background work the CLI says is still running, by task id — what a reaper must not kill,
+    /// a restart must wait for, and a client is told about, because between turns it is the only
+    /// sign that the machine is still working for this conversation. Read from the CLI's own level
+    /// signal, which replaces the whole set on every change, with the start and end bookends
+    /// folded in for the moments between. Ambient monitors — a plugin's watcher that runs for as
+    /// long as the process does — are not work anybody is waiting on and are left out.
+    private(set) var liveTasks: [String: LiveTask] = [:]
+
+    struct LiveTask: Sendable, Equatable {
+        var description: String?
+    }
+
+    /// The live set as a client hears it: how many, and what the one task is when there is one.
+    var backgroundWork: BackgroundWork? {
+        guard !liveTasks.isEmpty else { return nil }
+        return BackgroundWork(
+            tasks: liveTasks.count,
+            task: liveTasks.count == 1 ? liveTasks.values.first?.description : nil)
+    }
     private(set) var lastActivityAt = Date()
     private(set) var isRunning = false
     private(set) var pid: Int32 = 0
@@ -47,6 +63,7 @@ actor ClaudeProcess {
     private let exit = ExitLatch()
     private let sink: @Sendable (ClaudeProcess, String) async -> Void
     private let onExit: @Sendable (ClaudeProcess) async -> Void
+    private let onTasksChanged: @Sendable (ClaudeProcess, BackgroundWork?) async -> Void
     private var pendingControls: [String: CheckedContinuation<Bool, Never>] = [:]
     private var swallowing: CheckedContinuation<Bool, Never>?
     private var requestCounter = 0
@@ -61,7 +78,10 @@ actor ClaudeProcess {
     init(
         claudePath: String, permissionMode: String, launch: ClaudeLaunch, model: String,
         effort: String, sink: @escaping @Sendable (ClaudeProcess, String) async -> Void,
-        onExit: @escaping @Sendable (ClaudeProcess) async -> Void
+        onExit: @escaping @Sendable (ClaudeProcess) async -> Void,
+        onTasksChanged: @escaping @Sendable (ClaudeProcess, BackgroundWork?) async -> Void = {
+            _, _ in
+        }
     ) {
         self.claudePath = claudePath
         self.permissionMode = permissionMode
@@ -70,6 +90,7 @@ actor ClaudeProcess {
         self.effort = effort
         self.sink = sink
         self.onExit = onExit
+        self.onTasksChanged = onTasksChanged
     }
 
     /// Whether this process can take a turn that wants `launch`: the same working directory, the
@@ -269,19 +290,37 @@ actor ClaudeProcess {
             return
         }
         if type == "system" {
+            let before = backgroundWork
             switch object["subtype"] as? String {
             case "init":
                 if let sid = object["session_id"] as? String { currentSessionID = sid }
             case "background_tasks_changed":
                 let tasks = object["tasks"] as? [[String: Any]] ?? []
-                liveTasks = Set(tasks.compactMap { $0["task_id"] as? String })
+                liveTasks = [:]
+                for task in tasks where task["ambient"] as? Bool != true {
+                    guard let id = task["task_id"] as? String else { continue }
+                    liveTasks[id] = LiveTask(description: task["description"] as? String)
+                }
             case "task_started":
-                if let id = object["task_id"] as? String { liveTasks.insert(id) }
+                if let id = object["task_id"] as? String,
+                    object["is_backgrounded"] as? Bool == true,
+                    object["ambient"] as? Bool != true
+                {
+                    liveTasks[id] = LiveTask(description: object["description"] as? String)
+                }
+            case "task_updated":
+                if let id = object["task_id"] as? String,
+                    let patch = object["patch"] as? [String: Any],
+                    patch["is_backgrounded"] as? Bool == true, liveTasks[id] == nil
+                {
+                    liveTasks[id] = LiveTask(description: patch["description"] as? String)
+                }
             case "task_notification":
-                if let id = object["task_id"] as? String { liveTasks.remove(id) }
+                if let id = object["task_id"] as? String { liveTasks[id] = nil }
             default:
                 break
             }
+            if backgroundWork != before { await onTasksChanged(self, backgroundWork) }
         }
         if swallowing != nil {
             if type == "result" {
@@ -295,7 +334,9 @@ actor ClaudeProcess {
 
     private func finished() async {
         isRunning = false
-        liveTasks = []
+        let carried = backgroundWork
+        liveTasks = [:]
+        if carried != nil { await onTasksChanged(self, nil) }
         for (_, continuation) in pendingControls { continuation.resume(returning: false) }
         pendingControls = [:]
         expireSwallow()

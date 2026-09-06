@@ -394,10 +394,12 @@ func registerRoutes(
         if let session = await store.get(id) {
             let live = await liveness(of: session)
             let observed = await observer.summary(for: id)
+            let work = await store.backgroundWork(for: id)
             return jsonResponse(
                 SessionRevision(
                     updatedAt: max(session.updatedAt, observed?.updatedAt ?? session.updatedAt),
-                    active: live.active, turnOpen: live.turnOpen))
+                    active: live.active, turnOpen: live.turnOpen,
+                    backgroundTasks: work?.tasks, backgroundTask: work?.task))
         }
         if let observed = await observer.summary(for: id) {
             return jsonResponse(
@@ -420,6 +422,10 @@ func registerRoutes(
             let live = await liveness(of: session)
             session.active = live.active
             session.turnOpen = live.turnOpen
+            if let work = await store.backgroundWork(for: id) {
+                session.backgroundTasks = work.tasks
+                session.backgroundTask = work.task
+            }
             if let partial = await store.liveTurnMessage(id) {
                 session.messages.append(partial)
             } else if let claudeID = session.claudeSessionID,
