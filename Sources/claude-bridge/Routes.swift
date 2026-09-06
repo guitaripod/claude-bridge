@@ -372,8 +372,14 @@ func registerRoutes(
         if !held, let claudeID = session.claudeSessionID {
             held = await store.hasRunnerTurnInFlight(claudeSessionID: claudeID)
         }
+        // A turn this bridge ran and finished leaves residue the transcript cannot tell from an
+        // open turn — a tool call a stop cut off — so for a while after the runner let go, the
+        // bridge's own word outranks the file.
         var turnOpen = held
-        if !turnOpen, let claudeID = session.claudeSessionID {
+        if !turnOpen, let claudeID = session.claudeSessionID,
+            await !store.recentRunnerActivity(
+                claudeSessionID: claudeID, within: TranscriptIndex.activityWindow)
+        {
             turnOpen = await index.hasOpenTurn(claudeID)
         }
         let observed = await observer.summary(for: session.id)

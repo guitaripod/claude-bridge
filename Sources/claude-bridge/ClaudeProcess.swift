@@ -45,7 +45,7 @@ actor ClaudeProcess {
     private let stdinPipe = Pipe()
     private let stdoutPipe = Pipe()
     private let exit = ExitLatch()
-    private let sink: @Sendable (String) async -> Void
+    private let sink: @Sendable (ClaudeProcess, String) async -> Void
     private let onExit: @Sendable (ClaudeProcess) async -> Void
     private var pendingControls: [String: CheckedContinuation<Bool, Never>] = [:]
     private var swallowing: CheckedContinuation<Bool, Never>?
@@ -60,7 +60,7 @@ actor ClaudeProcess {
 
     init(
         claudePath: String, permissionMode: String, launch: ClaudeLaunch, model: String,
-        effort: String, sink: @escaping @Sendable (String) async -> Void,
+        effort: String, sink: @escaping @Sendable (ClaudeProcess, String) async -> Void,
         onExit: @escaping @Sendable (ClaudeProcess) async -> Void
     ) {
         self.claudePath = claudePath
@@ -185,18 +185,35 @@ actor ClaudeProcess {
     func close() async {
         guard isRunning else { return }
         try? stdinPipe.fileHandleForWriting.close()
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { [exit] in await exit.wait() }
-            group.addTask { try? await Task.sleep(for: Self.closeGrace) }
-            await group.next()
-            group.cancelAll()
-        }
-        if process.isRunning { process.terminate() }
+        guard await !exited(within: Self.closeGrace) else { return }
+        await terminate()
     }
 
-    func terminate() {
+    /// Ends the process now: SIGTERM, and SIGKILL for one that shrugs it off. A child inherits
+    /// whatever its parent did with SIGTERM — a signal a service ignores so it can read it off a
+    /// dispatch source is ignored by every process it spawns — so a term that is never followed
+    /// up is a child that outlives the bridge, holding the transcript and a stdout nobody reads.
+    func terminate() async {
         guard process.isRunning else { return }
         process.terminate()
+        guard await !exited(within: Self.closeGrace) else { return }
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+    }
+
+    private func exited(within grace: Duration) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask { [exit] in
+                await exit.wait()
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(for: grace)
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
     }
 
     private func control(_ subtype: String, fields: [String: Any]) async -> Bool {
@@ -273,7 +290,7 @@ actor ClaudeProcess {
             }
             return
         }
-        await sink(line)
+        await sink(self, line)
     }
 
     private func finished() async {

@@ -111,7 +111,8 @@ let store = SessionStore(
         client: apnsClient,
         devicesURL: storeURL.deletingLastPathComponent().appendingPathComponent("devices.json")),
     autoResumeDefault: env("BRIDGE_AUTO_RESUME", "0") == "1",
-    processTTL: Double(env("BRIDGE_PROCESS_TTL", "1800")) ?? 1800)
+    processTTL: Double(env("BRIDGE_PROCESS_TTL", "1800")) ?? 1800,
+    processPool: Int(env("BRIDGE_PROCESS_POOL", "4")) ?? 4)
 await store.startReaper()
 
 let router = Router(context: BridgeRequestContext.self)

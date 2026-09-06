@@ -31,7 +31,7 @@ private struct StdinClaude {
                   rid=$(echo "$line" | sed -n 's/.*"request_id":"\\([^"]*\\)".*/\\1/p')
                   touch "\(stop)"
                   $P '%s\\n' "{\\"type\\":\\"control_response\\",\\"response\\":{\\"subtype\\":\\"success\\",\\"request_id\\":\\"$rid\\"}}"
-                  $P '%s\\n' '{"type":"result","subtype":"error_during_execution","is_error":true}'
+                  [ -f "\(root.appendingPathComponent("hang").path)" ] || $P '%s\\n' '{"type":"result","subtype":"error_during_execution","is_error":true}'
                   ;;
                 *\\"/effort*)
                   $P '%s\\n' '{"type":"system","subtype":"init","session_id":"persist-session"}'
@@ -45,11 +45,17 @@ private struct StdinClaude {
                       rm -f "\(stop)"
                       ( sleep 3; [ -f "\(stop)" ] || $P '%s\\n' '{"type":"result","subtype":"success","is_error":false}' ) &
                       ;;
+                    *hang*)
+                      touch "\(root.appendingPathComponent("hang").path)"
+                      ;;
                     *)
                       $P '%s\\n' '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}'
                       $P '%s\\n' '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}}'
                       $P '%s\\n' '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.01}'
                       case "$line" in
+                        *stray*)
+                          ( sleep 0.3; $P '%s\\n' '{"type":"result","subtype":"success","is_error":false}' ) &
+                          ;;
                         *background*)
                           ( sleep 0.4
                             $P '%s\\n' '{"type":"system","subtype":"task_notification","task_id":"t1","status":"completed","summary":"done"}'
@@ -80,14 +86,18 @@ private struct StdinClaude {
     func cleanUp() { try? FileManager.default.removeItem(at: root) }
 }
 
-private func makeStore(_ fake: StdinClaude, processTTL: TimeInterval = 1800) -> SessionStore {
+private func makeStore(
+    _ fake: StdinClaude, processTTL: TimeInterval = 1800, processPool: Int = 4,
+    abortGrace: TimeInterval = 10
+) -> SessionStore {
     SessionStore(
         runner: ClaudeRunner(
             claudePath: fake.binary, workdir: fake.root.path, permissionMode: "default"),
         defaults: MachineDefaults(
             modelOverride: "sonnet", effortOverride: "medium", home: NSTemporaryDirectory()),
         storeURL: fake.root.appendingPathComponent("sessions.json"),
-        projectsDir: fake.root.path, processTTL: processTTL)
+        projectsDir: fake.root.path, processTTL: processTTL, processPool: processPool,
+        abortGrace: abortGrace)
 }
 
 private func waitUntil(
@@ -212,4 +222,95 @@ struct PersistentProcessTests {
 private actor Statuses {
     private(set) var values: [String] = []
     func append(_ value: String) { values.append(value) }
+}
+
+@Suite("One process per conversation — the edges")
+struct PersistentProcessEdgeTests {
+    @Test("A turn that needs a new process gets it without the old one's exit closing the turn")
+    func replacingTheProcessKeepsTheNewTurnOpen() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "one"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        _ = await store.send(session.id, request: SendRequest(text: "two", effort: "ultracode"))
+        await waitUntil { await assistantTexts(store, session.id).count == 2 }
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+
+        #expect(await assistantTexts(store, session.id) == ["answer", "answer"])
+        #expect(fake.starts == 2)
+        #expect(await store.liveProcessCount() == 1)
+    }
+
+    @Test("A result with no turn open is not a turn")
+    func aStrayResultOpensNothing() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+        let caster = await store.broadcaster(for: session.id)
+        let (_, events) = caster.subscribe()
+        let statuses = Statuses()
+        let watcher = Task {
+            for await event in events {
+                if case .status(let value) = event { await statuses.append(value) }
+            }
+        }
+        defer { watcher.cancel() }
+
+        _ = await store.send(session.id, request: SendRequest(text: "a stray one"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        try await Task.sleep(for: .milliseconds(700))
+
+        #expect(await assistantTexts(store, session.id) == ["answer"])
+        #expect(await statuses.values == ["running", "idle"])
+        #expect(await !store.hasQueuedOrRunningTurn(session.id))
+    }
+
+    @Test("Idle processes past the pool are let go, least recently used first")
+    func idleProcessesBeyondThePoolAreReaped() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake, processPool: 1)
+        let first = await store.create(CreateRequest(directory: fake.root.path))
+        let second = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(first.id, request: SendRequest(text: "one"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(first.id) }
+        try await Task.sleep(for: .milliseconds(50))
+        _ = await store.send(second.id, request: SendRequest(text: "one"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(second.id) }
+        #expect(await store.liveProcessCount() == 2)
+
+        await store.reapIdleProcesses()
+        #expect(await store.liveProcessCount() == 1)
+
+        _ = await store.send(second.id, request: SendRequest(text: "two"))
+        await waitUntil { await assistantTexts(store, second.id).count == 2 }
+        #expect(fake.starts == 2)
+    }
+
+    @Test("A stop the CLI accepted but never closed ends the process after the grace")
+    func aHungInterruptIsFinishedTheHardWay() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake, abortGrace: 0.5)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "hang here"))
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(await store.hasQueuedOrRunningTurn(session.id))
+        let result = await store.abortTurn(session.id)
+        #expect(result.stopped)
+        await waitUntil(.seconds(8)) { await !store.hasQueuedOrRunningTurn(session.id) }
+        #expect(await !store.hasQueuedOrRunningTurn(session.id))
+        await waitUntil(.seconds(2)) { await store.liveProcessCount() == 0 }
+        #expect(await store.liveProcessCount() == 0)
+
+        _ = await store.send(session.id, request: SendRequest(text: "two"))
+        await waitUntil { await assistantTexts(store, session.id).count == 2 }
+        #expect(fake.starts == 2)
+    }
 }

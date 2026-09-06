@@ -139,6 +139,12 @@ actor SessionStore {
     private var processes: [String: ClaudeProcess] = [:]
     private var openTurns: [String: OpenTurn] = [:]
     private let processTTL: TimeInterval
+    /// How many idle processes are kept at once. Each is a whole CLI in memory; past this the
+    /// least recently used goes, whatever its keep.
+    private let processPool: Int
+    /// How long an interrupted turn is given to close before its process is ended outright — a
+    /// tool that will not die under the CLI's own interrupt is not one to wait on forever.
+    private let abortGrace: TimeInterval
 
     private struct OpenTurn {
         var assembler: Assembler
@@ -152,10 +158,13 @@ actor SessionStore {
         runner: ClaudeRunner, defaults: MachineDefaults, storeURL: URL,
         projectsDir: String = "", pusher: LiveActivityPusher = LiveActivityPusher(client: nil),
         devicePusher: DevicePusher = DevicePusher(client: nil, devicesURL: nil),
-        autoResumeDefault: Bool = false, processTTL: TimeInterval = 1800
+        autoResumeDefault: Bool = false, processTTL: TimeInterval = 1800, processPool: Int = 4,
+        abortGrace: TimeInterval = 10
     ) {
         self.autoResumeDefault = autoResumeDefault
         self.processTTL = processTTL
+        self.processPool = max(1, processPool)
+        self.abortGrace = abortGrace
         self.pusher = pusher
         self.devicePusher = devicePusher
         self.runner = runner
@@ -460,30 +469,35 @@ actor SessionStore {
         let launch = ClaudeLaunch(
             resume: resume, fork: fork, directory: directory ?? runner.workdir,
             ultracode: ultracode)
-        Task {
-            await self.launchTurn(
-                id, prompt: text, launch: launch, model: model, effort: effort,
-                turnClaudeID: turnClaudeID)
-        }
-    }
-
-    /// Opens the turn on the conversation's process — the one already there when it can take the
-    /// turn, a fresh one otherwise — and hands it the prompt. The turn is open from here: the row
-    /// is live and the empty answer is on the wire before the CLI has said a word, exactly as the
-    /// one-process-per-turn runner did, so nothing a client sees changed shape.
-    private func launchTurn(
-        _ id: String, prompt: String, launch: ClaudeLaunch, model: String, effort: String,
-        turnClaudeID: String
-    ) async {
+        // The turn is open from here, before anything is awaited: the row is live and the empty
+        // answer is on the wire before the CLI has said a word, exactly as the one-process-per-
+        // turn runner did — and a line the process writes in the meantime finds a turn to land
+        // in rather than opening one of its own beside this one.
         let messageID = UUID().uuidString
         openTurns[id] = OpenTurn(
             assembler: Assembler(messageID: messageID), startedAt: Date(),
-            turnClaudeID: turnClaudeID, resume: launch.resume, reportedSessionID: launch.resume)
+            turnClaudeID: turnClaudeID, resume: resume, reportedSessionID: resume)
         publish(id, .status("running"))
         publish(
             id,
             .messageUpserted(
                 Message(id: messageID, role: .assistant, parts: [.text("")], createdAt: Date())))
+        Task {
+            await self.launchTurn(
+                id, prompt: text, launch: launch, model: model, effort: effort)
+        }
+    }
+
+    /// Hands the prompt to the conversation's process — the one already there when it can take
+    /// the turn, a fresh one otherwise. A process that was replaced or reaped between being
+    /// picked and being written to is not the one that will close this turn, so the prompt goes
+    /// again on a fresh one, once; a process that merely died keeps the turn until its exit
+    /// closes it, because lines may still be arriving.
+    private func launchTurn(
+        _ id: String, prompt: String, launch: ClaudeLaunch, model: String, effort: String,
+        retrying: Bool = false
+    ) async {
+        guard openTurns[id] != nil else { return }
         let process: ClaudeProcess
         do {
             process = try await self.process(for: id, launch: launch, model: model, effort: effort)
@@ -496,9 +510,16 @@ actor SessionStore {
         do {
             try await process.send(prompt)
         } catch {
-            // The process went before the prompt reached it. Its exit closes the turn with
-            // whatever it managed to say — closing here would drop lines still on their way in.
-            // A process that took its stdin away and stayed alive is not one to wait on.
+            guard processes[id] === process else {
+                guard !retrying else {
+                    closeTurn(id, fallback: "⚠️ Could not start Claude.")
+                    return
+                }
+                await launchTurn(
+                    id, prompt: prompt, launch: launch, model: model, effort: effort,
+                    retrying: true)
+                return
+            }
             if await process.isRunning { await process.terminate() }
         }
     }
@@ -522,10 +543,17 @@ actor SessionStore {
         let process = ClaudeProcess(
             claudePath: runner.claudePath, permissionMode: runner.permissionMode, launch: launch,
             model: model, effort: effort,
-            sink: { [weak self] line in await self?.ingest(id, line: line) },
+            sink: { [weak self] process, line in await self?.ingest(id, from: process, line: line) },
             onExit: { [weak self] process in await self?.processExited(id, process) })
-        try await process.start()
+        // Registered before it starts: a fast process speaks before `start()` returns, and a line
+        // from a process the store does not know is a line from nobody.
         processes[id] = process
+        do {
+            try await process.start()
+        } catch {
+            if processes[id] === process { processes[id] = nil }
+            throw error
+        }
         return process
     }
 
@@ -543,8 +571,9 @@ actor SessionStore {
     /// that arrives with no turn open is the CLI starting one on its own — background work it was
     /// carrying between turns ended and it is dealing with the report, as the TUI would — and it
     /// is given a turn to land in rather than being dropped.
-    private func ingest(_ id: String, line: String) {
-        guard let data = line.data(using: .utf8),
+    private func ingest(_ id: String, from process: ClaudeProcess, line: String) {
+        guard processes[id] === process,
+            let data = line.data(using: .utf8),
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
         if openTurns[id] == nil {
@@ -566,15 +595,14 @@ actor SessionStore {
     /// Which lines are a turn beginning when none is open. The CLI's own bookkeeping — a task
     /// ending, a rate-limit notice — is not; the model speaking, a tool answering, or a turn
     /// closing is.
+    /// A `result` on its own is not — a slash command's zero-turn answer that outran its
+    /// swallow, say — because a turn opened for it would close at once as an empty message.
     private static func opensTurn(_ object: [String: Any]) -> Bool {
         switch object["type"] as? String {
-        case "assistant", "stream_event", "result":
+        case "assistant", "stream_event":
             return true
         case "system":
             return object["subtype"] as? String == "init"
-        case "user":
-            let message = object["message"] as? [String: Any]
-            return message?["content"] is [[String: Any]]
         default:
             return false
         }
@@ -638,25 +666,47 @@ actor SessionStore {
     /// The conversation's process ended. A turn it had open is closed with what it had produced;
     /// the next prompt starts a fresh process on the same transcript.
     private func processExited(_ id: String, _ process: ClaudeProcess) {
-        if processes[id] === process { processes[id] = nil }
+        // A process that was replaced, reaped or dropped is not the one the open turn is on; its
+        // exit is its own business and must not close a turn that has just started elsewhere.
+        guard processes[id] === process else { return }
+        processes[id] = nil
         guard openTurns[id] != nil else { return }
         closeTurn(id, fallback: nil)
     }
 
     /// Ends idle processes that have outlived their keep. A process with background work still
     /// running is not idle whatever its stdin has heard lately.
+    ///
+    /// Every reading here is taken across an await, and a turn can open on a process between the
+    /// reading and the decision — so the decision is checked again on the same actor step it is
+    /// carried out, and a process a turn has since claimed is left exactly where it is.
     func reapIdleProcesses() async {
+        var idle: [(id: String, process: ClaudeProcess, lastActivityAt: Date)] = []
         for (id, process) in processes where openTurns[id] == nil {
             guard await process.isRunning else {
-                if processes[id] === process { processes[id] = nil }
+                if processes[id] === process, openTurns[id] == nil { processes[id] = nil }
                 continue
             }
-            guard await process.liveTasks.isEmpty,
-                Date().timeIntervalSince(await process.lastActivityAt) > processTTL
-            else { continue }
-            if processes[id] === process { processes[id] = nil }
-            await process.close()
+            guard await process.liveTasks.isEmpty else { continue }
+            idle.append((id, process, await process.lastActivityAt))
         }
+        idle.sort { $0.lastActivityAt < $1.lastActivityAt }
+        let now = Date()
+        for (index, entry) in idle.enumerated() {
+            let overKeep = now.timeIntervalSince(entry.lastActivityAt) > processTTL
+            let overPool = idle.count - index > processPool
+            guard overKeep || overPool else { continue }
+            guard openTurns[entry.id] == nil, processes[entry.id] === entry.process else { continue }
+            processes[entry.id] = nil
+            await entry.process.close()
+        }
+    }
+
+    /// How many conversations have a live process right now.
+    func liveProcessCount() async -> Int {
+        var count = 0
+        for (_, process) in processes where await process.isRunning { count += 1 }
+        return count
     }
 
     func startReaper() {
@@ -919,10 +969,23 @@ actor SessionStore {
             kill(pid, SIGTERM)
             return (true, discarded)
         }
-        Task {
-            if await !process.interrupt() { await process.terminate() }
+        let grace = abortGrace
+        Task { [weak self] in
+            guard await process.interrupt() else {
+                await process.terminate()
+                return
+            }
+            try? await Task.sleep(for: .seconds(grace))
+            await self?.endIfStillStopping(id, process)
         }
         return (true, discarded)
+    }
+
+    /// An interrupt the CLI accepted and then never closed the turn for — a tool it could not
+    /// kill — is finished the hard way, so a stop that was pressed is a stop that happens.
+    private func endIfStillStopping(_ id: String, _ process: ClaudeProcess) async {
+        guard openTurns[id] != nil, processes[id] === process else { return }
+        await process.terminate()
     }
 
     /// True while this bridge holds a turn slot for the session — including a prompt still waiting
@@ -1071,6 +1134,13 @@ actor SessionStore {
         guard attempts < AutoContinue.limit else { return }
         if let lifts = Cooldown.resetsAt(answer) {
             waitOutCooldown(id, until: lifts)
+            return
+        }
+        // A process that is still there carries its own background work and will start a turn
+        // for it when it ends; the orphans this scan finds are only orphans once nothing is
+        // running them.
+        guard processes[id] == nil else {
+            autoContinues[id] = 0
             return
         }
         let pending = BackgroundScan.pending(
