@@ -133,13 +133,29 @@ actor SessionStore {
     /// front of does not, which is why it is a decision and not a behaviour.
     private let autoResumeDefault: Bool
 
+    /// The long-lived CLI behind each conversation, and the turn each one currently has open. A
+    /// process outlives its turns so the work a turn leaves running in the background outlives it
+    /// too; it is let go once it has been idle for ``processTTL`` with nothing running.
+    private var processes: [String: ClaudeProcess] = [:]
+    private var openTurns: [String: OpenTurn] = [:]
+    private let processTTL: TimeInterval
+
+    private struct OpenTurn {
+        var assembler: Assembler
+        let startedAt: Date
+        let turnClaudeID: String
+        let resume: String?
+        var reportedSessionID: String?
+    }
+
     init(
         runner: ClaudeRunner, defaults: MachineDefaults, storeURL: URL,
         projectsDir: String = "", pusher: LiveActivityPusher = LiveActivityPusher(client: nil),
         devicePusher: DevicePusher = DevicePusher(client: nil, devicesURL: nil),
-        autoResumeDefault: Bool = false
+        autoResumeDefault: Bool = false, processTTL: TimeInterval = 1800
     ) {
         self.autoResumeDefault = autoResumeDefault
+        self.processTTL = processTTL
         self.pusher = pusher
         self.devicePusher = devicePusher
         self.runner = runner
@@ -300,6 +316,7 @@ actor SessionStore {
         sessions[id] = nil
         order.removeAll { $0 == id }
         broadcasters[id] = nil
+        dropProcess(id)
         persistNow()
     }
 
@@ -319,6 +336,7 @@ actor SessionStore {
     /// Resets a session to a fresh Claude conversation (drops history and the resumable id).
     func clear(_ id: String) {
         guard var session = sessions[id] else { return }
+        dropProcess(id)
         session.messages = []
         session.claudeSessionID = nil
         session.priorClaudeSessionIDs = nil
@@ -421,8 +439,6 @@ actor SessionStore {
         if let effort = queued.effort { session.effort = effort }
         sessions[id] = session
 
-        let caster = broadcaster(for: id)
-        let runner = self.runner
         let resume = session.claudeSessionID
         let model = session.model.isEmpty ? defaults.model() : session.model
         let requestedEffort = session.effort.isEmpty ? defaults.effort() : session.effort
@@ -441,27 +457,228 @@ actor SessionStore {
             fork: fork, directory: directory, startedAt: Date(), pid: nil,
             queued: (pendingPrompts[id] ?? []).map(\.record))
         journal.write(to: journalURL)
+        let launch = ClaudeLaunch(
+            resume: resume, fork: fork, directory: directory ?? runner.workdir,
+            ultracode: ultracode)
         Task {
-            let turnStart = Date()
-            let outcome = await runner.run(
-                prompt: text, resume: resume, model: model, effort: effort,
-                ultracode: ultracode, fork: fork,
-                directory: directory,
-                onStart: { pid in Task { await self.registerTurnProcess(id, pid: pid) } },
-                onSessionID: { sid in Task { await self.linkClaudeSession(id, claudeSessionID: sid) } },
-                onBackground: { toolID, outcome in
-                    Task { await self.seatBackgroundOutcome(id, toolID: toolID, outcome: outcome) }
-                },
-                emit: { event in
-                    caster.send(event)
-                    Task {
-                        await self.mirrorLiveTurn(id, event)
-                        await self.pusher.noteEvent(event, sessionID: id)
-                    }
-                })
-            await self.finishTurn(
-                id, outcome: outcome, turnClaudeID: turnClaudeID, startedAt: turnStart)
+            await self.launchTurn(
+                id, prompt: text, launch: launch, model: model, effort: effort,
+                turnClaudeID: turnClaudeID)
         }
+    }
+
+    /// Opens the turn on the conversation's process — the one already there when it can take the
+    /// turn, a fresh one otherwise — and hands it the prompt. The turn is open from here: the row
+    /// is live and the empty answer is on the wire before the CLI has said a word, exactly as the
+    /// one-process-per-turn runner did, so nothing a client sees changed shape.
+    private func launchTurn(
+        _ id: String, prompt: String, launch: ClaudeLaunch, model: String, effort: String,
+        turnClaudeID: String
+    ) async {
+        let messageID = UUID().uuidString
+        openTurns[id] = OpenTurn(
+            assembler: Assembler(messageID: messageID), startedAt: Date(),
+            turnClaudeID: turnClaudeID, resume: launch.resume, reportedSessionID: launch.resume)
+        publish(id, .status("running"))
+        publish(
+            id,
+            .messageUpserted(
+                Message(id: messageID, role: .assistant, parts: [.text("")], createdAt: Date())))
+        let process: ClaudeProcess
+        do {
+            process = try await self.process(for: id, launch: launch, model: model, effort: effort)
+        } catch {
+            publish(id, .error("Failed to launch Claude: \(error.localizedDescription)"))
+            closeTurn(id, fallback: "⚠️ Could not start Claude.")
+            return
+        }
+        registerTurnProcess(id, pid: await process.pid)
+        do {
+            try await process.send(prompt)
+        } catch {
+            // The process went before the prompt reached it. Its exit closes the turn with
+            // whatever it managed to say — closing here would drop lines still on their way in.
+            // A process that took its stdin away and stayed alive is not one to wait on.
+            if await process.isRunning { await process.terminate() }
+        }
+    }
+
+    /// The conversation's process, kept when it can take this turn and replaced when it cannot.
+    /// A model is changed in place and an effort level too; a process that refuses either, or
+    /// that is on a different transcript or directory, or has exited, is let go for a new one.
+    private func process(
+        for id: String, launch: ClaudeLaunch, model: String, effort: String
+    ) async throws -> ClaudeProcess {
+        if let existing = processes[id] {
+            if await existing.serves(launch) {
+                var kept = true
+                if await existing.model != model { kept = await existing.setModel(model) }
+                if kept, await existing.effort != effort { kept = await existing.setEffort(effort) }
+                if kept { return existing }
+            }
+            if processes[id] === existing { processes[id] = nil }
+            await existing.close()
+        }
+        let process = ClaudeProcess(
+            claudePath: runner.claudePath, permissionMode: runner.permissionMode, launch: launch,
+            model: model, effort: effort,
+            sink: { [weak self] line in await self?.ingest(id, line: line) },
+            onExit: { [weak self] process in await self?.processExited(id, process) })
+        try await process.start()
+        processes[id] = process
+        return process
+    }
+
+    /// One event of a turn, on the wire and in the mirror. What the runner's emit closure used to
+    /// do from a detached task, done in order on the actor — so the mirror can never see a turn's
+    /// final message after the turn has settled.
+    private func publish(_ id: String, _ event: BridgeEvent) {
+        broadcaster(for: id).send(event)
+        mirrorLiveTurn(id, event)
+        let pusher = self.pusher
+        Task { await pusher.noteEvent(event, sessionID: id) }
+    }
+
+    /// Every line the conversation's process writes, folded into whatever turn is open. A line
+    /// that arrives with no turn open is the CLI starting one on its own — background work it was
+    /// carrying between turns ended and it is dealing with the report, as the TUI would — and it
+    /// is given a turn to land in rather than being dropped.
+    private func ingest(_ id: String, line: String) {
+        guard let data = line.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return }
+        if openTurns[id] == nil {
+            guard Self.opensTurn(object) else { return }
+            beginUnsolicitedTurn(id)
+        }
+        guard var turn = openTurns[id] else { return }
+        turn.assembler.ingest(
+            object, emit: { self.publish(id, $0) },
+            report: { toolID, outcome in self.seatBackgroundOutcome(id, toolID: toolID, outcome: outcome) })
+        if let sid = turn.assembler.sessionID, sid != turn.reportedSessionID {
+            turn.reportedSessionID = sid
+            linkClaudeSession(id, claudeSessionID: sid)
+        }
+        openTurns[id] = turn
+        if object["type"] as? String == "result" { closeTurn(id, fallback: nil) }
+    }
+
+    /// Which lines are a turn beginning when none is open. The CLI's own bookkeeping — a task
+    /// ending, a rate-limit notice — is not; the model speaking, a tool answering, or a turn
+    /// closing is.
+    private static func opensTurn(_ object: [String: Any]) -> Bool {
+        switch object["type"] as? String {
+        case "assistant", "stream_event", "result":
+            return true
+        case "system":
+            return object["subtype"] as? String == "init"
+        case "user":
+            let message = object["message"] as? [String: Any]
+            return message?["content"] is [[String: Any]]
+        default:
+            return false
+        }
+    }
+
+    static let unsolicitedDisplayPrompt = "Background work finished."
+
+    /// A turn the CLI started by itself. The slot is taken, the row goes live and the journal
+    /// records it like any other turn; what differs is only that nothing was typed to start it.
+    private func beginUnsolicitedTurn(_ id: String) {
+        guard let session = sessions[id] else { return }
+        inFlight.insert(id)
+        let turnClaudeID = session.claudeSessionID ?? id
+        retainRunnerTurn(turnClaudeID)
+        journal.turns[id] = TurnRecord(
+            turnID: UUID().uuidString, sessionID: id, claudeSessionID: session.claudeSessionID,
+            prompt: "", displayPrompt: Self.unsolicitedDisplayPrompt, model: session.model,
+            effort: session.effort, fork: false, directory: session.directory, startedAt: Date(),
+            pid: turnProcessIDs[id], queued: (pendingPrompts[id] ?? []).map(\.record))
+        journal.write(to: journalURL)
+        let messageID = UUID().uuidString
+        openTurns[id] = OpenTurn(
+            assembler: Assembler(messageID: messageID), startedAt: Date(),
+            turnClaudeID: turnClaudeID, resume: session.claudeSessionID,
+            reportedSessionID: session.claudeSessionID)
+        publish(id, .status("running"))
+        publish(
+            id,
+            .messageUpserted(
+                Message(id: messageID, role: .assistant, parts: [.text("")], createdAt: Date())))
+    }
+
+    /// The turn is over — the CLI closed it, or the process went. What was assembled is the
+    /// answer, whole or cut short, and the store settles it the way it always has.
+    private func closeTurn(_ id: String, fallback: String?) {
+        guard let turn = openTurns.removeValue(forKey: id) else { return }
+        var message = turn.assembler.finalMessage()
+        if let fallback, Self.isBlank(message) {
+            message = Message(
+                id: message.id, role: .assistant, parts: [.text(fallback)], createdAt: message.createdAt)
+        }
+        publish(id, .messageUpserted(message))
+        finishTurn(
+            id,
+            outcome: ClaudeRunner.Outcome(
+                message: message, claudeSessionID: turn.assembler.sessionID ?? turn.resume,
+                costUSD: turn.assembler.costUSD, tokens: turn.assembler.tokens,
+                didCompact: turn.assembler.didCompact),
+            turnClaudeID: turn.turnClaudeID, startedAt: turn.startedAt)
+    }
+
+    private static func isBlank(_ message: Message) -> Bool {
+        message.parts.allSatisfy { part in
+            if case .text(let text) = part {
+                return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            return false
+        }
+    }
+
+    /// The conversation's process ended. A turn it had open is closed with what it had produced;
+    /// the next prompt starts a fresh process on the same transcript.
+    private func processExited(_ id: String, _ process: ClaudeProcess) {
+        if processes[id] === process { processes[id] = nil }
+        guard openTurns[id] != nil else { return }
+        closeTurn(id, fallback: nil)
+    }
+
+    /// Ends idle processes that have outlived their keep. A process with background work still
+    /// running is not idle whatever its stdin has heard lately.
+    func reapIdleProcesses() async {
+        for (id, process) in processes where openTurns[id] == nil {
+            guard await process.isRunning else {
+                if processes[id] === process { processes[id] = nil }
+                continue
+            }
+            guard await process.liveTasks.isEmpty,
+                Date().timeIntervalSince(await process.lastActivityAt) > processTTL
+            else { continue }
+            if processes[id] === process { processes[id] = nil }
+            await process.close()
+        }
+    }
+
+    func startReaper() {
+        Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(60))
+                await self?.reapIdleProcesses()
+            }
+        }
+    }
+
+    /// Every process, ended gently. The way out at shutdown: a bridge that leaves its children
+    /// behind leaves conversations nothing can reach.
+    func shutdownProcesses() async {
+        let running = processes
+        processes = [:]
+        for (_, process) in running { await process.close() }
+    }
+
+    private func dropProcess(_ id: String) {
+        guard let process = processes.removeValue(forKey: id) else { return }
+        Task { await process.close() }
     }
 
     private func retainRunnerTurn(_ claudeSessionID: String) {
@@ -687,14 +904,24 @@ actor SessionStore {
     /// queued behind it; the runner's stream ends and the partial turn is persisted normally. Stop
     /// means stop — leaving the queue to drain would start a fresh turn the moment the one the user
     /// just killed ended.
+    ///
+    /// The turn is interrupted the way the TUI's Escape does it, which keeps the process and the
+    /// background work it carries; a process that does not answer the interrupt is terminated.
     func abortTurn(_ id: String) -> (stopped: Bool, discarded: Int) {
         let discarded = pendingPrompts.removeValue(forKey: id)?.count ?? 0
         if journal.turns[id] != nil {
             journal.turns[id]?.queued = []
             journal.write(to: journalURL)
         }
-        guard let pid = turnProcessIDs[id] else { return (false, discarded) }
-        kill(pid, SIGTERM)
+        guard openTurns[id] != nil else { return (false, discarded) }
+        guard let process = processes[id] else {
+            guard let pid = turnProcessIDs[id] else { return (false, discarded) }
+            kill(pid, SIGTERM)
+            return (true, discarded)
+        }
+        Task {
+            if await !process.interrupt() { await process.terminate() }
+        }
         return (true, discarded)
     }
 
@@ -710,9 +937,15 @@ actor SessionStore {
     /// The two facts have to be unioned rather than picked between: a bridge-run turn whose single
     /// tool has been quiet for four minutes is invisible on disk, and a `claude` somebody started at
     /// the desk is invisible in here. A restart ends both.
-    func turnsInFlight(activeClaudeIDs: Set<String>) -> Int {
+    ///
+    /// Background work a process is still carrying between turns counts too: nothing is being
+    /// answered, but a restart would kill it all the same.
+    func turnsInFlight(activeClaudeIDs: Set<String>) async -> Int {
         var busy = Set<String>()
         for id in inFlight { busy.insert(sessions[id]?.claudeSessionID ?? id) }
+        for (id, process) in processes where await !process.liveTasks.isEmpty {
+            busy.insert(sessions[id]?.claudeSessionID ?? id)
+        }
         return busy.union(activeClaudeIDs).count
     }
 

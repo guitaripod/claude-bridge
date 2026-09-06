@@ -1,7 +1,8 @@
 import Foundation
 
-/// Spawns `claude -p` in streaming-JSON mode for one turn, maps its events to ``BridgeEvent``s,
-/// and returns the assembled assistant message plus the (new or resumed) Claude session id.
+/// Where the CLI is and how it is allowed to act, plus what one turn of it comes back as. The
+/// process itself is ``ClaudeProcess`` — one per conversation, alive across turns — and the
+/// folding of its events into a message is ``Assembler``, one per turn.
 struct ClaudeRunner: Sendable {
     let claudePath: String
     let workdir: String
@@ -17,129 +18,12 @@ struct ClaudeRunner: Sendable {
         var didCompact = false
     }
 
-    func run(
-        prompt: String,
-        resume claudeSessionID: String?,
-        model: String,
-        effort: String,
-        ultracode: Bool = false,
-        fork: Bool = false,
-        directory: String? = nil,
-        onStart: (@Sendable (Int32) -> Void)? = nil,
-        onSessionID: (@Sendable (String) -> Void)? = nil,
-        onBackground: (@Sendable (String, BackgroundOutcome) -> Void)? = nil,
-        emit: @Sendable @escaping (BridgeEvent) -> Void
-    ) async -> Outcome {
-        let cwd = directory ?? workdir
-        let messageID = UUID().uuidString
-        var arguments = [
-            "-p", prompt,
-            "--output-format", "stream-json",
-            "--include-partial-messages",
-            "--verbose",
-            "--model", model,
-            "--effort", effort,
-            "--permission-mode", permissionMode,
-            "--add-dir", cwd,
-        ]
-        if permissionMode == "bypassPermissions" {
-            arguments.append("--dangerously-skip-permissions")
-        }
-        if ultracode {
-            arguments += ["--settings", #"{"ultracode":true}"#]
-        }
-        if let claudeSessionID {
-            arguments += ["--resume", claudeSessionID]
-            if fork { arguments.append("--fork-session") }
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: claudePath)
-        process.arguments = arguments
-        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        var environment = ProcessInfo.processInfo.environment
-        environment["CLAUDE_CODE_ENTRYPOINT"] = "claude-bridge"
-        process.environment = environment
-
-        let stdout = Pipe()
-        process.standardOutput = stdout
-        process.standardError = FileHandle.nullDevice
-
-        let exit = ExitLatch()
-        process.terminationHandler = { _ in exit.signal() }
-
-        emit(.status("running"))
-        emit(
-            .messageUpserted(
-                Message(id: messageID, role: .assistant, parts: [.text("")], createdAt: Date())))
-
-        var assembler = Assembler(messageID: messageID)
-        let lines = Self.lineStream(from: stdout.fileHandleForReading)
-        do {
-            try process.run()
-        } catch {
-            emit(.error("Failed to launch Claude: \(error.localizedDescription)"))
-            return Outcome(
-                message: Message(
-                    id: messageID, role: .assistant,
-                    parts: [.text("⚠️ Could not start Claude.")], createdAt: Date()),
-                claudeSessionID: claudeSessionID)
-        }
-
-        onStart?(process.processIdentifier)
-        var reportedSessionID: String?
-        for await line in lines {
-            guard let data = line.data(using: .utf8),
-                let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else { continue }
-            assembler.ingest(
-                object, emit: emit,
-                report: { toolID, outcome in onBackground?(toolID, outcome) })
-            if let sid = assembler.sessionID, sid != reportedSessionID {
-                reportedSessionID = sid
-                onSessionID?(sid)
-            }
-        }
-        await Self.awaitExit(of: process, latch: exit)
-
-        let message = assembler.finalMessage()
-        emit(.messageUpserted(message))
-        return Outcome(
-            message: message, claudeSessionID: assembler.sessionID ?? claudeSessionID,
-            costUSD: assembler.costUSD, tokens: assembler.tokens,
-            didCompact: assembler.didCompact)
-    }
-
-    /// Waits for the child to die without ever calling `waitUntilExit()`.
-    /// That call spins the *calling* thread's run loop, but a Swift-concurrency
-    /// task resumes on whatever cooperative thread is free after an await — not
-    /// necessarily the one that launched the process — and the death
-    /// notification is then delivered to a run loop nobody is spinning. The
-    /// wait never returns: the turn never finishes, the session never leaves
-    /// "running", and the blocked cooperative thread is gone for good. The
-    /// termination handler fires on a Foundation-owned queue instead, with a
-    /// bounded fallback in case it is never called at all — stdout is already
-    /// at EOF by the time we get here, so the child is done in every normal case.
-    private static func awaitExit(of process: Process, latch: ExitLatch) async {
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { await latch.wait() }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(15))
-            }
-            await group.next()
-            group.cancelAll()
-        }
-        guard process.isRunning else { return }
-        log("child \(process.processIdentifier) outlived its output; terminating")
-        process.terminate()
-    }
-
     private static func log(_ message: String) {
         FileHandle.standardError.write(Data("[runner] \(message)\n".utf8))
     }
 
     /// Reads a file handle on a background thread, yielding complete newline-delimited lines.
-    private static func lineStream(from handle: FileHandle) -> AsyncStream<String> {
+    static func lineStream(from handle: FileHandle) -> AsyncStream<String> {
         AsyncStream { continuation in
             Thread.detachNewThread {
                 var buffer = Data()
@@ -165,7 +49,7 @@ struct ClaudeRunner: Sendable {
 /// One-shot exit signal: resumes whoever is awaiting the child, whether the
 /// termination handler fires before or after the wait begins, and lets a
 /// cancelled wait fall through instead of stranding the task.
-private final class ExitLatch: @unchecked Sendable {
+final class ExitLatch: @unchecked Sendable {
     private let lock = NSLock()
     private var continuation: CheckedContinuation<Void, Never>?
     private var signalled = false
@@ -200,12 +84,15 @@ private final class ExitLatch: @unchecked Sendable {
 /// Folds Claude's stream-json events into a single assistant message, emitting incremental events.
 /// Parts keep stream order — narration text stays interleaved with the tool calls it describes
 /// instead of collapsing into one trailing blob.
-private struct Assembler {
+struct Assembler {
     let messageID: String
     var sessionID: String?
     var costUSD: Double?
     var tokens: Int?
     private(set) var didCompact = false
+    /// The numbers the CLI reports for a compaction it just did, from its own boundary record.
+    /// The transcript's copy carries the summary as well and replaces this once it lands.
+    private var compactionMetadata: Compaction?
     private enum Segment {
         case text(String)
         case thinking(String)
@@ -234,6 +121,10 @@ private struct Assembler {
                 if let sid = object["session_id"] as? String { sessionID = sid }
             case "status":
                 ingestCompactionStatus(object, emit: emit)
+            case "compact_boundary":
+                ingestCompactionBoundary(object)
+            case "task_notification":
+                ingestTaskNotificationEvent(object, emit: emit, report: report)
             default:
                 break
             }
@@ -292,6 +183,49 @@ private struct Assembler {
         } else if object["status"] as? String == "compacting" {
             emit(.compaction(phase: "started", error: nil))
         }
+    }
+
+    /// The CLI's own record of a compaction it just did — trigger, tokens before and after, how
+    /// long it took. The seam is appended here if the status markers did not already put it in
+    /// stream order, so an auto-compaction reported only by its boundary still renders.
+    private mutating func ingestCompactionBoundary(_ object: [String: Any]) {
+        guard let meta = object["compact_metadata"] as? [String: Any] else { return }
+        var compaction = Compaction()
+        compaction.trigger = meta["trigger"] as? String
+        compaction.tokensBefore = (meta["pre_tokens"] as? NSNumber)?.intValue
+        compaction.tokensAfter = (meta["post_tokens"] as? NSNumber)?.intValue
+        compaction.durationMs = (meta["duration_ms"] as? NSNumber)?.doubleValue
+        compactionMetadata = compaction
+        guard !didCompact else { return }
+        didCompact = true
+        segments.append(.compaction)
+        blockBoundary = true
+    }
+
+    /// The harness's report that background work ended, as the long-lived CLI delivers it: a
+    /// structured line rather than a user message, naming the task and — for work this bridge
+    /// launched — the call that started it. Seated the same way the text form is.
+    private mutating func ingestTaskNotificationEvent(
+        _ object: [String: Any], emit: (BridgeEvent) -> Void,
+        report: (String, BackgroundOutcome) -> Void
+    ) {
+        let status: BackgroundOutcome.Status
+        switch (object["status"] as? String)?.lowercased() {
+        case "completed", "success", "succeeded": status = .completed
+        case "stopped", "killed", "cancelled", "canceled", "aborted": status = .stopped
+        default: status = .failed
+        }
+        let outcome = BackgroundOutcome(
+            taskID: object["task_id"] as? String, status: status,
+            summary: object["summary"] as? String, result: nil, reportedAt: Date())
+        if let toolID = object["tool_use_id"] as? String {
+            seat(toolID, outcome, emit: emit, report: report)
+            return
+        }
+        guard let taskID = object["task_id"] as? String, let toolID = taskLaunches[taskID] else {
+            return
+        }
+        seat(toolID, outcome, emit: emit, report: report)
     }
 
     private mutating func ingestStreamEvent(_ event: [String: Any], emit: (BridgeEvent) -> Void) {
@@ -471,7 +405,7 @@ private struct Assembler {
             case .file(let file):
                 parts.append(.file(file))
             case .compaction:
-                parts.append(.compaction(Compaction()))
+                parts.append(.compaction(compactionMetadata ?? Compaction()))
             }
         }
         if parts.isEmpty { parts.append(.text("")) }

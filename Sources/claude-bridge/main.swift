@@ -50,6 +50,10 @@ func startExternalIdleSweep(index: TranscriptIndex, store: SessionStore) {
     }
 }
 
+// A prompt written to a CLI that has just exited must come back as an error, not take the bridge
+// down with it.
+signal(SIGPIPE, SIG_IGN)
+
 let home = FileManager.default.homeDirectoryForCurrentUser.path
 let port = Int(env("BRIDGE_PORT", "4098")) ?? 4098
 let bindAddress = env("BRIDGE_BIND", "127.0.0.1")
@@ -106,7 +110,9 @@ let store = SessionStore(
     devicePusher: DevicePusher(
         client: apnsClient,
         devicesURL: storeURL.deletingLastPathComponent().appendingPathComponent("devices.json")),
-    autoResumeDefault: env("BRIDGE_AUTO_RESUME", "0") == "1")
+    autoResumeDefault: env("BRIDGE_AUTO_RESUME", "0") == "1",
+    processTTL: Double(env("BRIDGE_PROCESS_TTL", "1800")) ?? 1800)
+await store.startReaper()
 
 let router = Router(context: BridgeRequestContext.self)
 let tailnetGate: TailnetGate? =
@@ -158,8 +164,10 @@ let app = Application(
 print("claude-bridge listening on \(bindAddress):\(port) — workdir \(workdir), claude \(claudePath)")
 do {
     try await app.runService()
+    await store.shutdownProcesses()
     await store.flush()
 } catch {
+    await store.shutdownProcesses()
     await store.flush()
     throw error
 }

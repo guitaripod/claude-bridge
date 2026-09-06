@@ -141,7 +141,10 @@ struct TurnSerializationTests {
         #expect(await store.hasQueuedOrRunningTurn(forked.id))
         #expect(await store.hasRunnerTurnInFlight(claudeSessionID: "fake-session"))
 
-        try await Task.sleep(for: .milliseconds(600))
+        let deadline = ContinuousClock.now + .seconds(2)
+        while await store.hasQueuedOrRunningTurn(parent.id), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
         #expect(await store.hasQueuedOrRunningTurn(parent.id) == false)
         #expect(await store.hasRunnerTurnInFlight(claudeSessionID: "fake-session"))
 
