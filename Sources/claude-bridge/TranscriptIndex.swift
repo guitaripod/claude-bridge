@@ -548,6 +548,17 @@ actor TranscriptIndex {
         return dates
     }
 
+    /// Whether the conversation's own turn is open on disk: the transcript was written within the
+    /// activity window and its last turn has not closed. Narrower than ``isWriting(_:within:)``,
+    /// which also counts agents working for the session after its own turn settled.
+    func hasOpenTurn(_ id: String) -> Bool {
+        guard let path = path(for: id) else { return false }
+        let threshold = Date().addingTimeInterval(-Self.activityWindow)
+        guard let content = TranscriptParser.lastContentDate(atPath: path), content > threshold
+        else { return false }
+        return !TranscriptParser.isTurnClosed(atPath: path)
+    }
+
     /// True when the transcript (or its subagent sidecars) was written within
     /// the window — someone's process is actively working in the session.
     func isWriting(_ id: String, within seconds: TimeInterval) -> Bool {

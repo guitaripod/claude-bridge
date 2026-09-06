@@ -187,12 +187,27 @@ struct Session: Codable, Sendable {
     var autoResume: Bool?
     /// Derived from the transcript when a session is served, never stored — the CLI owns goal state.
     var goal: GoalStatus?
+    /// Stamped when a session is served, never stored: whether something is moving in this
+    /// conversation — its own turn, or agents still working for it — and, narrower, whether its
+    /// own turn is open. The transcript alone cannot say when a turn ended, because the CLI never
+    /// stamps a message complete, so a client that lost the one frame saying so reads it here.
+    var active: Bool?
+    var turnOpen: Bool?
 
     var summary: SessionSummary {
         SessionSummary(
             id: id, title: title, directory: directory, model: model, effort: effort,
             createdAt: createdAt, updatedAt: updatedAt)
     }
+}
+
+/// `GET /sessions/:id/revision`: the bridge's record of one session in one small answer, so a
+/// client may ask on a clock while its stream is quiet. Served from what the observer computed
+/// within the last second rather than recomputed per request.
+struct SessionRevision: Codable, Sendable {
+    var updatedAt: Date
+    var active: Bool
+    var turnOpen: Bool
 }
 
 struct SessionSummary: Codable, Sendable, Equatable {

@@ -363,9 +363,57 @@ func registerRoutes(
         return jsonResponse(CommandCatalog.all(home: home, directory: directory))
     }
 
+    /// Whether a stored session's own turn is open, and whether anything at all is moving in it.
+    /// A turn this bridge is running or holding a prompt for is open whatever the transcript says
+    /// — the CLI may not have written a line yet — and otherwise the transcript decides. The
+    /// wider reading is the observer's, which also counts agents still working for the chat.
+    @Sendable func liveness(of session: Session) async -> (active: Bool, turnOpen: Bool) {
+        var held = await store.hasQueuedOrRunningTurn(session.id)
+        if !held, let claudeID = session.claudeSessionID {
+            held = await store.hasRunnerTurnInFlight(claudeSessionID: claudeID)
+        }
+        var turnOpen = held
+        if !turnOpen, let claudeID = session.claudeSessionID {
+            turnOpen = await index.hasOpenTurn(claudeID)
+        }
+        let observed = await observer.summary(for: session.id)
+        return (held || turnOpen || (observed?.active ?? false), turnOpen)
+    }
+
+    /// The bridge's record of one session in one small answer, for a client asking on a clock
+    /// while its stream is quiet. What the observer computed within the last second answers the
+    /// wider reading and the stamp; the turn itself is read the way `GET /sessions/:id` reads it.
+    router.get("sessions/:id/revision") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        if let session = await store.get(id) {
+            let live = await liveness(of: session)
+            let observed = await observer.summary(for: id)
+            return jsonResponse(
+                SessionRevision(
+                    updatedAt: max(session.updatedAt, observed?.updatedAt ?? session.updatedAt),
+                    active: live.active, turnOpen: live.turnOpen))
+        }
+        if let observed = await observer.summary(for: id) {
+            return jsonResponse(
+                SessionRevision(
+                    updatedAt: observed.updatedAt, active: observed.active ?? false,
+                    turnOpen: observed.turnOpen ?? observed.active ?? false))
+        }
+        if await index.contains(id) {
+            return jsonResponse(
+                SessionRevision(
+                    updatedAt: await index.updatedAt(for: id) ?? .distantPast,
+                    active: await index.hasOpenTurn(id), turnOpen: await index.hasOpenTurn(id)))
+        }
+        return jsonResponse(["error": "not found"], status: .notFound)
+    }
+
     router.get("sessions/:id") { _, context in
         let id = context.parameters.get("id") ?? ""
         if var session = await store.get(id) {
+            let live = await liveness(of: session)
+            session.active = live.active
+            session.turnOpen = live.turnOpen
             if let partial = await store.liveTurnMessage(id) {
                 session.messages.append(partial)
             } else if let claudeID = session.claudeSessionID,
@@ -393,6 +441,14 @@ func registerRoutes(
         }
         if var discovered = await index.session(id) {
             discovered.goal = await index.goal(for: id)
+            if let observed = await observer.summary(for: id) {
+                discovered.active = observed.active
+                discovered.turnOpen = observed.turnOpen
+            } else {
+                let open = await index.hasOpenTurn(id)
+                discovered.active = open
+                discovered.turnOpen = open
+            }
             return jsonResponse(discovered)
         }
         return jsonResponse(["error": "not found"], status: .notFound)

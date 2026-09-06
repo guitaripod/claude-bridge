@@ -159,6 +159,12 @@ actor ObserverLoop {
         lastSummaries.values.sorted { $0.updatedAt > $1.updatedAt }
     }
 
+    /// One row of the same snapshot. Nil for a session the sweep has not seen — a chat created
+    /// since, or one the observer has not counted yet — which is *not known* rather than idle.
+    func summary(for id: String) -> SessionSummary? {
+        lastSummaries[id]
+    }
+
     private func currentSummaries() async -> [String: SessionSummary] {
         let active = await index.activeIDs(within: TranscriptIndex.activityWindow)
         let dates = await index.transcriptDates()
