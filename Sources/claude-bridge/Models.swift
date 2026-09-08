@@ -223,7 +223,13 @@ struct SessionRevision: Codable, Sendable {
 /// Background work a conversation's process is carrying between turns, as the CLI reports it: how
 /// many tasks, and — when there is exactly one — what it is. Absent means none; the CLI's own
 /// level signal (`background_tasks_changed`) replaces the whole set on every change, so a missed
-/// edge can never leave a stale indicator standing.
+/// edge cannot leave a stale count standing.
+///
+/// It cannot, however, save a task the CLI stops speaking about at all: one killed without a
+/// `task_notification` and without a level that prunes it stays in the set for the life of the
+/// process. That is why this is reported only *between* turns, which is the whole of what it
+/// means — a running turn outranks it, so a stale entry cannot make a session that is plainly
+/// thinking also claim to be carrying work nobody can see.
 struct BackgroundWork: Codable, Sendable, Equatable {
     var tasks: Int
     var task: String?

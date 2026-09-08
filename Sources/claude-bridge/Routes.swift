@@ -399,7 +399,8 @@ func registerRoutes(
                 SessionRevision(
                     updatedAt: max(session.updatedAt, observed?.updatedAt ?? session.updatedAt),
                     active: live.active, turnOpen: live.turnOpen,
-                    backgroundTasks: work?.tasks, backgroundTask: work?.task))
+                    backgroundTasks: live.turnOpen ? nil : work?.tasks,
+                    backgroundTask: live.turnOpen ? nil : work?.task))
         }
         if let observed = await observer.summary(for: id) {
             return jsonResponse(
@@ -422,7 +423,7 @@ func registerRoutes(
             let live = await liveness(of: session)
             session.active = live.active
             session.turnOpen = live.turnOpen
-            if let work = await store.backgroundWork(for: id) {
+            if !live.turnOpen, let work = await store.backgroundWork(for: id) {
                 session.backgroundTasks = work.tasks
                 session.backgroundTask = work.task
             }

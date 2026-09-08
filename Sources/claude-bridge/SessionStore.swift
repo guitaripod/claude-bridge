@@ -215,7 +215,7 @@ actor SessionStore {
             if (autoContinues[id] ?? 0) > 0, summary.active == true {
                 summary.resuming = true
             }
-            if let work = carriedWork[id] {
+            if summary.turnOpen != true, let work = carriedWork[id] {
                 summary.backgroundTasks = work.tasks
                 summary.backgroundTask = work.task
             }
