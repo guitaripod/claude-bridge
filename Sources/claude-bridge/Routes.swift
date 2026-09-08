@@ -435,7 +435,8 @@ func registerRoutes(
                 transcriptDate > session.updatedAt.addingTimeInterval(2),
                 let fresh = await index.session(claudeID)
             {
-                session.messages = fresh.messages
+                session.messages = SessionStore.named(
+                    fresh.messages, asPublishedIn: session.messages)
                 session.updatedAt = transcriptDate
             }
             // A session with no linked transcript — every fresh chat before its first turn — has

@@ -378,6 +378,21 @@ actor SessionStore {
         }
     }
 
+    /// The transcript's account of a session's messages, wearing the names this bridge published
+    /// for them.
+    ///
+    /// The sweep and the tail exist to surface a turn run somewhere else — an interactive `claude`
+    /// in a terminal — and they read it off disk, where every message wears the CLI's own name.
+    /// A turn this bridge ran is on that same disk, and the moment its suppression lapses the
+    /// sweep hands the client the answer it has just finished watching arrive, under a name the
+    /// client has never seen: a second copy of the same words, standing until the next transcript
+    /// read replaces the lot. Named as published, the same event is an update of the message that
+    /// is already there.
+    func namedAsPublished(_ folded: [Message], in sessionID: String) -> [Message] {
+        guard let stored = sessions[sessionID]?.messages, !stored.isEmpty else { return folded }
+        return Self.named(folded, asPublishedIn: stored)
+    }
+
     func broadcaster(for id: String) -> Broadcaster {
         if let existing = broadcasters[id] { return existing }
         let created = Broadcaster()
@@ -1328,14 +1343,14 @@ actor SessionStore {
         if let fresh = await index?.session(claudeID), !fresh.messages.isEmpty,
             var session = sessions[id]
         {
-            session.messages = fresh.messages
+            session.messages = Self.named(fresh.messages, asPublishedIn: session.messages)
             if session.claudeSessionID == nil { session.claudeSessionID = claudeID }
             session.pendingFork = nil
             session.updatedAt = Date()
             sessions[id] = session
             moveToFront(id)
             persist()
-            if let last = fresh.messages.last(where: { $0.role == .assistant }) {
+            if let last = session.messages.last(where: { $0.role == .assistant }) {
                 broadcaster(for: id).send(.messageUpserted(last))
             }
         }
@@ -1630,6 +1645,51 @@ actor SessionStore {
 
     /// A concurrent-turn race once persisted the same assembled message twice;
     /// heal any such duplicates on load, keeping the newest occurrence in place.
+    /// The transcript's account of a conversation, wearing the names this bridge already published
+    /// for it.
+    ///
+    /// A conversation has two records and they mint ids differently: a turn this bridge ran gives
+    /// every message a store-minted id and streams it under that name, while the fold reads the
+    /// CLI's own JSONL and takes each id from the line's uuid. Serving the fold's set wholesale
+    /// therefore renames every message in the chat — the same words, a different name — and a
+    /// client's identity for a message is its id. One that has just watched an answer arrive finds
+    /// nothing in the new account by that name, keeps the copy it is holding as well, and shows the
+    /// answer twice until some later read happens to agree with the one before it.
+    ///
+    /// So the transcript is authoritative about the conversation and the store about what each
+    /// message is called. The two are walked together while they agree — the same role, and neither
+    /// one's words a departure from the other's — and the pairing stops at the first disagreement,
+    /// past which the fold is holding something this bridge never saw and its own name is the only
+    /// one there is.
+    static func named(_ folded: [Message], asPublishedIn stored: [Message]) -> [Message] {
+        var folded = folded
+        var index = 0
+        while index < folded.count, index < stored.count,
+            folded[index].role == stored[index].role,
+            wordsAgree(folded[index], stored[index])
+        {
+            folded[index].id = stored[index].id
+            index += 1
+        }
+        return folded
+    }
+
+    /// Whether two accounts of the same message can be the same message: one of them says nothing,
+    /// or one's words are how the other's begin. A partial the store recorded for a turn nobody
+    /// closed is an opening of the finished answer on disk, and an assistant message that is
+    /// nothing but tool calls has no words on either side.
+    private static func wordsAgree(_ folded: Message, _ stored: Message) -> Bool {
+        let left = words(of: folded)
+        let right = words(of: stored)
+        return left.isEmpty || right.isEmpty || left.hasPrefix(right) || right.hasPrefix(left)
+    }
+
+    private static func words(of message: Message) -> String {
+        message.parts.reduce(into: "") { text, part in
+            if case .text(let value) = part { text += value }
+        }
+    }
+
     private static func dedupedByID(_ messages: [Message]) -> [Message] {
         var lastIndexByID: [String: Int] = [:]
         for (index, message) in messages.enumerated() { lastIndexByID[message.id] = index }

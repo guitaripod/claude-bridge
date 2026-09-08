@@ -222,8 +222,14 @@ actor ObserverLoop {
             }
             if Date() < suppressedUntil[path] ?? .distantPast { continue }
             guard !advance.changed.isEmpty else { continue }
-            for message in advance.messages where advance.changed.contains(message.id) {
-                await hub.publish(.session(id: sessionID, event: .messageUpserted(message)))
+            let published = await store.namedAsPublished(advance.messages, in: sessionID)
+            for (index, message) in advance.messages.enumerated()
+            where advance.changed.contains(message.id) {
+                await hub.publish(
+                    .session(
+                        id: sessionID,
+                        event: .messageUpserted(index < published.count ? published[index] : message)
+                    ))
             }
         }
     }

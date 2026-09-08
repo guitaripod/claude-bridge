@@ -74,7 +74,9 @@ actor TranscriptWatcher {
             !TranscriptParser.isTurnClosed(atPath: path)
         {
             await report(true)
-            if let open = fold.snapshot.last, open.role == .assistant {
+            if let open = await store.namedAsPublished(fold.snapshot, in: sessionID).last,
+                open.role == .assistant
+            {
                 caster.send(.messageUpserted(open))
             }
         } else if Self.agentsWorking(transcriptPath: path) {
@@ -124,8 +126,9 @@ actor TranscriptWatcher {
             }
             guard Date() > suppressedUntil, !changed.isEmpty else { continue }
 
-            for message in fold.snapshot where changed.contains(message.id) {
-                caster.send(.messageUpserted(message))
+            let published = await store.namedAsPublished(fold.snapshot, in: sessionID)
+            for (index, message) in fold.snapshot.enumerated() where changed.contains(message.id) {
+                caster.send(.messageUpserted(index < published.count ? published[index] : message))
             }
             if TranscriptParser.isTurnClosed(atPath: path),
                 !Self.agentsWorking(transcriptPath: path)
