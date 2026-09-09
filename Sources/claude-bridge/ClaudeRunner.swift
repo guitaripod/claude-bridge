@@ -401,7 +401,10 @@ struct Assembler {
                 guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
                 parts.append(.reasoning(value))
             case .tool(let id):
-                if let call = tools[id] { parts.append(.tool(call)) }
+                if var call = tools[id] {
+                    if call.status == .running { call.status = .stopped }
+                    parts.append(.tool(call))
+                }
             case .file(let file):
                 parts.append(.file(file))
             case .compaction:

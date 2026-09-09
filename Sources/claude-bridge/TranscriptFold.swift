@@ -412,7 +412,15 @@ struct TranscriptFold: Sendable {
     }
 
     private mutating func flushTurn() {
-        guard let done = turn else { return }
+        guard var done = turn else { return }
+        for index in done.parts.indices {
+            guard case .tool(var call) = done.parts[index], call.status == .running else { continue }
+            call.status = .stopped
+            done.parts[index] = .tool(call)
+            if let location = toolLocation[call.id], location.messageIndex == nil {
+                toolLocation[call.id] = (nil, location.partIndex)
+            }
+        }
         messages.append(done)
         for (toolID, location) in toolLocation where location.messageIndex == nil {
             toolLocation[toolID] = (messages.count - 1, location.partIndex)
