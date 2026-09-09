@@ -51,6 +51,23 @@ actor ClaudeProcess {
             tasks: liveTasks.count,
             task: liveTasks.count == 1 ? liveTasks.values.first?.description : nil)
     }
+    /// Whether a `task_updated` patch says the task it names has ended. The CLI stamps an
+    /// `end_time` and a settled status on the last patch of every task it stops running, so this
+    /// is a second witness beside the level signal and the notification — and the one that still
+    /// arrives when a task ends into a turn the process is already busy with. A word this does
+    /// not recognise has ended, the way an unrecognised outcome is still an outcome: work that is
+    /// going says so in one of the few words that mean going, and counting a stranger as work
+    /// pins the process against every reaper and every restart for as long as it lives.
+    private static func patchEndsTask(_ patch: [String: Any]) -> Bool {
+        if let end = patch["end_time"], !(end is NSNull) { return true }
+        guard let status = (patch["status"] as? String)?.lowercased() else { return false }
+        return !Self.livingStatuses.contains(status)
+    }
+
+    private static let livingStatuses: Set<String> = [
+        "running", "started", "starting", "pending", "queued", "in_progress", "active",
+    ]
+
     private(set) var lastActivityAt = Date()
     private(set) var isRunning = false
     private(set) var pid: Int32 = 0
@@ -310,10 +327,13 @@ actor ClaudeProcess {
                 }
             case "task_updated":
                 if let id = object["task_id"] as? String,
-                    let patch = object["patch"] as? [String: Any],
-                    patch["is_backgrounded"] as? Bool == true, liveTasks[id] == nil
+                    let patch = object["patch"] as? [String: Any]
                 {
-                    liveTasks[id] = LiveTask(description: patch["description"] as? String)
+                    if Self.patchEndsTask(patch) {
+                        liveTasks[id] = nil
+                    } else if patch["is_backgrounded"] as? Bool == true, liveTasks[id] == nil {
+                        liveTasks[id] = LiveTask(description: patch["description"] as? String)
+                    }
                 }
             case "task_notification":
                 if let id = object["task_id"] as? String { liveTasks[id] = nil }

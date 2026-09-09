@@ -59,6 +59,13 @@ private struct StdinClaude {
                         *ambient*)
                           $P '%s\\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"m1","task_type":"local_bash","description":"tail -f log","ambient":true}]}'
                           ;;
+                        *hold*)
+                          $P '%s\\n' '{"type":"system","subtype":"task_started","task_id":"h1","task_type":"local_bash","description":"sleep 900","is_backgrounded":true}'
+                          $P '%s\\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"h1","task_type":"local_bash","description":"sleep 900"}]}'
+                          ;;
+                        *settle*)
+                          $P '%s\\n' '{"type":"system","subtype":"task_updated","task_id":"h1","patch":{"status":"completed","end_time":1788972349027}}'
+                          ;;
                       esac
                       $P '%s\\n' '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.01}'
                       case "$line" in
@@ -226,6 +233,43 @@ struct PersistentProcessTests {
         _ = await store.send(session.id, request: SendRequest(text: "start the ambient monitor"))
         await waitUntil { await assistantTexts(store, session.id).count == 1 }
         await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        #expect(await store.backgroundWork(for: session.id) == nil)
+        #expect(await store.list().first { $0.id == session.id }?.backgroundTasks == nil)
+    }
+
+    @Test("A task the CLI only ever stamps an end on is off the set")
+    func endedPatchRetiresBackgroundWork() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "hold something for me"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        #expect(await store.backgroundWork(for: session.id) == BackgroundWork(tasks: 1, task: "sleep 900"))
+
+        _ = await store.send(session.id, request: SendRequest(text: "let it settle"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        #expect(await store.backgroundWork(for: session.id) == nil)
+        #expect(await store.list().first { $0.id == session.id }?.backgroundTasks == nil)
+        #expect(fake.starts == 1)
+    }
+
+    @Test("Work goes with the process that was carrying it")
+    func replacedProcessTakesItsBackgroundWorkWithIt() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "hold something for me"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        #expect(await store.backgroundWork(for: session.id)?.tasks == 1)
+
+        _ = await store.send(session.id, request: SendRequest(text: "ultracode this one"))
+        await waitUntil { await assistantTexts(store, session.id).count == 2 }
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        #expect(fake.starts == 2)
         #expect(await store.backgroundWork(for: session.id) == nil)
         #expect(await store.list().first { $0.id == session.id }?.backgroundTasks == nil)
     }

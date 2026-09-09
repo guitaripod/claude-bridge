@@ -546,6 +546,11 @@ actor SessionStore {
     /// The conversation's process, kept when it can take this turn and replaced when it cannot.
     /// A model is changed in place and an effort level too; a process that refuses either, or
     /// that is on a different transcript or directory, or has exited, is let go for a new one.
+    ///
+    /// Whatever the outgoing process was carrying goes with it. Its own last word — the `nil` its
+    /// exit sends — arrives after the map has moved on and is refused as a line from nobody, and
+    /// the process taking its place reports only what changes from an empty set, so a count left
+    /// standing here is a count nothing can ever take down.
     private func process(
         for id: String, launch: ClaudeLaunch, model: String, effort: String
     ) async throws -> ClaudeProcess {
@@ -556,7 +561,10 @@ actor SessionStore {
                 if kept, await existing.effort != effort { kept = await existing.setEffort(effort) }
                 if kept { return existing }
             }
-            if processes[id] === existing { processes[id] = nil }
+            if processes[id] === existing {
+                processes[id] = nil
+                setBackgroundWork(id, nil)
+            }
             await existing.close()
         }
         let process = ClaudeProcess(
@@ -725,7 +733,10 @@ actor SessionStore {
         var idle: [(id: String, process: ClaudeProcess, lastActivityAt: Date)] = []
         for (id, process) in processes where openTurns[id] == nil {
             guard await process.isRunning else {
-                if processes[id] === process, openTurns[id] == nil { processes[id] = nil }
+                if processes[id] === process, openTurns[id] == nil {
+                    processes[id] = nil
+                    setBackgroundWork(id, nil)
+                }
                 continue
             }
             guard await process.liveTasks.isEmpty else { continue }

@@ -227,11 +227,12 @@ struct SessionRevision: Codable, Sendable {
 /// level signal (`background_tasks_changed`) replaces the whole set on every change, so a missed
 /// edge cannot leave a stale count standing.
 ///
-/// It cannot, however, save a task the CLI stops speaking about at all: one killed without a
-/// `task_notification` and without a level that prunes it stays in the set for the life of the
-/// process. That is why this is reported only *between* turns, which is the whole of what it
-/// means — a running turn outranks it, so a stale entry cannot make a session that is plainly
-/// thinking also claim to be carrying work nobody can see.
+/// One signal is not enough to hold that promise. A level can be missed and a notification can
+/// end into a turn the process is already busy with, so a task is also taken off the set by the
+/// `task_updated` patch that stamps its end — three witnesses, any one of which retires it.
+/// What remains uncovered is a task the CLI stops speaking about altogether, which is why this is
+/// reported only *between* turns: a running turn outranks it, so a stale entry cannot make a
+/// session that is plainly thinking also claim to be carrying work nobody can see.
 struct BackgroundWork: Codable, Sendable, Equatable {
     var tasks: Int
     var task: String?
