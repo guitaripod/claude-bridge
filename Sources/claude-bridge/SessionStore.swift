@@ -1668,31 +1668,91 @@ actor SessionStore {
     /// answer twice until some later read happens to agree with the one before it.
     ///
     /// So the transcript is authoritative about the conversation and the store about what each
-    /// message is called. The two are walked together while they agree — the same role, and neither
-    /// one's words a departure from the other's — and the pairing stops at the first disagreement,
-    /// past which the fold is holding something this bridge never saw and its own name is the only
-    /// one there is.
+    /// message is called. The two are walked together, and a disagreement is a gap rather than an
+    /// ending: the fold routinely holds what the store never saw — a compaction seam, a turn typed
+    /// into a terminal, an interrupted call the CLI re-wrote — and the store holds partials the
+    /// fold has not caught up with. Stopping at the first such message used to hand every message
+    /// after it back under the fold's names, which is how a finished answer arrived a second time
+    /// at the end of nearly every turn in any conversation long enough to have one gap in it.
+    ///
+    /// A folded message the store's next message does not match looks ahead in the store for the
+    /// message it is, but only on evidence that cannot be a coincidence — a tool call's own id, or
+    /// words long enough to be an answer — because a wrong pairing renames a different message,
+    /// which is worse than the duplicate it was avoiding. A folded message nothing matches keeps
+    /// its own name: it is the only one there is.
     static func named(_ folded: [Message], asPublishedIn stored: [Message]) -> [Message] {
         var folded = folded
-        var index = 0
-        while index < folded.count, index < stored.count,
-            folded[index].role == stored[index].role,
-            wordsAgree(folded[index], stored[index])
-        {
-            folded[index].id = stored[index].id
-            index += 1
+        var next = 0
+        var settled = -1
+        for index in folded.indices where next < stored.count {
+            if folded[index].role == stored[next].role, pair(folded[index], stored[next], .inStep) {
+                folded[index].id = stored[next].id
+                next += 1
+                settled = index
+                continue
+            }
+            let horizon = min(stored.count, next + 1 + lookahead)
+            guard next + 1 < horizon,
+                let match = (next + 1..<horizon).first(where: {
+                    stored[$0].role == folded[index].role && pair(folded[index], stored[$0], .anchor)
+                })
+            else { continue }
+            folded[index].id = stored[match].id
+            // What sits between the last settled pair and this anchor is a gap on at least one
+            // side, and the messages just before an anchor are the ones most likely to be the same
+            // on both — the prompt that asked for the answer the anchor is. Walking back from the
+            // anchor recovers them on the evidence a pinned neighbour lends, which a short prompt
+            // could never supply on its own.
+            var back = index - 1
+            var mirror = match - 1
+            while back > settled, mirror >= next, folded[back].role == stored[mirror].role,
+                pair(folded[back], stored[mirror], .backfill)
+            {
+                folded[back].id = stored[mirror].id
+                back -= 1
+                mirror -= 1
+            }
+            next = match + 1
+            settled = index
         }
         return folded
     }
 
-    /// Whether two accounts of the same message can be the same message: one of them says nothing,
-    /// or one's words are how the other's begin. A partial the store recorded for a turn nobody
-    /// closed is an opening of the finished answer on disk, and an assistant message that is
-    /// nothing but tool calls has no words on either side.
-    private static func wordsAgree(_ folded: Message, _ stored: Message) -> Bool {
+    /// How much a pairing has to prove. In step, two messages are the same unless they visibly
+    /// differ; across a gap, only on evidence that cannot be a coincidence; and walking back from
+    /// an anchor, on agreeing words of any length, because the anchor already pinned the place.
+    private enum Evidence { case inStep, anchor, backfill }
+
+    /// How far past a gap the store is searched for the message the fold is holding.
+    private static let lookahead = 64
+
+    /// The shortest run of words that identifies a message on its own.
+    private static let anchorLength = 24
+
+    /// Whether two accounts can be the same message. In step, the old rule holds: one of them says
+    /// nothing, or one's words are how the other's begin — a partial the store recorded is an
+    /// opening of the finished answer on disk, and a message of nothing but tool calls has no words
+    /// on either side. Across a gap the bar is identity rather than compatibility: a shared tool
+    /// call id, or agreeing words long enough to be an answer. Either way, two messages whose tool
+    /// calls share no id are two different messages.
+    private static func pair(_ folded: Message, _ stored: Message, _ evidence: Evidence) -> Bool {
+        let leftTools = toolIDs(of: folded)
+        let rightTools = toolIDs(of: stored)
+        if !leftTools.isEmpty, !rightTools.isEmpty {
+            return !leftTools.isDisjoint(with: rightTools)
+        }
         let left = words(of: folded)
         let right = words(of: stored)
-        return left.isEmpty || right.isEmpty || left.hasPrefix(right) || right.hasPrefix(left)
+        if left.isEmpty || right.isEmpty { return evidence == .inStep }
+        let agree = left.hasPrefix(right) || right.hasPrefix(left)
+        return agree && (evidence != .anchor || min(left.count, right.count) >= anchorLength)
+    }
+
+    private static func toolIDs(of message: Message) -> Set<String> {
+        Set(message.parts.compactMap { part in
+            if case .tool(let call) = part { return call.id }
+            return nil
+        })
     }
 
     private static func words(of message: Message) -> String {

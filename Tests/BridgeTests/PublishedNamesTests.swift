@@ -65,8 +65,8 @@ struct PublishedNamesTests {
         #expect(named.map(\.id) == ["STORE-U", "fold-a"])
     }
 
-    @Test("A role the store never recorded stops the pairing rather than shifting it")
-    func roleMismatchStopsThePairing() {
+    @Test("A message the store never recorded is a gap, not the end of the pairing")
+    func gapInTheFoldIsStepped() {
         let stored = [
             message("STORE-U", .user, "hello"),
             message("STORE-A", .assistant, "the answer"),
@@ -77,7 +77,45 @@ struct PublishedNamesTests {
             message("fold-a", .assistant, "the answer"),
         ]
         let named = SessionStore.named(folded, asPublishedIn: stored)
-        #expect(named.map(\.id) == ["STORE-U", "fold-s", "fold-a"])
+        #expect(named.map(\.id) == ["STORE-U", "fold-s", "STORE-A"])
+    }
+
+    /// The duplicate that came back after 5812898: one early turn the two records disagree about,
+    /// and every answer after it — including the one the client just watched arrive — was handed
+    /// over again under the CLI's own id.
+    @Test("One early disagreement no longer renames everything after it")
+    func earlyDivergenceDoesNotRenameTheRest() {
+        let answer = "These are made-up but plausible wall times for a full suite."
+        let stored = [
+            message("STORE-U1", .user, "first"),
+            message("STORE-A1", .assistant, "a partial the store kept"),
+            message("STORE-U2", .user, "make a table"),
+            message("STORE-A2", .assistant, answer),
+        ]
+        let folded = [
+            message("fold-u1", .user, "first"),
+            message("fold-a1", .assistant, "what the terminal wrote instead, entirely different"),
+            message("fold-x", .assistant, "and a second line the store never saw at all"),
+            message("fold-u2", .user, "make a table"),
+            message("fold-a2", .assistant, answer),
+        ]
+        let named = SessionStore.named(folded, asPublishedIn: stored)
+        #expect(named.map(\.id) == ["STORE-U1", "fold-a1", "fold-x", "STORE-U2", "STORE-A2"])
+    }
+
+    @Test("A short word is never evidence enough to jump a gap")
+    func shortWordsDoNotAnchor() {
+        let stored = [
+            message("STORE-U", .user, "go"),
+            message("STORE-A", .assistant, "Done."),
+            message("STORE-B", .assistant, "Done."),
+        ]
+        let folded = [
+            message("fold-x", .assistant, "something the store never held, long enough to matter"),
+            message("fold-b", .assistant, "Done."),
+        ]
+        let named = SessionStore.named(folded, asPublishedIn: stored)
+        #expect(named.map(\.id) == ["fold-x", "fold-b"])
     }
 
     @Test("A conversation this bridge holds nothing for is left as it is")
