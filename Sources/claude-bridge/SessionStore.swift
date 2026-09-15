@@ -145,6 +145,16 @@ actor SessionStore {
     /// How long an interrupted turn is given to close before its process is ended outright — a
     /// tool that will not die under the CLI's own interrupt is not one to wait on forever.
     private let abortGrace: TimeInterval
+    /// How long a turn whose process has never written a line is given before the launch is called
+    /// failed. A CLI that is going to speak speaks in seconds; one that never does is wedged on
+    /// startup — loading a transcript it cannot load, or waiting on something nobody will answer —
+    /// and the turn it holds open would otherwise never close.
+    private let launchTimeout: TimeInterval
+    /// How long an open turn may go without a single line from its process before the process is
+    /// ended and the turn closed. Generous on purpose: one foreground tool call can run for a very
+    /// long time without the CLI saying anything, and ending a turn that is merely slow is worse
+    /// than leaving a wedged one a while longer.
+    private let turnSilenceTTL: TimeInterval
 
     private struct OpenTurn {
         var assembler: Assembler
@@ -159,12 +169,15 @@ actor SessionStore {
         projectsDir: String = "", pusher: LiveActivityPusher = LiveActivityPusher(client: nil),
         devicePusher: DevicePusher = DevicePusher(client: nil, devicesURL: nil),
         autoResumeDefault: Bool = false, processTTL: TimeInterval = 1800, processPool: Int = 4,
-        abortGrace: TimeInterval = 10
+        abortGrace: TimeInterval = 10, launchTimeout: TimeInterval = 300,
+        turnSilenceTTL: TimeInterval = 7200
     ) {
         self.autoResumeDefault = autoResumeDefault
         self.processTTL = processTTL
         self.processPool = max(1, processPool)
         self.abortGrace = abortGrace
+        self.launchTimeout = launchTimeout
+        self.turnSilenceTTL = turnSilenceTTL
         self.pusher = pusher
         self.devicePusher = devicePusher
         self.runner = runner
@@ -723,13 +736,39 @@ actor SessionStore {
         publish(id, .background(work))
     }
 
+    /// Ends turns whose process has stopped speaking, so a wedge cannot hold a row live forever.
+    ///
+    /// Only three things close a turn otherwise: the CLI's own `result`, the process exiting, and
+    /// somebody pressing stop. A CLI that is alive and silent satisfies none of them, and an open
+    /// turn is load-bearing twice over — the session reports itself running, and the reaper skips
+    /// the conversation entirely, because a process with a turn on it is not idle by definition.
+    /// One wedged launch therefore leaves a row live and a whole CLI resident until the bridge is
+    /// restarted, which is exactly the shape of hang this exists to end.
+    ///
+    /// Silence is measured from the last line the process wrote *or* the last prompt written to
+    /// it, so a turn's clock starts when the turn does. A process that has never spoken at all is
+    /// held to a much shorter limit: it has not begun the turn, so there is no long tool call to
+    /// be patient about.
+    private func endWedgedTurns(now: Date = Date()) async {
+        for id in Array(openTurns.keys) {
+            guard let process = processes[id], await process.isRunning else { continue }
+            let limit = await process.hasSpoken ? turnSilenceTTL : launchTimeout
+            guard await process.quietFor(limit, now: now) else { continue }
+            guard openTurns[id] != nil, processes[id] === process else { continue }
+            publish(id, .error("Claude stopped responding; the turn was ended."))
+            closeTurn(id, fallback: "⚠️ Claude stopped responding — the turn was ended.")
+            dropProcess(id)
+        }
+    }
+
     /// Ends idle processes that have outlived their keep. A process with background work still
     /// running is not idle whatever its stdin has heard lately.
     ///
     /// Every reading here is taken across an await, and a turn can open on a process between the
     /// reading and the decision — so the decision is checked again on the same actor step it is
     /// carried out, and a process a turn has since claimed is left exactly where it is.
-    func reapIdleProcesses() async {
+    func reapIdleProcesses(now: Date = Date()) async {
+        await endWedgedTurns(now: now)
         var idle: [(id: String, process: ClaudeProcess, lastActivityAt: Date)] = []
         for (id, process) in processes where openTurns[id] == nil {
             guard await process.isRunning else {
@@ -739,11 +778,13 @@ actor SessionStore {
                 }
                 continue
             }
+            if await process.retireVanishedShellTasks(now: now) {
+                noteBackgroundWork(id, from: process, await process.backgroundWork)
+            }
             guard await process.liveTasks.isEmpty else { continue }
             idle.append((id, process, await process.lastActivityAt))
         }
         idle.sort { $0.lastActivityAt < $1.lastActivityAt }
-        let now = Date()
         for (index, entry) in idle.enumerated() {
             let overKeep = now.timeIntervalSince(entry.lastActivityAt) > processTTL
             let overPool = idle.count - index > processPool

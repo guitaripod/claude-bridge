@@ -42,7 +42,30 @@ actor ClaudeProcess {
 
     struct LiveTask: Sendable, Equatable {
         var description: String?
+        /// The CLI's own `task_type`. A shell is the one kind whose life the machine can check
+        /// for itself; an agent or a workflow runs inside the CLI and leaves no process to find.
+        var kind: String?
+        /// When this process first heard of the task. A shell that has only just been asked for
+        /// may not have forked yet, so its absence from the process table means nothing until it
+        /// has had time to appear.
+        var seenAt: Date = Date()
+
+        var isShell: Bool { ClaudeProcess.shellKinds.contains(kind ?? "") }
     }
+
+    /// The `task_type` values that run as a child process rather than inside the CLI.
+    static let shellKinds: Set<String> = ["local_bash", "bash", "shell"]
+
+    /// How long a task is given to appear in the process table, and how long the process must have
+    /// been silent, before an empty process table is taken as the end of its shells.
+    static let shellGrace: TimeInterval = 30
+
+    /// Whether the CLI has written a single line since it started.
+    ///
+    /// A process that has never spoken has not begun the turn it was handed — it is still loading
+    /// a transcript, or it is wedged. Separating that from a turn that started and went quiet is
+    /// what lets a launch be given seconds while a long tool call is given hours.
+    private(set) var hasSpoken = false
 
     /// The live set as a client hears it: how many, and what the one task is when there is one.
     var backgroundWork: BackgroundWork? {
@@ -51,6 +74,38 @@ actor ClaudeProcess {
             tasks: liveTasks.count,
             task: liveTasks.count == 1 ? liveTasks.values.first?.description : nil)
     }
+    /// Retires background shells the CLI still lists but the machine cannot find.
+    ///
+    /// The level signal, the end patch and the notification are all the CLI talking, and they
+    /// share one blind spot: a shell that dies without the CLI noticing — killed from another
+    /// terminal, or reaped by something that never told it — is never spoken about again. The
+    /// entry then outlives the work in two places that matter, because a listing reports it as
+    /// live and the reaper treats it as a reason to keep a whole CLI resident forever.
+    ///
+    /// So this is a fourth witness, and the only one that is not the CLI's own account: the
+    /// process table. A backgrounded shell is a child of this process for as long as it runs, so
+    /// no children at all means no shell is running. It is read only as a negative and only when
+    /// every live task is a shell — an agent or a workflow runs inside the CLI and would leave
+    /// nothing to find — and only once both the tasks and the process have been quiet long
+    /// enough that a fork still on its way cannot be mistaken for one that never happened.
+    func retireVanishedShellTasks(now: Date = Date()) -> Bool {
+        guard isRunning, !liveTasks.isEmpty else { return false }
+        guard liveTasks.values.allSatisfy(\.isShell) else { return false }
+        guard liveTasks.values.allSatisfy({ now.timeIntervalSince($0.seenAt) > Self.shellGrace })
+        else { return false }
+        guard now.timeIntervalSince(lastActivityAt) > Self.shellGrace else { return false }
+        guard !ProcessProbe.hasChild(pid) else { return false }
+        liveTasks = [:]
+        return true
+    }
+
+    /// Whether the process has written nothing for `silence`, and whether it ever spoke at all.
+    /// Read together by the watchdog: a launch that never produced a line is a different failure
+    /// from a turn that started and stopped, and is worth far less patience.
+    func quietFor(_ silence: TimeInterval, now: Date = Date()) -> Bool {
+        now.timeIntervalSince(lastActivityAt) > silence
+    }
+
     /// Whether a `task_updated` patch says the task it names has ended. The CLI stamps an
     /// `end_time` and a settled status on the last patch of every task it stops running, so this
     /// is a second witness beside the level signal and the notification — and the one that still
@@ -165,6 +220,7 @@ actor ClaudeProcess {
         pid = process.processIdentifier
         isRunning = true
         lastActivityAt = Date()
+        hasSpoken = false
         currentSessionID = launch.resume
         let lines = ClaudeRunner.lineStream(from: stdoutPipe.fileHandleForReading)
         Task { [weak self] in
@@ -295,6 +351,7 @@ actor ClaudeProcess {
     /// itself are read here; everything else goes to the store in the order it arrived.
     private func consume(_ line: String) async {
         lastActivityAt = Date()
+        hasSpoken = true
         guard let data = line.data(using: .utf8),
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
@@ -316,14 +373,20 @@ actor ClaudeProcess {
                 liveTasks = [:]
                 for task in tasks where task["ambient"] as? Bool != true {
                     guard let id = task["task_id"] as? String else { continue }
-                    liveTasks[id] = LiveTask(description: task["description"] as? String)
+                    liveTasks[id] = LiveTask(
+                        description: task["description"] as? String,
+                        kind: task["task_type"] as? String,
+                        seenAt: liveTasks[id]?.seenAt ?? Date())
                 }
             case "task_started":
                 if let id = object["task_id"] as? String,
                     object["is_backgrounded"] as? Bool == true,
                     object["ambient"] as? Bool != true
                 {
-                    liveTasks[id] = LiveTask(description: object["description"] as? String)
+                    liveTasks[id] = LiveTask(
+                        description: object["description"] as? String,
+                        kind: object["task_type"] as? String,
+                        seenAt: liveTasks[id]?.seenAt ?? Date())
                 }
             case "task_updated":
                 if let id = object["task_id"] as? String,
@@ -332,7 +395,9 @@ actor ClaudeProcess {
                     if Self.patchEndsTask(patch) {
                         liveTasks[id] = nil
                     } else if patch["is_backgrounded"] as? Bool == true, liveTasks[id] == nil {
-                        liveTasks[id] = LiveTask(description: patch["description"] as? String)
+                        liveTasks[id] = LiveTask(
+                            description: patch["description"] as? String,
+                            kind: (patch["task_type"] ?? object["task_type"]) as? String)
                     }
                 }
             case "task_notification":

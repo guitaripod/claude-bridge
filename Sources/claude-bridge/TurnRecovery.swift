@@ -39,6 +39,52 @@ enum ProcessProbe {
         return commandLine(pid)?.contains("claude") == true
     }
 
+    /// Whether the process has a child process of its own.
+    ///
+    /// A backgrounded `Bash` is a direct child `bash -c` of the CLI for the whole of its life, so
+    /// the absence of any child is the machine's own word that no shell the CLI still lists is
+    /// running. It cannot say which child belongs to which task, and a foreground tool is a child
+    /// too — which is why this is only ever read as a negative, and only when every live task is a
+    /// shell.
+    static func hasChild(_ pid: Int32) -> Bool {
+        guard pid > 0 else { return false }
+        #if canImport(Darwin)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+            process.arguments = ["-P", String(pid)]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            guard (try? process.run()) != nil else { return true }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return !String(decoding: data, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        #else
+            // The kernel keeps the list already; a full walk of /proc is the fallback for a build
+            // without CONFIG_PROC_CHILDREN. Either way an unreadable answer counts as "has a
+            // child", because a probe that cannot see is not evidence that nothing is there.
+            let children = "/proc/\(pid)/task/\(pid)/children"
+            if let data = FileManager.default.contents(atPath: children) {
+                return !String(decoding: data, as: UTF8.self)
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            guard let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc") else {
+                return true
+            }
+            for entry in entries where Int32(entry) != nil {
+                guard let stat = try? String(contentsOfFile: "/proc/\(entry)/stat", encoding: .utf8),
+                    let close = stat.lastIndex(of: ")")
+                else { continue }
+                let fields = stat[stat.index(close, offsetBy: 1)...]
+                    .split(separator: " ", omittingEmptySubsequences: true)
+                guard fields.count > 1, Int32(fields[1]) == pid else { continue }
+                return true
+            }
+            return false
+        #endif
+    }
+
     static func commandLine(_ pid: Int32) -> String? {
         #if canImport(Darwin)
             let process = Process()

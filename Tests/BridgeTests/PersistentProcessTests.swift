@@ -38,6 +38,9 @@ private struct StdinClaude {
                   $P '%s\\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Set effort level"}]}}'
                   $P '%s\\n' '{"type":"result","subtype":"success","is_error":false,"num_turns":0}'
                   ;;
+                *mute*)
+                  :
+                  ;;
                 *)
                   $P '%s\\n' '{"type":"system","subtype":"init","session_id":"persist-session"}'
                   case "$line" in
@@ -113,7 +116,8 @@ private struct StdinClaude {
 
 private func makeStore(
     _ fake: StdinClaude, processTTL: TimeInterval = 1800, processPool: Int = 4,
-    abortGrace: TimeInterval = 10
+    abortGrace: TimeInterval = 10, launchTimeout: TimeInterval = 300,
+    turnSilenceTTL: TimeInterval = 7200
 ) -> SessionStore {
     SessionStore(
         runner: ClaudeRunner(
@@ -122,7 +126,7 @@ private func makeStore(
             modelOverride: "sonnet", effortOverride: "medium", home: NSTemporaryDirectory()),
         storeURL: fake.root.appendingPathComponent("sessions.json"),
         projectsDir: fake.root.path, processTTL: processTTL, processPool: processPool,
-        abortGrace: abortGrace)
+        abortGrace: abortGrace, launchTimeout: launchTimeout, turnSilenceTTL: turnSilenceTTL)
 }
 
 private func waitUntil(
@@ -221,6 +225,43 @@ struct PersistentProcessTests {
         #expect(await store.backgroundWork(for: session.id) == nil)
         #expect(await store.list().first { $0.id == session.id }?.backgroundTasks == nil)
         #expect(await reports.values == [carried, nil])
+    }
+
+    @Test("A launch that never speaks does not hold the turn open forever")
+    func wedgedLaunchIsEnded() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake, launchTimeout: 0.2)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "mute"))
+        await waitUntil { await store.hasQueuedOrRunningTurn(session.id) }
+        try await Task.sleep(for: .milliseconds(400))
+        await store.reapIdleProcesses()
+
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        #expect(await !store.hasQueuedOrRunningTurn(session.id))
+        #expect(
+            await assistantTexts(store, session.id)
+                .contains { $0.contains("stopped responding") })
+    }
+
+    @Test("A shell the CLI stops speaking about is retired once nothing is running")
+    func vanishedShellTaskIsRetired() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "hold"))
+        await waitUntil { await store.backgroundWork(for: session.id) != nil }
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        #expect(await store.backgroundWork(for: session.id)?.tasks == 1)
+
+        // The fake never ends h1 and never mentions it again — the shape of a shell killed from
+        // somewhere the CLI cannot see. Past the grace, the empty process table settles it.
+        await store.reapIdleProcesses(now: Date().addingTimeInterval(120))
+        #expect(await store.backgroundWork(for: session.id) == nil)
     }
 
     @Test("An ambient monitor is not work anybody is waiting on")

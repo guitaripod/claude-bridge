@@ -112,7 +112,9 @@ let store = SessionStore(
         devicesURL: storeURL.deletingLastPathComponent().appendingPathComponent("devices.json")),
     autoResumeDefault: env("BRIDGE_AUTO_RESUME", "0") == "1",
     processTTL: Double(env("BRIDGE_PROCESS_TTL", "1800")) ?? 1800,
-    processPool: Int(env("BRIDGE_PROCESS_POOL", "4")) ?? 4)
+    processPool: Int(env("BRIDGE_PROCESS_POOL", "4")) ?? 4,
+    launchTimeout: Double(env("BRIDGE_LAUNCH_TIMEOUT", "300")) ?? 300,
+    turnSilenceTTL: Double(env("BRIDGE_TURN_SILENCE_TTL", "7200")) ?? 7200)
 await store.startReaper()
 
 let router = Router(context: BridgeRequestContext.self)
