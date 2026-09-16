@@ -203,6 +203,8 @@ struct Session: Codable, Sendable {
     var backgroundTasks: Int?
     /// What the one task is, when exactly one is running, in the CLI's own words.
     var backgroundTask: String?
+    var backgroundSince: Date?
+    var backgroundStalled: Bool?
 
     var summary: SessionSummary {
         SessionSummary(
@@ -220,6 +222,8 @@ struct SessionRevision: Codable, Sendable {
     var turnOpen: Bool
     var backgroundTasks: Int? = nil
     var backgroundTask: String? = nil
+    var backgroundSince: Date? = nil
+    var backgroundStalled: Bool? = nil
 }
 
 /// Background work a conversation's process is carrying between turns, as the CLI reports it: how
@@ -236,6 +240,21 @@ struct SessionRevision: Codable, Sendable {
 struct BackgroundWork: Codable, Sendable, Equatable {
     var tasks: Int
     var task: String?
+    /// When the oldest of the tasks began, so a client can say how long the machine has been at
+    /// it — the difference between a build that started a minute ago and a shell that has sat
+    /// there since morning.
+    var since: Date?
+    /// The machine's own finding that a shell is stuck: past the budget the model gave it with
+    /// no CPU time and no output for a whole window. True or absent, never false, so a listing
+    /// that has nothing to say about it says nothing.
+    var stalled: Bool?
+
+    init(tasks: Int, task: String? = nil, since: Date? = nil, stalled: Bool? = nil) {
+        self.tasks = tasks
+        self.task = task
+        self.since = since
+        self.stalled = stalled
+    }
 }
 
 struct SessionSummary: Codable, Sendable, Equatable {
@@ -273,6 +292,8 @@ struct SessionSummary: Codable, Sendable, Equatable {
     /// ``Session/backgroundTasks``. Nil when there is none.
     var backgroundTasks: Int?
     var backgroundTask: String?
+    var backgroundSince: Date?
+    var backgroundStalled: Bool?
 }
 
 /// The agents working for one session, as a list row can describe them.
@@ -382,7 +403,7 @@ enum BridgeEvent: Codable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case type, message, messageID, delta, tool, status, error, goal, phase, interruption
-        case tasks, task
+        case tasks, task, since, stalled
     }
 
     func encode(to encoder: Encoder) throws {
@@ -419,6 +440,8 @@ enum BridgeEvent: Codable, Sendable {
             try c.encode("background", forKey: .type)
             try c.encode(work?.tasks ?? 0, forKey: .tasks)
             try c.encodeIfPresent(work?.task, forKey: .task)
+            try c.encodeIfPresent(work?.since, forKey: .since)
+            try c.encodeIfPresent(work?.stalled, forKey: .stalled)
         }
     }
 
@@ -447,7 +470,9 @@ enum BridgeEvent: Codable, Sendable {
             self = .background(
                 tasks > 0
                     ? BackgroundWork(
-                        tasks: tasks, task: try c.decodeIfPresent(String.self, forKey: .task))
+                        tasks: tasks, task: try c.decodeIfPresent(String.self, forKey: .task),
+                        since: try c.decodeIfPresent(Date.self, forKey: .since),
+                        stalled: try c.decodeIfPresent(Bool.self, forKey: .stalled))
                     : nil)
         default: self = .error(try c.decode(String.self, forKey: .error))
         }

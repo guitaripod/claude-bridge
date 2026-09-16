@@ -155,6 +155,9 @@ actor SessionStore {
     /// long time without the CLI saying anything, and ending a turn that is merely slow is worse
     /// than leaving a wedged one a while longer.
     private let turnSilenceTTL: TimeInterval
+    /// How long a background shell past its budget must show no CPU time and no output before
+    /// the bridge ends it. Zero leaves stuck shells to the person, reported but running.
+    private let stallWindow: TimeInterval
 
     private struct OpenTurn {
         var assembler: Assembler
@@ -170,9 +173,10 @@ actor SessionStore {
         devicePusher: DevicePusher = DevicePusher(client: nil, devicesURL: nil),
         autoResumeDefault: Bool = false, processTTL: TimeInterval = 1800, processPool: Int = 4,
         abortGrace: TimeInterval = 10, launchTimeout: TimeInterval = 300,
-        turnSilenceTTL: TimeInterval = 7200
+        turnSilenceTTL: TimeInterval = 7200, stallWindow: TimeInterval = ClaudeProcess.stallWindow
     ) {
         self.autoResumeDefault = autoResumeDefault
+        self.stallWindow = stallWindow
         self.processTTL = processTTL
         self.processPool = max(1, processPool)
         self.abortGrace = abortGrace
@@ -231,6 +235,8 @@ actor SessionStore {
             if summary.turnOpen != true, let work = carriedWork[id] {
                 summary.backgroundTasks = work.tasks
                 summary.backgroundTask = work.task
+                summary.backgroundSince = work.since
+                summary.backgroundStalled = work.stalled
             }
             return summary
         }
@@ -779,6 +785,7 @@ actor SessionStore {
                 }
                 continue
             }
+            await endStalledShells(id, on: process, now: now)
             if await process.retireVanishedShellTasks(now: now) {
                 noteBackgroundWork(id, from: process, await process.backgroundWork)
             }
@@ -794,6 +801,102 @@ actor SessionStore {
             processes[entry.id] = nil
             await entry.process.close()
         }
+    }
+
+    /// Reads the process's shells against the machine, ends the ones found stuck, and says so
+    /// in the chat — the row settles, the CLI is free to be reaped, and the person learns what
+    /// was ended and why rather than watching a badge vanish.
+    private func endStalledShells(_ id: String, on process: ClaudeProcess, now: Date) async {
+        let stalled = await process.assessStalls(now: now, window: max(stallWindow, 1))
+        if stallWindow > 0, !stalled.isEmpty {
+            var ended: [ClaudeProcess.StalledShell] = []
+            for shell in stalled where await process.end([shell], reason: Self.stallReason(shell)) > 0 {
+                ended.append(shell)
+            }
+            if !ended.isEmpty { note(id, Self.stallNotice(ended)) }
+        }
+        noteBackgroundWork(id, from: process, await process.backgroundWork)
+    }
+
+    /// Ends every background shell the conversation's process is carrying, at a person's
+    /// request. Refused, with the reason, when there is nothing this can end: a turn is open
+    /// and its stop is the other button, no process is resident, or the work is an agent or a
+    /// workflow, which runs inside the CLI and has no process of its own to end.
+    func stopBackgroundWork(_ id: String) async -> (ended: Int, refusal: String?) {
+        guard openTurns[id] == nil else {
+            return (0, "A turn is running — stop the turn instead.")
+        }
+        guard let process = processes[id], await process.isRunning else {
+            return (0, "Nothing is running for this chat on the bridge.")
+        }
+        let work = await process.backgroundWork
+        let ended = await process.endAllShells(reason: Self.stopReason)
+        if ended.isEmpty {
+            guard work != nil else { return (0, "Nothing is running in the background.") }
+            return (0, "Only shell commands can be stopped from here; this chat's background work is an agent or a workflow.")
+        }
+        note(id, Self.stopNotice(ended))
+        noteBackgroundWork(id, from: process, await process.backgroundWork)
+        return (ended.count, nil)
+    }
+
+    /// A line of the bridge's own in the conversation, in the voice the wedged-turn notice
+    /// already uses. The person reads it in the chat; the model does not — what the model reads
+    /// is written into the task's output file, which is where the harness sends it.
+    private func note(_ id: String, _ text: String) {
+        guard sessions[id] != nil else { return }
+        let message = Message(
+            id: UUID().uuidString, role: .assistant, parts: [.text(text)], createdAt: Date())
+        sessions[id]?.messages.append(message)
+        sessions[id]?.updatedAt = Date()
+        broadcaster(for: id).send(.messageUpserted(message))
+        persist()
+    }
+
+    static func stallReason(_ shell: ClaudeProcess.StalledShell) -> String {
+        "[claude-bridge] Ended this command: it ran \(Self.clock(shell.ranFor)) — past the "
+            + "\(Self.clock(shell.budget)) it was given — and spent no CPU time and wrote no output "
+            + "for \(Self.clock(shell.silentFor)), so it was blocked (most often on stdin, when a "
+            + "command that reads input is run with no file). Do not run it again as it was; if "
+            + "it must not read input, add `< /dev/null`."
+    }
+
+    static let stopReason =
+        "[claude-bridge] Ended this command: a person stopped the chat's background work from the app."
+
+    static func stallNotice(_ shells: [ClaudeProcess.StalledShell]) -> String {
+        let lines = shells.map { shell -> String in
+            let name = shell.description ?? shell.command
+            return "⏹ Ended a stuck shell after \(Self.clock(shell.ranFor)) — no output and no CPU time "
+                + "for \(Self.clock(shell.silentFor)) past its \(Self.clock(shell.budget)) budget: "
+                + "`\(Self.oneLine(name))`"
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    static func stopNotice(_ shells: [ClaudeProcess.StalledShell]) -> String {
+        let lines = shells.map { shell -> String in
+            "⏹ Stopped background work after \(Self.clock(shell.ranFor)): `\(Self.oneLine(shell.description ?? shell.command))`"
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func oneLine(_ text: String) -> String {
+        let first = text.split(separator: "\n", omittingEmptySubsequences: true).first
+            .map(String.init) ?? text
+        return first.count > 120 ? String(first.prefix(117)) + "…" : first
+    }
+
+    /// `2m`, `1h 19m`, `3d 2h` — the coarse clock a person reads a duration at.
+    static func clock(_ interval: TimeInterval) -> String {
+        let seconds = max(0, Int(interval.rounded()))
+        if seconds < 60 { return "\(seconds)s" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m" }
+        let hours = minutes / 60
+        if hours < 24 { return minutes % 60 == 0 ? "\(hours)h" : "\(hours)h \(minutes % 60)m" }
+        let days = hours / 24
+        return hours % 24 == 0 ? "\(days)d" : "\(days)d \(hours % 24)h"
     }
 
     /// How many conversations have a live process right now.

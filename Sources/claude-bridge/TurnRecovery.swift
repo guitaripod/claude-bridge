@@ -85,6 +85,115 @@ enum ProcessProbe {
         #endif
     }
 
+    /// The direct children of a process. Empty when there are none or the table cannot be read.
+    static func children(of pid: Int32) -> [Int32] {
+        guard pid > 0 else { return [] }
+        #if canImport(Darwin)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+            process.arguments = ["-P", String(pid)]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            guard (try? process.run()) != nil else { return [] }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline)
+                .compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+        #else
+            // The kernel files a child under the *thread* that spawned it, so every thread's list
+            // is read: a child spawned off the main thread is still a child.
+            if let threads = try? FileManager.default.contentsOfDirectory(atPath: "/proc/\(pid)/task") {
+                var found: [Int32] = []
+                var listed = false
+                for thread in threads {
+                    guard let data = FileManager.default.contents(
+                        atPath: "/proc/\(pid)/task/\(thread)/children")
+                    else { continue }
+                    listed = true
+                    found += String(decoding: data, as: UTF8.self)
+                        .split(whereSeparator: \.isWhitespace).compactMap { Int32($0) }
+                }
+                if listed { return found }
+            }
+            guard let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc") else {
+                return []
+            }
+            return entries.compactMap { entry -> Int32? in
+                guard let child = Int32(entry), let fields = statFields(child), fields.count > 1,
+                    Int32(fields[1]) == pid
+                else { return nil }
+                return child
+            }
+        #endif
+    }
+
+    /// Every process under one, breadth first, so a parent comes before what it spawned.
+    static func descendants(of pid: Int32) -> [Int32] {
+        var found: [Int32] = []
+        var queue = children(of: pid)
+        var seen: Set<Int32> = [pid]
+        while !queue.isEmpty {
+            let next = queue.removeFirst()
+            guard seen.insert(next).inserted else { continue }
+            found.append(next)
+            queue.append(contentsOf: children(of: next))
+        }
+        return found
+    }
+
+    /// CPU time the process itself has spent, in seconds. A reading that does not move between
+    /// two looks is a process that is blocked rather than busy.
+    static func cpuSeconds(of pid: Int32) -> Double {
+        #if canImport(Darwin)
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/ps")
+            process.arguments = ["-o", "cputime=", "-p", String(pid)]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            guard (try? process.run()) != nil else { return 0 }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return parseClock(String(decoding: data, as: UTF8.self))
+        #else
+            guard let fields = statFields(pid), fields.count > 13,
+                let user = Double(fields[11]), let system = Double(fields[12])
+            else { return 0 }
+            let ticks = Double(sysconf(Int32(_SC_CLK_TCK)))
+            return ticks > 0 ? (user + system) / ticks : 0
+        #endif
+    }
+
+    /// `ps` prints CPU time as `[[days-]hours:]minutes:seconds.hundredths`.
+    static func parseClock(_ text: String) -> Double {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return 0 }
+        var days = 0.0
+        var clock = trimmed
+        if let dash = clock.firstIndex(of: "-") {
+            days = Double(clock[..<dash]) ?? 0
+            clock = String(clock[clock.index(after: dash)...])
+        }
+        let parts = clock.split(separator: ":").compactMap { Double($0) }
+        let seconds = parts.reversed().enumerated().reduce(0.0) { total, part in
+            total + part.element * pow(60, Double(part.offset))
+        }
+        return days * 86400 + seconds
+    }
+
+    #if !canImport(Darwin)
+        /// The fields of `/proc/<pid>/stat` after the bracketed command name, so a name with
+        /// spaces or parentheses in it cannot shift every column that follows.
+        private static func statFields(_ pid: Int32) -> [Substring]? {
+            guard let stat = try? String(contentsOfFile: "/proc/\(pid)/stat", encoding: .utf8),
+                let close = stat.lastIndex(of: ")")
+            else { return nil }
+            return stat[stat.index(close, offsetBy: 1)...]
+                .split(separator: " ", omittingEmptySubsequences: true)
+        }
+    #endif
+
     static func commandLine(_ pid: Int32) -> String? {
         #if canImport(Darwin)
             let process = Process()

@@ -49,9 +49,74 @@ actor ClaudeProcess {
         /// may not have forked yet, so its absence from the process table means nothing until it
         /// has had time to appear.
         var seenAt: Date = Date()
+        /// The call behind a shell task, when the CLI named it: what was run, how long the model
+        /// gave it, and where the harness writes what it says.
+        var shell: ShellCall?
+        /// The last reading of the shell's work and when that reading last moved.
+        var watch: StallWatch?
+        /// Set once the machine has found the shell stuck: past its budget with nothing moving
+        /// for a whole window. Reported, and — where the policy is on — acted on.
+        var stalled = false
 
         var isShell: Bool { ClaudeProcess.shellKinds.contains(kind ?? "") }
+
+        init(description: String?, kind: String?, seenAt: Date = Date(), shell: ShellCall? = nil) {
+            self.description = description
+            self.kind = kind
+            self.seenAt = seenAt
+            self.shell = shell
+        }
     }
+
+    /// A background shell as the tool call that started it described it. The CLI's task events
+    /// name the call (`tool_use_id`) but not the command, its budget or its output file; those are
+    /// on the `assistant` block that made the call and the `tool_result` that answered it, both of
+    /// which pass through here, so they are kept by call id until a task claims them.
+    struct ShellCall: Sendable, Equatable {
+        var toolUseID: String
+        var command: String
+        /// What the model gave the command to finish in. The harness stops *waiting* there —
+        /// it moves the command to the background and tells the model so — but never ends it, so
+        /// a command that will never finish outlives its budget by hours.
+        var budget: TimeInterval
+        /// Whether the model asked for the background itself, or the harness moved a foreground
+        /// command there when the budget ran out.
+        var explicit: Bool
+        var outputFile: String?
+
+        static let defaultBudget: TimeInterval = 120
+    }
+
+    /// One reading of a shell's work — CPU its process tree has spent, bytes it has written — and
+    /// the moment the reading last changed. Two equal readings a window apart are a shell that is
+    /// doing nothing at all, as opposed to one that is quietly busy.
+    struct StallWatch: Sendable, Equatable {
+        var cpu: Double
+        var output: Int64
+        var changedAt: Date
+    }
+
+    /// A shell the machine has found stuck, with what a person or the model needs to know about it.
+    struct StalledShell: Sendable, Equatable {
+        var taskID: String
+        var description: String?
+        var command: String
+        var pids: [Int32]
+        var outputFile: String?
+        var ranFor: TimeInterval
+        var budget: TimeInterval
+        var silentFor: TimeInterval
+    }
+
+    /// How long a shell past its budget must show no CPU time and no output before it is stuck.
+    /// A build prints as it goes and a poll loop spends CPU on every pass; only a process that is
+    /// blocked — on a stdin nobody will write, a lock nobody holds, a remote that went away —
+    /// shows neither for this long.
+    static let stallWindow: TimeInterval = 600
+
+    private var shellCalls: [String: ShellCall] = [:]
+    private var shellCallOrder: [String] = []
+    private static let shellCallsKept = 64
 
     /// The `task_type` values that run as a child process rather than inside the CLI.
     static let shellKinds: Set<String> = ["local_bash", "bash", "shell"]
@@ -70,9 +135,219 @@ actor ClaudeProcess {
     /// The live set as a client hears it: how many, and what the one task is when there is one.
     var backgroundWork: BackgroundWork? {
         guard !liveTasks.isEmpty else { return nil }
+        let stalled = liveTasks.values.contains { $0.stalled }
         return BackgroundWork(
             tasks: liveTasks.count,
-            task: liveTasks.count == 1 ? liveTasks.values.first?.description : nil)
+            task: liveTasks.count == 1 ? liveTasks.values.first?.description : nil,
+            since: liveTasks.values.map(\.seenAt).min(),
+            stalled: stalled ? true : nil)
+    }
+
+    /// Reads every live shell against the machine and says which are stuck.
+    ///
+    /// The CLI's account of a task is that it is running, and for a shell that is blocked forever
+    /// that account is true and useless: the harness ends nothing once the budget the model set
+    /// has passed, and the reaper will not retire a process with a task on it, so one command
+    /// waiting on a stdin nobody will write keeps a whole CLI resident and a row live for a day.
+    /// The machine has a second account — CPU time and bytes written — and a shell past its
+    /// budget whose reading has not moved for a full window is stuck by any definition that
+    /// matters to the person waiting on it. Each call takes one reading and compares it with the
+    /// last; the reading itself is what makes the judgement, so a task stops being stalled the
+    /// moment it does anything.
+    func assessStalls(now: Date = Date(), window: TimeInterval = stallWindow) -> [StalledShell] {
+        guard isRunning else { return [] }
+        let shells = liveTasks.filter { $0.value.isShell }
+        guard !shells.isEmpty else { return [] }
+        let candidates = shellChildren()
+        var stalled: [StalledShell] = []
+        for (id, task) in shells {
+            let budget = task.shell?.budget ?? ShellCall.defaultBudget
+            let pids = subtree(for: task, among: candidates, alone: shells.count == 1)
+            guard !pids.isEmpty else { continue }
+            let reading = StallWatch(
+                cpu: pids.reduce(0) { $0 + ProcessProbe.cpuSeconds(of: $1) },
+                output: task.shell?.outputFile.map(Self.fileSize) ?? 0,
+                changedAt: now)
+            var next = task
+            if let last = task.watch, last.cpu == reading.cpu, last.output == reading.output {
+                next.watch = last
+            } else {
+                next.watch = reading
+            }
+            let ranFor = now.timeIntervalSince(task.seenAt)
+            let silentFor = now.timeIntervalSince(next.watch?.changedAt ?? now)
+            next.stalled = ranFor > budget && silentFor >= window
+            liveTasks[id] = next
+            if next.stalled {
+                stalled.append(
+                    StalledShell(
+                        taskID: id, description: task.description,
+                        command: task.shell?.command ?? task.description ?? "",
+                        pids: pids, outputFile: task.shell?.outputFile, ranFor: ranFor,
+                        budget: budget, silentFor: silentFor))
+            }
+        }
+        return stalled
+    }
+
+    /// Ends the shells named, hard. A shell that has shown nothing for a window will not answer
+    /// a polite signal any sooner than it answered its stdin, and the harness starts background
+    /// shells with the gentle signals ignored anyway. The reason is written into the task's own
+    /// output file first, which is the one place the harness tells the model to look when it
+    /// reports the command ended — so the model reads why, and does not simply run it again.
+    @discardableResult
+    func end(_ shells: [StalledShell], reason: String) -> Int {
+        var ended = 0
+        for shell in shells {
+            if let file = shell.outputFile { Self.append(reason, to: file) }
+            let killed = Self.killSubtree(shell.pids)
+            if killed > 0 { ended += 1 }
+            liveTasks[shell.taskID]?.stalled = true
+        }
+        return ended
+    }
+
+    /// Ends every shell the CLI is carrying, on request. What is found is what is ended; a task
+    /// whose process the machine cannot find is left to the CLI's own accounting.
+    func endAllShells(reason: String) -> [StalledShell] {
+        guard isRunning else { return [] }
+        let shells = liveTasks.filter { $0.value.isShell }
+        let candidates = shellChildren()
+        var ended: [StalledShell] = []
+        for (id, task) in shells {
+            let pids = subtree(for: task, among: candidates, alone: shells.count == 1)
+            guard !pids.isEmpty else { continue }
+            let now = Date()
+            let shell = StalledShell(
+                taskID: id, description: task.description,
+                command: task.shell?.command ?? task.description ?? "", pids: pids,
+                outputFile: task.shell?.outputFile, ranFor: now.timeIntervalSince(task.seenAt),
+                budget: task.shell?.budget ?? ShellCall.defaultBudget,
+                silentFor: now.timeIntervalSince(task.watch?.changedAt ?? now))
+            if end([shell], reason: reason) > 0 { ended.append(shell) }
+        }
+        return ended
+    }
+
+    /// The CLI's children that are background shells: the harness wraps every `Bash` command in
+    /// a `bash -c` that sources its shell snapshot, and that wrapper is what the process table
+    /// shows. Language servers and MCP servers are children too and are not shells.
+    private func shellChildren() -> [(pid: Int32, commandLine: String)] {
+        ProcessProbe.children(of: pid).compactMap { child in
+            guard let line = ProcessProbe.commandLine(child) else { return nil }
+            return (child, line)
+        }
+    }
+
+    /// The processes belonging to one task: the wrapper whose command line carries the task's
+    /// command, and everything under it. With one shell live every wrapper is its own; with
+    /// several, a wrapper that names no command is nobody's, because ending the wrong one is
+    /// worse than ending none.
+    private func subtree(
+        for task: LiveTask, among candidates: [(pid: Int32, commandLine: String)], alone: Bool
+    ) -> [Int32] {
+        let needle = Self.needle(for: task)
+        let wrappers = candidates.filter { candidate in
+            if let needle, candidate.commandLine.contains(needle) { return true }
+            return alone && needle == nil && Self.isShellWrapper(candidate.commandLine)
+        }
+        return wrappers.flatMap { [$0.pid] + ProcessProbe.descendants(of: $0.pid) }
+    }
+
+    /// The opening of the command as the wrapper's command line will show it: the first line, up
+    /// to the first single quote, since the harness re-quotes those. Too short to be telling is
+    /// no needle at all.
+    static func needle(for task: LiveTask) -> String? {
+        guard let command = task.shell?.command ?? task.description else { return nil }
+        let head = command.split(separator: "\n", omittingEmptySubsequences: true).first
+            .map(String.init) ?? command
+        let unquoted = head.split(separator: "'", maxSplits: 1, omittingEmptySubsequences: false)
+            .first.map(String.init) ?? head
+        let trimmed = unquoted.trimmingCharacters(in: .whitespaces)
+        return trimmed.count >= 8 ? trimmed : nil
+    }
+
+    static func isShellWrapper(_ commandLine: String) -> Bool {
+        commandLine.contains("shell-snapshots") || commandLine.hasPrefix("/bin/bash -c ")
+            || commandLine.hasPrefix("bash -c ") || commandLine.hasPrefix("/bin/sh -c ")
+            || commandLine.hasPrefix("sh -c ")
+    }
+
+    private static func fileSize(_ path: String) -> Int64 {
+        (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int64 ?? 0
+    }
+
+    private static func append(_ text: String, to path: String) {
+        guard let handle = FileHandle(forWritingAtPath: path) else {
+            try? Data(text.utf8).write(to: URL(fileURLWithPath: path))
+            return
+        }
+        defer { try? handle.close() }
+        _ = try? handle.seekToEnd()
+        try? handle.write(contentsOf: Data(("\n" + text + "\n").utf8))
+    }
+
+    /// SIGKILL, deepest first, so a parent cannot respawn what its child was doing.
+    private static func killSubtree(_ pids: [Int32]) -> Int {
+        var killed = 0
+        for pid in pids.reversed() where pid > 1 {
+            if kill(pid, SIGKILL) == 0 { killed += 1 }
+        }
+        return killed
+    }
+
+    /// Remembers what a `Bash` call asked for, by the call's id, so the task the CLI later says
+    /// it started can be read against the command, the budget and the output file it has.
+    private func rememberShellCall(_ block: [String: Any]) {
+        guard block["type"] as? String == "tool_use",
+            let id = block["id"] as? String,
+            (block["name"] as? String)?.lowercased() == "bash",
+            let input = block["input"] as? [String: Any],
+            let command = input["command"] as? String
+        else { return }
+        let timeout = (input["timeout"] as? Double) ?? (input["timeout"] as? Int).map(Double.init)
+        shellCalls[id] = ShellCall(
+            toolUseID: id, command: command,
+            budget: timeout.map { $0 / 1000 } ?? ShellCall.defaultBudget,
+            explicit: input["run_in_background"] as? Bool == true, outputFile: nil)
+        shellCallOrder.append(id)
+        while shellCallOrder.count > Self.shellCallsKept {
+            shellCalls[shellCallOrder.removeFirst()] = nil
+        }
+    }
+
+    /// The harness answers a backgrounded command with a banner naming the file it writes to;
+    /// that file is the only output the shell has, and its size is half of what a stall is
+    /// judged on.
+    private func rememberShellResult(_ block: [String: Any]) {
+        guard block["type"] as? String == "tool_result",
+            let id = block["tool_use_id"] as? String, shellCalls[id] != nil
+        else { return }
+        let text = Self.flattenResult(block["content"])
+        guard let file = Self.outputFile(in: text) else { return }
+        shellCalls[id]?.outputFile = file
+        for (taskID, task) in liveTasks where task.shell?.toolUseID == id {
+            liveTasks[taskID]?.shell?.outputFile = file
+        }
+    }
+
+    static func outputFile(in text: String) -> String? {
+        guard let range = text.range(of: "Output is being written to: ") else { return nil }
+        let rest = text[range.upperBound...]
+        let path = rest.prefix { !$0.isWhitespace }
+        let trimmed = path.hasSuffix(".") ? path.dropLast() : path[...]
+        return trimmed.isEmpty ? nil : String(trimmed)
+    }
+
+    private static func flattenResult(_ content: Any?) -> String {
+        if let text = content as? String { return text }
+        guard let blocks = content as? [[String: Any]] else { return "" }
+        return blocks.compactMap { $0["text"] as? String }.joined(separator: "\n")
+    }
+
+    private func contentBlocks(of object: [String: Any]) -> [[String: Any]] {
+        guard let message = object["message"] as? [String: Any] else { return [] }
+        return message["content"] as? [[String: Any]] ?? []
     }
     /// Retires background shells the CLI still lists but the machine cannot find.
     ///
@@ -363,6 +638,12 @@ actor ClaudeProcess {
             pendingControls.removeValue(forKey: id)?.resume(returning: success)
             return
         }
+        if type == "assistant" {
+            for block in contentBlocks(of: object) { rememberShellCall(block) }
+        }
+        if type == "user" {
+            for block in contentBlocks(of: object) { rememberShellResult(block) }
+        }
         if type == "system" {
             let before = backgroundWork
             switch object["subtype"] as? String {
@@ -370,23 +651,27 @@ actor ClaudeProcess {
                 if let sid = object["session_id"] as? String { currentSessionID = sid }
             case "background_tasks_changed":
                 let tasks = object["tasks"] as? [[String: Any]] ?? []
+                let known = liveTasks
                 liveTasks = [:]
                 for task in tasks where task["ambient"] as? Bool != true {
                     guard let id = task["task_id"] as? String else { continue }
-                    liveTasks[id] = LiveTask(
-                        description: task["description"] as? String,
-                        kind: task["task_type"] as? String,
-                        seenAt: liveTasks[id]?.seenAt ?? Date())
+                    var entry = known[id] ?? LiveTask(description: nil, kind: nil)
+                    entry.description = task["description"] as? String ?? entry.description
+                    entry.kind = task["task_type"] as? String ?? entry.kind
+                    liveTasks[id] = entry
                 }
             case "task_started":
                 if let id = object["task_id"] as? String,
                     object["is_backgrounded"] as? Bool == true,
                     object["ambient"] as? Bool != true
                 {
-                    liveTasks[id] = LiveTask(
-                        description: object["description"] as? String,
-                        kind: object["task_type"] as? String,
-                        seenAt: liveTasks[id]?.seenAt ?? Date())
+                    var entry = liveTasks[id] ?? LiveTask(description: nil, kind: nil)
+                    entry.description = object["description"] as? String ?? entry.description
+                    entry.kind = object["task_type"] as? String ?? entry.kind
+                    if let toolID = object["tool_use_id"] as? String, let call = shellCalls[toolID] {
+                        entry.shell = call
+                    }
+                    liveTasks[id] = entry
                 }
             case "task_updated":
                 if let id = object["task_id"] as? String,

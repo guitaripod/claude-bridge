@@ -63,8 +63,11 @@ private struct StdinClaude {
                           $P '%s\\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"m1","task_type":"local_bash","description":"tail -f log","ambient":true}]}'
                           ;;
                         *hold*)
-                          $P '%s\\n' '{"type":"system","subtype":"task_started","task_id":"h1","task_type":"local_bash","description":"sleep 900","is_backgrounded":true}'
+                          $P '%s\\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu-h1","name":"Bash","input":{"command":"sleep 900; echo \(root.lastPathComponent)","timeout":1000}}]}}'
+                          case "$line" in *real*) /bin/sh -c "sleep 900; echo \(root.lastPathComponent)" < /dev/null > /dev/null 2>&1 & ;; esac
+                          $P '%s\\n' '{"type":"system","subtype":"task_started","task_id":"h1","tool_use_id":"tu-h1","task_type":"local_bash","description":"sleep 900","is_backgrounded":true}'
                           $P '%s\\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"h1","task_type":"local_bash","description":"sleep 900"}]}'
+                          $P '%s\\n' '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu-h1","content":"Command running in background with ID: h1. Output is being written to: \(root.appendingPathComponent("h1.output").path). You will be notified when it completes."}]}}'
                           ;;
                         *settle*)
                           $P '%s\\n' '{"type":"system","subtype":"task_updated","task_id":"h1","patch":{"status":"completed","end_time":1788972349027}}'
@@ -127,6 +130,23 @@ private func makeStore(
         storeURL: fake.root.appendingPathComponent("sessions.json"),
         projectsDir: fake.root.path, processTTL: processTTL, processPool: processPool,
         abortGrace: abortGrace, launchTimeout: launchTimeout, turnSilenceTTL: turnSilenceTTL)
+}
+
+/// Whether a process whose command line carries `needle` is alive on this machine, read the
+/// way the bridge reads it — off the process table, not off anything the fake CLI said.
+private func shellAlive(_ needle: String) -> Bool {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    process.arguments = ["-f", needle]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = FileHandle.nullDevice
+    guard (try? process.run()) != nil else { return false }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+    let own = String(ProcessInfo.processInfo.processIdentifier)
+    return String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline)
+        .contains { $0.trimmingCharacters(in: .whitespaces) != own }
 }
 
 private func waitUntil(
@@ -213,8 +233,9 @@ struct PersistentProcessTests {
         _ = await store.send(session.id, request: SendRequest(text: "carry this on"))
         await waitUntil { await assistantTexts(store, session.id).count == 1 }
         await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
-        let carried = BackgroundWork(tasks: 1, task: "sleep 60")
-        #expect(await store.backgroundWork(for: session.id) == carried)
+        let carried = await store.backgroundWork(for: session.id)
+        #expect(carried?.tasks == 1)
+        #expect(carried?.task == "sleep 60")
         let row = await store.list().first { $0.id == session.id }
         #expect(row?.backgroundTasks == 1)
         #expect(row?.backgroundTask == "sleep 60")
@@ -224,7 +245,7 @@ struct PersistentProcessTests {
         await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
         #expect(await store.backgroundWork(for: session.id) == nil)
         #expect(await store.list().first { $0.id == session.id }?.backgroundTasks == nil)
-        #expect(await reports.values == [carried, nil])
+        #expect(await reports.values.map { $0?.tasks } == [1, nil])
     }
 
     @Test("A launch that never speaks does not hold the turn open forever")
@@ -287,7 +308,11 @@ struct PersistentProcessTests {
 
         _ = await store.send(session.id, request: SendRequest(text: "hold something for me"))
         await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
-        #expect(await store.backgroundWork(for: session.id) == BackgroundWork(tasks: 1, task: "sleep 900"))
+        let carried = await store.backgroundWork(for: session.id)
+        #expect(carried?.tasks == 1)
+        #expect(carried?.task == "sleep 900")
+        #expect(carried?.since != nil)
+        #expect(carried?.stalled == nil)
 
         _ = await store.send(session.id, request: SendRequest(text: "let it settle"))
         await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
@@ -313,6 +338,81 @@ struct PersistentProcessTests {
         #expect(fake.starts == 2)
         #expect(await store.backgroundWork(for: session.id) == nil)
         #expect(await store.list().first { $0.id == session.id }?.backgroundTasks == nil)
+    }
+
+    /// The harness never ends a background shell, and a shell blocked on a stdin nobody will
+    /// write shows nothing for hours: no CPU time, no output. Past its budget and a whole window
+    /// of nothing, the bridge ends it, says so in the chat, and the row settles.
+    @Test("A shell past its budget with nothing moving for a window is ended and reported")
+    func stalledShellIsEndedAndReported() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "hold something real for me"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        await waitUntil { shellAlive("echo \(fake.root.lastPathComponent)") }
+        #expect(shellAlive("echo \(fake.root.lastPathComponent)"))
+
+        let later = Date().addingTimeInterval(3600)
+        await store.reapIdleProcesses(now: later)
+        #expect(shellAlive("echo \(fake.root.lastPathComponent)"))
+        #expect(await store.backgroundWork(for: session.id)?.stalled == nil)
+
+        await store.reapIdleProcesses(now: later.addingTimeInterval(ClaudeProcess.stallWindow + 1))
+        await waitUntil(.seconds(3)) { !shellAlive("echo \(fake.root.lastPathComponent)") }
+        #expect(!shellAlive("echo \(fake.root.lastPathComponent)"))
+        let notice = await assistantTexts(store, session.id).last ?? ""
+        #expect(notice.contains("Ended a stuck shell"))
+        #expect(notice.contains("sleep 900"))
+        let written = (try? String(contentsOf: fake.root.appendingPathComponent("h1.output"), encoding: .utf8)) ?? ""
+        #expect(written.contains("[claude-bridge] Ended this command"))
+
+        await store.reapIdleProcesses(now: later.addingTimeInterval(ClaudeProcess.stallWindow + 60))
+        #expect(await store.backgroundWork(for: session.id) == nil)
+    }
+
+    @Test("A shell that keeps producing is never mistaken for a stuck one")
+    func busyShellIsLeftAlone() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "hold something real for me"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        await waitUntil { shellAlive("echo \(fake.root.lastPathComponent)") }
+
+        let later = Date().addingTimeInterval(3600)
+        await store.reapIdleProcesses(now: later)
+        try "a line of output".write(
+            to: fake.root.appendingPathComponent("h1.output"), atomically: true, encoding: .utf8)
+        await store.reapIdleProcesses(now: later.addingTimeInterval(ClaudeProcess.stallWindow + 1))
+        #expect(shellAlive("echo \(fake.root.lastPathComponent)"))
+        #expect(await store.backgroundWork(for: session.id)?.stalled == nil)
+        _ = await store.stopBackgroundWork(session.id)
+    }
+
+    @Test("Stopping background work from the app ends the shell and says so")
+    func stopEndsBackgroundShells() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        #expect(await store.stopBackgroundWork(session.id).refusal != nil)
+
+        _ = await store.send(session.id, request: SendRequest(text: "hold something real for me"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        await waitUntil { shellAlive("echo \(fake.root.lastPathComponent)") }
+
+        let result = await store.stopBackgroundWork(session.id)
+        #expect(result.ended == 1)
+        #expect(result.refusal == nil)
+        await waitUntil(.seconds(3)) { !shellAlive("echo \(fake.root.lastPathComponent)") }
+        #expect(!shellAlive("echo \(fake.root.lastPathComponent)"))
+        #expect((await assistantTexts(store, session.id).last ?? "").contains("Stopped background work"))
     }
 
     @Test("Stop interrupts the turn and keeps the process")

@@ -400,7 +400,9 @@ func registerRoutes(
                     updatedAt: max(session.updatedAt, observed?.updatedAt ?? session.updatedAt),
                     active: live.active, turnOpen: live.turnOpen,
                     backgroundTasks: live.turnOpen ? nil : work?.tasks,
-                    backgroundTask: live.turnOpen ? nil : work?.task))
+                    backgroundTask: live.turnOpen ? nil : work?.task,
+                    backgroundSince: live.turnOpen ? nil : work?.since,
+                    backgroundStalled: live.turnOpen ? nil : work?.stalled))
         }
         if let observed = await observer.summary(for: id) {
             return jsonResponse(
@@ -426,6 +428,8 @@ func registerRoutes(
             if !live.turnOpen, let work = await store.backgroundWork(for: id) {
                 session.backgroundTasks = work.tasks
                 session.backgroundTask = work.task
+                session.backgroundSince = work.since
+                session.backgroundStalled = work.stalled
             }
             if let partial = await store.liveTurnMessage(id) {
                 session.messages.append(partial)
@@ -708,6 +712,20 @@ func registerRoutes(
                     "Nothing to stop from here — this session is running on the server, not from this app."
             ],
             status: .conflict)
+    }
+
+    // Ends the background shells a conversation's process is carrying, from the app. Stopping a
+    // turn is `abort`; this is for the work that goes on after the turn — a command the model
+    // stepped back from that is never going to finish, which the machine ends on its own only
+    // once it has proven the point over a whole window. A refusal says which of the reasons it
+    // is, so the client can show the person the button that would have worked.
+    router.post("sessions/:id/background/stop") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        let result = await store.stopBackgroundWork(id)
+        if let refusal = result.refusal {
+            return jsonResponse(["error": refusal], status: .conflict)
+        }
+        return jsonResponse(["ended": result.ended])
     }
 
     // Its own route rather than a field on the session: a client asks this on every transcript
