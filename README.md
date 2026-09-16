@@ -268,7 +268,7 @@ Each event on `/sessions/:id/events` is one `data: <json>\n\n` frame:
 | `tool` | `messageID`, `tool` | Tool call upsert — first with `status: "running"`, again with `output` and `completed`/`error` |
 | `status` | `status` | `"running"` when a turn starts, `"idle"` when it ends |
 | `goal` | `goal?` | The session's `/goal` changed; the field is absent once nothing is being pursued |
-| `compaction` | `phase`, `error?` | A compaction started, finished, or failed — the turn is still running throughout. The numbers and summary arrive as the `compaction` part of a `message` upsert |
+| `compaction` | `phase`, `error?` | A compaction started, finished, or failed — the turn is still running throughout. The seam itself arrives as a `system` message upsert with one `compaction` part, carrying the numbers at once and the summary once the transcript has it; what the model says after it is a new assistant message |
 | `interrupted` | `interruption?` | A turn was cut off by the machine, with what it had already done; the field is absent once it is picked back up or dismissed |
 | `error` | `error` | Turn-level failure (e.g. the `claude` binary could not be launched) |
 

@@ -682,16 +682,17 @@ actor SessionStore {
     /// answer, whole or cut short, and the store settles it the way it always has.
     private func closeTurn(_ id: String, fallback: String?) {
         guard let turn = openTurns.removeValue(forKey: id) else { return }
-        var message = turn.assembler.finalMessage()
-        if let fallback, Self.isBlank(message) {
-            message = Message(
-                id: message.id, role: .assistant, parts: [.text(fallback)], createdAt: message.createdAt)
+        var messages = turn.assembler.finalMessages()
+        if let fallback, messages.count == 1, Self.isBlank(messages[0]) {
+            messages[0] = Message(
+                id: messages[0].id, role: .assistant, parts: [.text(fallback)],
+                createdAt: messages[0].createdAt)
         }
-        publish(id, .messageUpserted(message))
+        for message in messages { publish(id, .messageUpserted(message)) }
         finishTurn(
             id,
             outcome: ClaudeRunner.Outcome(
-                message: message, claudeSessionID: turn.assembler.sessionID ?? turn.resume,
+                messages: messages, claudeSessionID: turn.assembler.sessionID ?? turn.resume,
                 costUSD: turn.assembler.costUSD, tokens: turn.assembler.tokens,
                 didCompact: turn.assembler.didCompact),
             turnClaudeID: turn.turnClaudeID, startedAt: turn.startedAt)
@@ -1121,9 +1122,9 @@ actor SessionStore {
 
     private var lastRunnerFinish: [String: Date] = [:]
 
-    /// Backfills a compacted turn's numbers and summary from the transcript. The runner leaves an
-    /// empty ``Compaction`` in stream order so the seam renders the moment the turn ends; this
-    /// replaces it once the CLI has flushed the boundary record it never streams.
+    /// Backfills a compacted turn's seam with the summary from the transcript. The runner's seam
+    /// carries the numbers the CLI streamed, so it renders the moment it happens; the summary is
+    /// in the boundary record alone, which the CLI flushes around the time the turn ends.
     private func fillCompaction(
         _ id: String, messageID: String, claudeSessionID: String?
     ) async {
@@ -1158,23 +1159,26 @@ actor SessionStore {
         turnProcessIDs[id] = nil
         clearJournal(id)
         liveTurns[id] = nil
-        settledTurnMessageIDs[id] = outcome.message.id
+        settledTurnMessageIDs[id] = outcome.messages.last { $0.role == .assistant }?.id
+            ?? outcome.messages.last?.id
         releaseRunnerTurn(turnClaudeID)
         lastRunnerFinish[turnClaudeID] = Date()
         if let newID = outcome.claudeSessionID, newID != turnClaudeID {
             releaseRunnerTurn(newID)
             lastRunnerFinish[newID] = Date()
         }
-        let answer = Self.plainText(outcome.message)
+        let answer = outcome.messages.map(Self.plainText).joined(separator: "\n")
         defer {
             queueBackgroundContinuation(id, answer: answer)
             advanceQueue(id)
         }
         guard var session = sessions[id] else { return }
-        if let existing = session.messages.firstIndex(where: { $0.id == outcome.message.id }) {
-            session.messages[existing] = outcome.message
-        } else {
-            session.messages.append(outcome.message)
+        for message in outcome.messages {
+            if let existing = session.messages.firstIndex(where: { $0.id == message.id }) {
+                session.messages[existing] = message
+            } else {
+                session.messages.append(message)
+            }
         }
         setClaudeSessionID(outcome.claudeSessionID, on: &session)
         session.pendingFork = nil
@@ -1192,11 +1196,11 @@ actor SessionStore {
         moveToFront(id)
         persist()
         maybeAutoTitle(id)
-        if outcome.didCompact {
+        if outcome.didCompact, let seam = outcome.messages.last(where: Self.isSeam) {
             let claudeID = session.claudeSessionID
-            Task { await self.fillCompaction(id, messageID: outcome.message.id, claudeSessionID: claudeID) }
+            Task { await self.fillCompaction(id, messageID: seam.id, claudeSessionID: claudeID) }
         }
-        let toolCount = outcome.message.parts.count { part in
+        let toolCount = outcome.messages.flatMap(\.parts).count { part in
             if case .tool = part { return true }
             return false
         }
@@ -1690,9 +1694,18 @@ actor SessionStore {
         else { return [] }
         return stored.map { session in
             var healed = session
-            healed.messages = dedupedByID(session.messages)
+            healed.messages = dedupedByID(session.messages).map(seamAsSystem)
             return healed
         }
+    }
+
+    /// A seam an earlier bridge stored as the assistant's answer, moved to the role the transcript
+    /// gives it — so the fold's copy pairs with it instead of standing beside it.
+    private static func seamAsSystem(_ message: Message) -> Message {
+        guard message.role == .assistant, isSeam(message) else { return message }
+        var moved = message
+        moved.role = .system
+        return moved
     }
 
     /// A concurrent-turn race once persisted the same assembled message twice;
@@ -1777,6 +1790,15 @@ actor SessionStore {
     /// call id, or agreeing words long enough to be an answer. Either way, two messages whose tool
     /// calls share no id are two different messages.
     private static func pair(_ folded: Message, _ stored: Message, _ evidence: Evidence) -> Bool {
+        switch (seam(of: folded), seam(of: stored)) {
+        case (nil, nil):
+            break
+        case (let left?, let right?):
+            return evidence != .anchor
+                || (left.tokensBefore != nil && left.tokensBefore == right.tokensBefore)
+        default:
+            return false
+        }
         let leftTools = toolIDs(of: folded)
         let rightTools = toolIDs(of: stored)
         if !leftTools.isEmpty, !rightTools.isEmpty {
@@ -1788,6 +1810,19 @@ actor SessionStore {
         let agree = left.hasPrefix(right) || right.hasPrefix(left)
         return agree && (evidence != .anchor || min(left.count, right.count) >= anchorLength)
     }
+
+    /// A compaction seam is the same seam on both sides or nothing at all: in step it is the one
+    /// message a wordless pairing can never mistake, and across a gap only the numbers it carries
+    /// identify it. A seam is never a message with words, whatever the words say — the old rule
+    /// took a wordless stored seam for whatever answer the fold held next, and renamed it.
+    private static func seam(of message: Message) -> Compaction? {
+        guard message.parts.count == 1, case .compaction(let value) = message.parts[0] else {
+            return nil
+        }
+        return value
+    }
+
+    private static func isSeam(_ message: Message) -> Bool { seam(of: message) != nil }
 
     private static func toolIDs(of message: Message) -> Set<String> {
         Set(message.parts.compactMap { part in

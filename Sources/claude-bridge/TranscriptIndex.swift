@@ -1129,6 +1129,10 @@ enum TranscriptParser {
                 return false
             case "user":
                 guard let message = line["message"] as? [String: Any] else { return true }
+                // The summary a compaction writes is the CLI's own line, not a prompt: a manual
+                // `/compact` ends on it, and calling that a turn starting held every compacted
+                // chat live until something else was written to it.
+                if line["isCompactSummary"] as? Bool == true { return true }
                 if let text = message["content"] as? String {
                     // Somebody typed something: a turn is starting. Unless what they "typed" is
                     // the CLI's own record of an escape, which ends one.

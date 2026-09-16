@@ -144,9 +144,7 @@ struct TranscriptFold: Sendable {
                 else { return }
                 flushTurn()
                 lastPromptAt = stamp
-                messages.append(
-                    Message(
-                        id: uuid, role: .user, parts: Self.userParts(text), createdAt: stamp))
+                place(Message(id: uuid, role: .user, parts: Self.userParts(text), createdAt: stamp))
                 changed.insert(uuid)
             } else if let blocks = message["content"] as? [[String: Any]] {
                 var texts: [String] = []
@@ -172,7 +170,7 @@ struct TranscriptFold: Sendable {
                 if !texts.isEmpty {
                     flushTurn()
                     lastPromptAt = stamp
-                    messages.append(
+                    place(
                         Message(
                             id: uuid, role: .user,
                             parts: Self.userParts(texts.joined(separator: "\n\n")),
@@ -409,6 +407,29 @@ struct TranscriptFold: Sendable {
         open.usage = (open.usage ?? TokenCounts()) + counts
         open.costUSD = (open.costUSD ?? 0) + Rate.forModel(model ?? "").cost(of: counts)
         changed.insert(open.id)
+    }
+
+    /// Seats a prompt where its own stamp says it was typed. The CLI writes the record of a
+    /// `/compact` after the compaction it caused, stamped when it was typed — so read in file
+    /// order the seam comes first and the prompt that asked for it second, which is not the order
+    /// anyone saw, nor the order the bridge streamed it in. A prompt stamped before the seam it
+    /// follows goes above it.
+    private mutating func place(_ prompt: Message) {
+        var at = messages.count
+        while at > 0, isSeam(messages[at - 1]), prompt.createdAt < messages[at - 1].createdAt {
+            at -= 1
+        }
+        messages.insert(prompt, at: at)
+        guard at < messages.count - 1 else { return }
+        for (toolID, location) in toolLocation {
+            guard let index = location.messageIndex, index >= at else { continue }
+            toolLocation[toolID] = (index + 1, location.partIndex)
+        }
+    }
+
+    private func isSeam(_ message: Message) -> Bool {
+        guard message.parts.count == 1, case .compaction = message.parts[0] else { return false }
+        return true
     }
 
     private mutating func flushTurn() {

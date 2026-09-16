@@ -9,12 +9,14 @@ struct ClaudeRunner: Sendable {
     let permissionMode: String
 
     struct Outcome: Sendable {
-        var message: Message
+        /// What the turn produced, in order: the assistant's chunks and, between them, every
+        /// compaction seam as a message of its own — the shape the transcript fold reads back.
+        var messages: [Message]
         var claudeSessionID: String?
         var costUSD: Double?
         var tokens: Int?
-        /// The turn compacted. The message carries a placeholder ``Part/compaction(_:)`` in stream
-        /// order whose numbers only the transcript knows — see `SessionStore.fillCompaction`.
+        /// The turn compacted. A seam message carries the numbers the CLI streamed; only the
+        /// transcript knows the summary — see `SessionStore.fillCompaction`.
         var didCompact = false
     }
 
@@ -81,11 +83,19 @@ final class ExitLatch: @unchecked Sendable {
     }
 }
 
-/// Folds Claude's stream-json events into a single assistant message, emitting incremental events.
+/// Folds Claude's stream-json events into the turn's messages, emitting incremental events.
 /// Parts keep stream order — narration text stays interleaved with the tool calls it describes
 /// instead of collapsing into one trailing blob.
+///
+/// A compaction splits the turn the way the transcript records it: the seam is a `system`
+/// message of its own, and what the model says after it is a fresh assistant message. The two
+/// records of a conversation — this stream and the CLI's own file — then hold the same messages
+/// in the same shape, which is what lets the sweep name the file's copy after the streamed one
+/// instead of handing a client a second card for the seam it has just watched arrive.
 struct Assembler {
-    let messageID: String
+    /// The assistant message currently being written. Starts as the id the store announced with
+    /// the turn and moves on at every seam.
+    private(set) var messageID: String
     var sessionID: String?
     var costUSD: Double?
     var tokens: Int?
@@ -98,9 +108,15 @@ struct Assembler {
         case thinking(String)
         case tool(String)
         case file(FileRef)
-        case compaction
+        case compaction(seamID: String)
     }
     private var segments: [Segment] = []
+    /// One id per assistant chunk, in order; the first is the id the store announced.
+    private var chunkIDs: [String]
+    /// Whether the client has been told the current chunk exists. The first chunk is announced by
+    /// the store when the turn opens; a chunk begun at a seam is announced by the first event
+    /// that lands in it, so a seam nothing follows leaves no empty bubble behind.
+    private var chunkAnnounced = true
     private var tools: [String: ToolCall] = [:]
     /// Task id to the id of the call that launched it, read out of launch banners. The fold keeps
     /// the same book for the same reason — see ``rememberLaunchedTask(in:of:)``.
@@ -108,7 +124,10 @@ struct Assembler {
     private var currentBlock: (index: Int, toolID: String?)?
     private var blockBoundary = true
 
-    init(messageID: String) { self.messageID = messageID }
+    init(messageID: String) {
+        self.messageID = messageID
+        chunkIDs = [messageID]
+    }
 
     mutating func ingest(
         _ object: [String: Any], emit: (BridgeEvent) -> Void,
@@ -122,7 +141,7 @@ struct Assembler {
             case "status":
                 ingestCompactionStatus(object, emit: emit)
             case "compact_boundary":
-                ingestCompactionBoundary(object)
+                ingestCompactionBoundary(object, emit: emit)
             case "task_notification":
                 ingestTaskNotificationEvent(object, emit: emit, report: report)
             default:
@@ -164,7 +183,10 @@ struct Assembler {
             case .thinking, .tool, .file, .compaction: return true
             }
         }
-        if !hasContent { segments.append(.text(text)) }
+        if !hasContent {
+            announceChunk(emit: emit)
+            segments.append(.text(text))
+        }
     }
 
     /// Compaction is a turn that spends minutes reading instead of answering, and the CLI is the
@@ -177,8 +199,7 @@ struct Assembler {
             emit(.compaction(phase: "failed", error: error))
         } else if object["compact_result"] as? String != nil {
             didCompact = true
-            segments.append(.compaction)
-            blockBoundary = true
+            openSeam(emit: emit)
             emit(.compaction(phase: "finished", error: nil))
         } else if object["status"] as? String == "compacting" {
             emit(.compaction(phase: "started", error: nil))
@@ -186,9 +207,12 @@ struct Assembler {
     }
 
     /// The CLI's own record of a compaction it just did — trigger, tokens before and after, how
-    /// long it took. The seam is appended here if the status markers did not already put it in
-    /// stream order, so an auto-compaction reported only by its boundary still renders.
-    private mutating func ingestCompactionBoundary(_ object: [String: Any]) {
+    /// long it took. The seam is opened here if the status markers did not already put it in
+    /// stream order, so an auto-compaction reported only by its boundary still renders; either
+    /// way the seam on the wire is updated with the numbers the moment they are known.
+    private mutating func ingestCompactionBoundary(
+        _ object: [String: Any], emit: (BridgeEvent) -> Void
+    ) {
         guard let meta = object["compact_metadata"] as? [String: Any] else { return }
         var compaction = Compaction()
         compaction.trigger = meta["trigger"] as? String
@@ -196,10 +220,57 @@ struct Assembler {
         compaction.tokensAfter = (meta["post_tokens"] as? NSNumber)?.intValue
         compaction.durationMs = (meta["duration_ms"] as? NSNumber)?.doubleValue
         compactionMetadata = compaction
-        guard !didCompact else { return }
-        didCompact = true
-        segments.append(.compaction)
+        if !didCompact {
+            didCompact = true
+            openSeam(emit: emit)
+            return
+        }
+        for segment in segments.reversed() {
+            guard case .compaction(let seamID) = segment else { continue }
+            emit(.messageUpserted(seamMessage(seamID)))
+            return
+        }
+    }
+
+    /// Cuts the turn at a compaction. A chunk with words or calls in it keeps its id and the seam
+    /// takes a fresh one; a chunk nothing has landed in yet gives its id to the seam instead, so
+    /// the bubble the store announced becomes the seam rather than standing empty beside it — which
+    /// is a manual `/compact`, and an auto-compaction that fired before the model's first word.
+    /// Either way what follows goes to a new chunk, announced only once something lands in it.
+    private mutating func openSeam(emit: (BridgeEvent) -> Void) {
+        let seamID = Self.hasContent(currentChunk) ? UUID().uuidString : messageID
+        segments.append(.compaction(seamID: seamID))
         blockBoundary = true
+        currentBlock = nil
+        messageID = UUID().uuidString
+        chunkIDs.append(messageID)
+        chunkAnnounced = false
+        emit(.messageUpserted(seamMessage(seamID)))
+    }
+
+    private func seamMessage(_ seamID: String) -> Message {
+        Message(
+            id: seamID, role: .system, parts: [.compaction(compactionMetadata ?? Compaction())],
+            createdAt: Date())
+    }
+
+    /// The segments since the last seam.
+    private var currentChunk: ArraySlice<Segment> {
+        let start = segments.lastIndex { segment in
+            if case .compaction = segment { return true }
+            return false
+        }
+        return segments[(start.map { $0 + 1 } ?? 0)...]
+    }
+
+    /// Puts the current chunk on the wire before the first event that addresses it, since a delta
+    /// for a message the client does not hold is dropped there.
+    private mutating func announceChunk(emit: (BridgeEvent) -> Void) {
+        guard !chunkAnnounced else { return }
+        chunkAnnounced = true
+        emit(
+            .messageUpserted(
+                Message(id: messageID, role: .assistant, parts: [.text("")], createdAt: Date())))
     }
 
     /// The harness's report that background work ended, as the long-lived CLI delivers it: a
@@ -242,6 +313,7 @@ struct Assembler {
                 segments.append(.tool(id))
                 currentBlock = (index, id)
                 blockBoundary = true
+                announceChunk(emit: emit)
                 emit(.toolUpserted(messageID: messageID, call))
             } else {
                 currentBlock = (index, nil)
@@ -256,6 +328,7 @@ struct Assembler {
                     segments.append(.text(chunk))
                     blockBoundary = false
                 }
+                announceChunk(emit: emit)
                 emit(.partTextDelta(messageID: messageID, delta: chunk))
             } else if let chunk = delta["thinking"] as? String {
                 if !blockBoundary, case .thinking(let existing) = segments.last {
@@ -331,7 +404,7 @@ struct Assembler {
         if var call = tools[toolID] {
             call.background = outcome
             tools[toolID] = call
-            emit(.toolUpserted(messageID: messageID, call))
+            emit(.toolUpserted(messageID: chunkID(holding: toolID), call))
         }
         report(toolID, outcome)
     }
@@ -368,7 +441,7 @@ struct Assembler {
             call.output = String(flattened.prefix(TranscriptParser.toolOutputLimit))
             call.status = (block["is_error"] as? Bool == true) ? .error : .completed
             tools[toolID] = call
-            emit(.toolUpserted(messageID: messageID, call))
+            emit(.toolUpserted(messageID: chunkID(holding: toolID), call))
             appendImage(
                 from: block, result: object["toolUseResult"], toolID: toolID, call: call)
         }
@@ -390,7 +463,55 @@ struct Assembler {
         blockBoundary = true
     }
 
-    func finalMessage() -> Message {
+    /// The message a call was made in: the chunk before the seam that follows it, or the current
+    /// one when no seam does. A result for a call made before a compaction lands on the chunk
+    /// that holds the call, not on whatever the model is writing now.
+    private func chunkID(holding toolID: String) -> String {
+        var chunk = 0
+        for segment in segments {
+            switch segment {
+            case .tool(let id) where id == toolID: return chunkIDs[chunk]
+            case .compaction: chunk += 1
+            default: break
+            }
+        }
+        return messageID
+    }
+
+    /// Everything the turn produced, as the messages the transcript will hold: each assistant
+    /// chunk under its own id, each seam between them as a system message. A turn that said
+    /// nothing at all is one empty assistant message, so the bubble the store announced settles.
+    func finalMessages() -> [Message] {
+        var messages: [Message] = []
+        var chunk = 0
+        var current: ArraySlice<Segment> = []
+        let now = Date()
+        func flushChunk() {
+            let parts = Self.parts(of: current, tools: tools)
+            if !parts.isEmpty {
+                messages.append(
+                    Message(id: chunkIDs[chunk], role: .assistant, parts: parts, createdAt: now))
+            }
+            current = []
+        }
+        for segment in segments {
+            guard case .compaction(let seamID) = segment else {
+                current.append(segment)
+                continue
+            }
+            flushChunk()
+            messages.append(seamMessage(seamID))
+            chunk += 1
+        }
+        flushChunk()
+        if messages.isEmpty {
+            messages.append(
+                Message(id: chunkIDs[0], role: .assistant, parts: [.text("")], createdAt: now))
+        }
+        return messages
+    }
+
+    private static func parts(of segments: ArraySlice<Segment>, tools: [String: ToolCall]) -> [Part] {
         var parts: [Part] = []
         for segment in segments {
             switch segment {
@@ -408,11 +529,21 @@ struct Assembler {
             case .file(let file):
                 parts.append(.file(file))
             case .compaction:
-                parts.append(.compaction(compactionMetadata ?? Compaction()))
+                break
             }
         }
-        if parts.isEmpty { parts.append(.text("")) }
-        return Message(id: messageID, role: .assistant, parts: parts, createdAt: Date())
+        return parts
+    }
+
+    private static func hasContent(_ segments: ArraySlice<Segment>) -> Bool {
+        segments.contains { segment in
+            switch segment {
+            case .text(let value), .thinking(let value):
+                return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            case .tool, .file: return true
+            case .compaction: return false
+            }
+        }
     }
 
     private static func flatten(_ content: Any?) -> String {
