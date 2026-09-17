@@ -27,6 +27,16 @@ private struct StdinClaude {
             echo "start $$" >> "\(invocationLog.path)"
             while IFS= read -r line; do
               case "$line" in
+                *stop_task*)
+                  rid=$(echo "$line" | sed -n 's/.*"request_id":"\\([^"]*\\)".*/\\1/p')
+                  if [ -f "\(root.appendingPathComponent("nostop").path)" ]; then
+                    $P '%s\\n' "{\\"type\\":\\"control_response\\",\\"response\\":{\\"subtype\\":\\"error\\",\\"request_id\\":\\"$rid\\",\\"error\\":\\"stop_task is not supported in this context\\"}}"
+                  else
+                    pkill -f "sleep 900; echo \(root.lastPathComponent)" >/dev/null 2>&1
+                    $P '%s\\n' "{\\"type\\":\\"control_response\\",\\"response\\":{\\"subtype\\":\\"success\\",\\"request_id\\":\\"$rid\\",\\"response\\":{}}}"
+                    $P '%s\\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
+                  fi
+                  ;;
                 *control_request*)
                   rid=$(echo "$line" | sed -n 's/.*"request_id":"\\([^"]*\\)".*/\\1/p')
                   touch "\(stop)"
@@ -68,6 +78,18 @@ private struct StdinClaude {
                           $P '%s\\n' '{"type":"system","subtype":"task_started","task_id":"h1","tool_use_id":"tu-h1","task_type":"local_bash","description":"sleep 900","is_backgrounded":true}'
                           $P '%s\\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"h1","task_type":"local_bash","description":"sleep 900"}]}'
                           $P '%s\\n' '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu-h1","content":"Command running in background with ID: h1. Output is being written to: \(root.appendingPathComponent("h1.output").path). You will be notified when it completes."}]}}'
+                          ;;
+                        *creep*)
+                          $P '%s\\n' '{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"tu-h2","name":"Bash","input":{"command":"sleep 900; echo \(root.lastPathComponent)","description":"Look for the widget","timeout":5000}}]}}'
+                          /bin/sh -c "sleep 900; echo \(root.lastPathComponent)" < /dev/null > /dev/null 2>&1 &
+                          $P '%s\\n' '{"type":"system","subtype":"task_started","task_id":"h2","tool_use_id":"tu-h2","task_type":"local_bash","description":"Look for the widget","is_backgrounded":false}'
+                          $P '%s\\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"h2","task_type":"local_bash","description":"Look for the widget"}]}'
+                          $P '%s\\n' '{"type":"system","subtype":"task_updated","task_id":"h2","patch":{"is_backgrounded":true}}'
+                          $P '%s\\n' '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu-h2","content":"Command did not complete within its 5s timeout and was moved to the background (ID: h2). Output is being written to: \(root.appendingPathComponent("h2.output").path)."}]}}'
+                          ;;
+                        *delegate*)
+                          $P '%s\\n' '{"type":"system","subtype":"task_started","task_id":"a1","task_type":"local_agent","description":"Explore the repository","is_backgrounded":true}'
+                          $P '%s\\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","task_type":"local_agent","description":"Explore the repository"}]}'
                           ;;
                         *settle*)
                           $P '%s\\n' '{"type":"system","subtype":"task_updated","task_id":"h1","patch":{"status":"completed","end_time":1788972349027}}'
@@ -413,6 +435,70 @@ struct PersistentProcessTests {
         await waitUntil(.seconds(3)) { !shellAlive("echo \(fake.root.lastPathComponent)") }
         #expect(!shellAlive("echo \(fake.root.lastPathComponent)"))
         #expect((await assistantTexts(store, session.id).last ?? "").contains("Stopped background work"))
+    }
+
+    @Test("Background work that is an agent is stopped the same way a shell is")
+    func stopEndsAgentWork() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "delegate this one"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        await waitUntil { await store.backgroundWork(for: session.id) != nil }
+
+        let result = await store.stopBackgroundWork(session.id)
+        #expect(result.ended == 1)
+        #expect(result.refusal == nil)
+        #expect(await store.backgroundWork(for: session.id) == nil)
+        let notice = await assistantTexts(store, session.id).last ?? ""
+        #expect(notice.contains("Stopped background work"))
+        #expect(notice.contains("Explore the repository"))
+    }
+
+    @Test("A command the harness backgrounded is ended by hand when the CLI will not")
+    func stopEndsHarnessBackgroundedShellWithoutTheCLI() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        try Data().write(to: fake.root.appendingPathComponent("nostop"))
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "creep along quietly"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        await waitUntil { shellAlive("sleep 900; echo \(fake.root.lastPathComponent)") }
+        #expect(await store.backgroundWork(for: session.id)?.task == "Look for the widget")
+
+        let result = await store.stopBackgroundWork(session.id)
+        #expect(result.ended == 1)
+        #expect(result.refusal == nil)
+        await waitUntil(.seconds(3)) {
+            !shellAlive("sleep 900; echo \(fake.root.lastPathComponent)")
+        }
+        #expect(!shellAlive("sleep 900; echo \(fake.root.lastPathComponent)"))
+        let written =
+            (try? String(contentsOf: fake.root.appendingPathComponent("h2.output"), encoding: .utf8))
+            ?? ""
+        #expect(written.contains("[claude-bridge] Ended this command"))
+    }
+
+    @Test("Work the CLI will not stop and the machine cannot find is refused in its own words")
+    func stopSaysSoWhenNothingCouldBeEnded() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        try Data().write(to: fake.root.appendingPathComponent("nostop"))
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "delegate this one"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        await waitUntil { await store.backgroundWork(for: session.id) != nil }
+
+        let result = await store.stopBackgroundWork(session.id)
+        #expect(result.ended == 0)
+        #expect(result.refusal?.contains("did not answer the stop") == true)
+        #expect(await store.backgroundWork(for: session.id) != nil)
     }
 
     @Test("Stop interrupts the turn and keeps the process")

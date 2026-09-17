@@ -818,10 +818,11 @@ actor SessionStore {
         noteBackgroundWork(id, from: process, await process.backgroundWork)
     }
 
-    /// Ends every background shell the conversation's process is carrying, at a person's
-    /// request. Refused, with the reason, when there is nothing this can end: a turn is open
-    /// and its stop is the other button, no process is resident, or the work is an agent or a
-    /// workflow, which runs inside the CLI and has no process of its own to end.
+    /// Ends every piece of background work the conversation's process is carrying, at a person's
+    /// request — a shell, an agent, a workflow alike, because the CLI ends its own work by name
+    /// and only a task it will not answer for has to be hunted in the process table. Refused,
+    /// with the reason, when there is nothing this can end: a turn is open and its stop is the
+    /// other button, no process is resident, nothing is running, or the CLI would not end it.
     func stopBackgroundWork(_ id: String) async -> (ended: Int, refusal: String?) {
         guard openTurns[id] == nil else {
             return (0, "A turn is running — stop the turn instead.")
@@ -829,15 +830,16 @@ actor SessionStore {
         guard let process = processes[id], await process.isRunning else {
             return (0, "Nothing is running for this chat on the bridge.")
         }
-        let work = await process.backgroundWork
-        let ended = await process.endAllShells(reason: Self.stopReason)
-        if ended.isEmpty {
-            guard work != nil else { return (0, "Nothing is running in the background.") }
-            return (0, "Only shell commands can be stopped from here; this chat's background work is an agent or a workflow.")
+        guard await process.backgroundWork != nil else {
+            return (0, "Nothing is running in the background.")
         }
-        note(id, Self.stopNotice(ended))
+        let stopped = await process.stopAllTasks(reason: Self.stopReason)
         noteBackgroundWork(id, from: process, await process.backgroundWork)
-        return (ended.count, nil)
+        guard !stopped.isEmpty else {
+            return (0, "Claude did not answer the stop; this chat's background work is still running.")
+        }
+        note(id, Self.stopNotice(stopped))
+        return (stopped.count, nil)
     }
 
     /// A line of the bridge's own in the conversation, in the voice the wedged-turn notice
@@ -874,9 +876,10 @@ actor SessionStore {
         return lines.joined(separator: "\n")
     }
 
-    static func stopNotice(_ shells: [ClaudeProcess.StalledShell]) -> String {
-        let lines = shells.map { shell -> String in
-            "⏹ Stopped background work after \(Self.clock(shell.ranFor)): `\(Self.oneLine(shell.description ?? shell.command))`"
+    static func stopNotice(_ tasks: [ClaudeProcess.StoppedTask]) -> String {
+        let lines = tasks.map { task -> String in
+            let name = task.description.map { "`\(Self.oneLine($0))`" } ?? "a background task"
+            return "⏹ Stopped background work after \(Self.clock(task.ranFor)): \(name)"
         }
         return lines.joined(separator: "\n")
     }

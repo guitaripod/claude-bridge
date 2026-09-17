@@ -118,6 +118,23 @@ actor ClaudeProcess {
     private var shellCallOrder: [String] = []
     private static let shellCallsKept = 64
 
+    /// The tool call behind each task the CLI has named, whether or not the task began in the
+    /// background. A command the model backgrounded itself is announced as background work by the
+    /// event that carries the call; a command the *harness* backgrounded when its timeout ran out
+    /// is announced by one that does not, and its `task_started` came earlier saying the task was
+    /// in the foreground. Keeping the pairing from the first mention is what lets the second kind
+    /// be read back to the command it is running — without it a task is known only by the model's
+    /// own description of it, which names no process on the machine. The moment is kept with it,
+    /// because such a task has already run its whole timeout by the time it is called background
+    /// work, and a clock started then would give it that long again before anything judged it.
+    private var taskCalls: [String: TaskOrigin] = [:]
+    private var taskCallOrder: [String] = []
+
+    struct TaskOrigin: Sendable, Equatable {
+        var toolID: String
+        var startedAt: Date
+    }
+
     /// The `task_type` values that run as a child process rather than inside the CLI.
     static let shellKinds: Set<String> = ["local_bash", "bash", "shell"]
 
@@ -207,15 +224,64 @@ actor ClaudeProcess {
         return ended
     }
 
-    /// Ends every shell the CLI is carrying, on request. What is found is what is ended; a task
-    /// whose process the machine cannot find is left to the CLI's own accounting.
-    func endAllShells(reason: String) -> [StalledShell] {
+    /// Ends every background task the CLI is carrying, at a person's request.
+    ///
+    /// The CLI stops its own work far better than the process table can: `stop_task` names a task
+    /// by the id the CLI gave it, so a shell, an agent and a workflow all end the same way, the
+    /// registry is updated by the machine that owns it, and the model is told. Hunting the process
+    /// table is the fallback for a task the CLI would not stop — and only shells leave anything
+    /// there to find, because an agent and a workflow run inside the CLI itself.
+    func stopAllTasks(reason: String) async -> [StoppedTask] {
         guard isRunning else { return [] }
-        let shells = liveTasks.filter { $0.value.isShell }
+        let tasks = liveTasks
+        guard !tasks.isEmpty else { return [] }
+        var stopped: [StoppedTask] = []
+        var refused: [String: LiveTask] = [:]
+        for (id, task) in tasks {
+            if let file = task.shell?.outputFile { Self.append(reason, to: file) }
+            guard await control("stop_task", fields: ["task_id": id], timeout: Self.stopTaskTimeout)
+            else {
+                refused[id] = task
+                continue
+            }
+            liveTasks[id] = nil
+            taskCalls[id] = nil
+            stopped.append(Self.stopped(id, task))
+        }
+        for shell in endShells(refused, reason: reason) {
+            stopped.append(Self.stopped(shell.taskID, tasks[shell.taskID], ranFor: shell.ranFor))
+        }
+        return stopped
+    }
+
+    private static func stopped(_ id: String, _ task: LiveTask?, ranFor: TimeInterval? = nil)
+        -> StoppedTask
+    {
+        StoppedTask(
+            taskID: id, description: task?.description ?? task?.shell?.command,
+            kind: task?.kind,
+            ranFor: ranFor ?? task.map { Date().timeIntervalSince($0.seenAt) } ?? 0)
+    }
+
+    /// A background task ended at a person's request, in the words a chat can read it back in.
+    struct StoppedTask: Sendable, Equatable {
+        var taskID: String
+        var description: String?
+        var kind: String?
+        var ranFor: TimeInterval
+    }
+
+    /// Ends the shells among the tasks named, by hand. What is found is what is ended; a task
+    /// whose process the machine cannot find is left to the CLI's own accounting.
+    func endShells(_ tasks: [String: LiveTask], reason: String) -> [StalledShell] {
+        guard isRunning else { return [] }
+        let shells = tasks.filter { $0.value.isShell }
+        guard !shells.isEmpty else { return [] }
+        let liveShellCount = liveTasks.count { $0.value.isShell }
         let candidates = shellChildren()
         var ended: [StalledShell] = []
         for (id, task) in shells {
-            let pids = subtree(for: task, among: candidates, alone: shells.count == 1)
+            let pids = subtree(for: task, among: candidates, alone: liveShellCount == 1)
             guard !pids.isEmpty else { continue }
             let now = Date()
             let shell = StalledShell(
@@ -294,6 +360,25 @@ actor ClaudeProcess {
             if kill(pid, SIGKILL) == 0 { killed += 1 }
         }
         return killed
+    }
+
+    /// Remembers which tool call a task belongs to, from the first event that says so.
+    private func rememberTaskCall(_ task: String, _ toolID: String) {
+        guard taskCalls[task] == nil else { return }
+        taskCalls[task] = TaskOrigin(toolID: toolID, startedAt: Date())
+        taskCallOrder.append(task)
+        while taskCallOrder.count > Self.shellCallsKept {
+            taskCalls[taskCallOrder.removeFirst()] = nil
+        }
+    }
+
+    /// Gives a live task the call it came from: the command, its budget and its output file, and
+    /// the moment the work actually started rather than the moment it was called background work.
+    private func attachCall(_ entry: inout LiveTask, task: String, toolID: String?) {
+        if let toolID { rememberTaskCall(task, toolID) }
+        guard let origin = taskCalls[task] else { return }
+        if entry.shell == nil { entry.shell = shellCalls[origin.toolID] }
+        entry.seenAt = min(entry.seenAt, origin.startedAt)
     }
 
     /// Remembers what a `Bash` call asked for, by the call's id, so the task the CLI later says
@@ -419,6 +504,10 @@ actor ClaudeProcess {
     /// judged unresponsive to it. Both answer in milliseconds when they answer at all.
     static let controlTimeout: Duration = .seconds(3)
     static let slashTimeout: Duration = .seconds(10)
+    /// How long the CLI is given to end one background task. Longer than an ordinary control
+    /// request, because ending an agent or a workflow is the CLI unwinding work of its own rather
+    /// than answering a question about itself.
+    static let stopTaskTimeout: Duration = .seconds(15)
     /// How long a closed stdin is given to end the process before it is terminated.
     static let closeGrace: Duration = .seconds(3)
 
@@ -585,7 +674,9 @@ actor ClaudeProcess {
         }
     }
 
-    private func control(_ subtype: String, fields: [String: Any]) async -> Bool {
+    private func control(
+        _ subtype: String, fields: [String: Any], timeout: Duration = ClaudeProcess.controlTimeout
+    ) async -> Bool {
         guard isRunning else { return false }
         requestCounter += 1
         let id = "bridge-\(requestCounter)"
@@ -601,7 +692,7 @@ actor ClaudeProcess {
                 return
             }
             Task { [weak self] in
-                try? await Task.sleep(for: Self.controlTimeout)
+                try? await Task.sleep(for: timeout)
                 await self?.expireControl(id)
             }
         }
@@ -658,19 +749,21 @@ actor ClaudeProcess {
                     var entry = known[id] ?? LiveTask(description: nil, kind: nil)
                     entry.description = task["description"] as? String ?? entry.description
                     entry.kind = task["task_type"] as? String ?? entry.kind
+                    attachCall(&entry, task: id, toolID: task["tool_use_id"] as? String)
                     liveTasks[id] = entry
                 }
             case "task_started":
-                if let id = object["task_id"] as? String,
-                    object["is_backgrounded"] as? Bool == true,
+                let id = object["task_id"] as? String
+                if let id, let toolID = object["tool_use_id"] as? String {
+                    rememberTaskCall(id, toolID)
+                }
+                if let id, object["is_backgrounded"] as? Bool == true,
                     object["ambient"] as? Bool != true
                 {
                     var entry = liveTasks[id] ?? LiveTask(description: nil, kind: nil)
                     entry.description = object["description"] as? String ?? entry.description
                     entry.kind = object["task_type"] as? String ?? entry.kind
-                    if let toolID = object["tool_use_id"] as? String, let call = shellCalls[toolID] {
-                        entry.shell = call
-                    }
+                    attachCall(&entry, task: id, toolID: object["tool_use_id"] as? String)
                     liveTasks[id] = entry
                 }
             case "task_updated":
@@ -679,14 +772,24 @@ actor ClaudeProcess {
                 {
                     if Self.patchEndsTask(patch) {
                         liveTasks[id] = nil
+                        taskCalls[id] = nil
                     } else if patch["is_backgrounded"] as? Bool == true, liveTasks[id] == nil {
-                        liveTasks[id] = LiveTask(
+                        var entry = LiveTask(
                             description: patch["description"] as? String,
                             kind: (patch["task_type"] ?? object["task_type"]) as? String)
+                        attachCall(&entry, task: id, toolID: object["tool_use_id"] as? String)
+                        liveTasks[id] = entry
+                    } else if liveTasks[id] != nil {
+                        var entry = liveTasks[id]!
+                        attachCall(&entry, task: id, toolID: object["tool_use_id"] as? String)
+                        liveTasks[id] = entry
                     }
                 }
             case "task_notification":
-                if let id = object["task_id"] as? String { liveTasks[id] = nil }
+                if let id = object["task_id"] as? String {
+                    liveTasks[id] = nil
+                    taskCalls[id] = nil
+                }
             default:
                 break
             }

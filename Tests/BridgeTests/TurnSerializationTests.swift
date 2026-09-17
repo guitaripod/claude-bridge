@@ -56,6 +56,18 @@ private func makeStore(_ fake: FakeClaude) -> (SessionStore, URL) {
     return (store, storeURL)
 }
 
+/// Waits for a condition rather than for a duration: a fixed sleep asserts how fast this machine
+/// is under whatever else the suite is running, which is not what any of these tests are about.
+private func until(
+    _ limit: Duration, _ condition: @Sendable () async -> Bool
+) async throws {
+    let deadline = ContinuousClock.now + limit
+    while ContinuousClock.now < deadline {
+        if await condition() { return }
+        try await Task.sleep(for: .milliseconds(20))
+    }
+}
+
 @Suite("Turn serialization")
 struct TurnSerializationTests {
 
@@ -72,11 +84,12 @@ struct TurnSerializationTests {
         #expect(first == .started)
         #expect(second == .queued(position: 1))
 
-        try await Task.sleep(for: .milliseconds(200))
+        try await until(.seconds(3)) { fake.starts >= 1 }
         #expect(fake.starts == 1)
 
-        try await Task.sleep(for: .seconds(2))
+        try await until(.seconds(6)) { fake.starts >= 2 }
         #expect(fake.starts == 2)
+        try await until(.seconds(3)) { await store.hasQueuedOrRunningTurn(session.id) == false }
         #expect(await store.hasQueuedOrRunningTurn(session.id) == false)
 
         let stored = await store.get(session.id)
