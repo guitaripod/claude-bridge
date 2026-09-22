@@ -79,7 +79,7 @@ actor TranscriptWatcher {
             {
                 caster.send(.messageUpserted(open))
             }
-        } else if Self.agentsWorking(transcriptPath: path) {
+        } else if await agentsWorking(transcriptID) {
             await report(true)
         }
 
@@ -103,7 +103,7 @@ actor TranscriptWatcher {
                     continue
                 }
                 guard Date() > suppressedUntil else { continue }
-                if Self.agentsWorking(transcriptPath: path) {
+                if await agentsWorking(transcriptID) {
                     lastGrowth = Date()
                     await report(true)
                 } else if Date().timeIntervalSince(lastGrowth) > Self.idleAfter
@@ -131,7 +131,7 @@ actor TranscriptWatcher {
                 caster.send(.messageUpserted(index < published.count ? published[index] : message))
             }
             if TranscriptParser.isTurnClosed(atPath: path),
-                !Self.agentsWorking(transcriptPath: path)
+                !(await agentsWorking(transcriptID))
             {
                 await report(false)
             } else {
@@ -140,15 +140,16 @@ actor TranscriptWatcher {
         }
     }
 
-    /// Whether agents spawned by this session are still writing. A turn that
+    /// Whether agents spawned by this session are still out. A turn that
     /// hands its work to background agents closes in the parent transcript
     /// while the real work runs on in the sidecars — reading only the parent
-    /// would call that session finished the moment it delegated.
-    private nonisolated static func agentsWorking(transcriptPath: String) -> Bool {
-        guard let latest = TranscriptParser.sidecarActivity(transcriptPath: transcriptPath) else {
-            return false
-        }
-        return Date().timeIntervalSince(latest) < TranscriptIndex.subagentActivityWindow
+    /// would call that session finished the moment it delegated. Asked of the
+    /// index rather than of the sidecars' mtimes, because an agent that has
+    /// reported back is finished however recently it wrote, and a chat that
+    /// kept spinning for ninety seconds after its last agent answered was the
+    /// same hang the list had.
+    private nonisolated func agentsWorking(_ transcriptID: String) async -> Bool {
+        await index.hasWorkingAgents(transcriptID)
     }
 
     private nonisolated func fileSize(_ path: String) -> Int? {
