@@ -51,9 +51,16 @@ actor TranscriptIndex {
     private var lastScanAt: ContinuousClock.Instant?
     private static let scanDebounce: Duration = .seconds(2)
 
-    init(root: URL, defaults: MachineDefaults) {
+    /// - Parameter owners: the sessions a live CLI is serving right now, or nil when the machine
+    ///   cannot say. Defaults to cannot-say, so an index that was not handed the machine's word
+    ///   concludes nothing from it.
+    init(
+        root: URL, defaults: MachineDefaults,
+        owners: @escaping @Sendable () -> Set<String>? = { nil }
+    ) {
         self.root = root
         self.defaults = defaults
+        self.owners = owners
     }
 
     func list(excluding claimed: Set<String>, hidden: Set<String>) -> [SessionSummary] {
@@ -210,7 +217,7 @@ actor TranscriptIndex {
     /// The bound exists at all because a harness that died leaves its ledger unbalanced forever.
     static let fanoutRunWindow: TimeInterval = 30 * 60
 
-    private var answerCache: [String: (offset: Int, at: [String: Date])] = [:]
+    private var answerCache: [String: (offset: Int, answers: TranscriptAnswers)] = [:]
     private var progressCache: [String: SubagentProgress] = [:]
     private var journalCache: [String: (offset: Int, started: Set<String>, completed: Set<String>)] =
         [:]
@@ -225,8 +232,10 @@ actor TranscriptIndex {
         progressCache = progressCache.filter { FileManager.default.fileExists(atPath: $0.key) }
         journalCache = journalCache.filter { FileManager.default.fileExists(atPath: $0.key) }
         metaToolUseIDs = metaToolUseIDs.filter { FileManager.default.fileExists(atPath: $0.key) }
+        lastLineStamps = lastLineStamps.filter { FileManager.default.fileExists(atPath: $0.key) }
         if answerCache.count > ceiling { answerCache = [:] }
         if metaToolUseIDs.count > ceiling { metaToolUseIDs = [:] }
+        if lastLineStamps.count > ceiling { lastLineStamps = [:] }
         if progressCache.count > ceiling { progressCache = [:] }
         if journalCache.count > ceiling { journalCache = [:] }
     }
@@ -248,49 +257,48 @@ actor TranscriptIndex {
         return cached
     }
 
-    /// When the parent transcript last heard back from each call and each background task, keyed
-    /// by the call's `tool_use_id` and by the task's own id.
-    ///
-    /// An agent's sidecar going quiet is not the end of the agent, and its last write being
-    /// recent is not proof it is still out: the parent is told in so many words when one
-    /// finishes — a foreground call's `tool_result`, a background task's `<task-notification>` —
-    /// and a sidecar whose last write that word has since answered is finished work, however
-    /// few seconds ago it wrote. Without this a session that delegated anything read as live for
-    /// minutes after the last agent had reported back. A background launch's own `tool_result`
-    /// answers only that the agent started, so it is not recorded here.
-    ///
-    /// Incremental: only complete lines appended since the last call are read, and only lines
-    /// carrying one of the two markers are parsed. A full-file parse of a growing transcript on
-    /// every poll starves the actor for minutes.
-    private func answers(transcriptPath: String) -> [String: Date] {
-        var cached = answerCache[transcriptPath] ?? (0, [:])
-        guard let handle = FileHandle(forReadingAtPath: transcriptPath) else { return cached.at }
-        defer { try? handle.close() }
-        let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
-        if size < cached.offset { cached = (0, [:]) }
-        guard size > cached.offset else { return cached.at }
-        try? handle.seek(toOffset: UInt64(cached.offset))
-        guard let data = try? handle.read(upToCount: size - cached.offset) else { return cached.at }
-        cached.at.merge(TranscriptParser.answers(in: data), uniquingKeysWith: max)
-        cached.offset += completeBytes(in: data)
-        answerCache[transcriptPath] = cached
-        return cached.at
+    /// Everything this session's own records say about when its agents were heard back from:
+    /// the parent transcript, and every sidecar written inside the horizon — an agent an agent
+    /// spawned reports to the agent that spawned it, never to the parent, so its answer is in a
+    /// sidecar. A sidecar that answered a nested agent wrote that answer after the nested agent's
+    /// last line, so any answer that matters to a recent agent is in a recent file.
+    private func answers(transcriptPath: String) -> TranscriptAnswers {
+        var all = fileAnswers(atPath: transcriptPath)
+        let horizon = Date().addingTimeInterval(-Self.activityWindow * 2)
+        for dir in Self.sidecarDirs(transcriptPath: transcriptPath) {
+            guard
+                let names = try? FileManager.default.contentsOfDirectory(atPath: dir.path)
+            else { continue }
+            for name in names where name.hasPrefix("agent-") && name.hasSuffix(".jsonl") {
+                let path = dir.appendingPathComponent(name).path
+                guard let written = Self.statMtime(path), written > horizon else { continue }
+                all.merge(fileAnswers(atPath: path))
+            }
+        }
+        return all
     }
 
-    /// How far a sidecar's last write may trail the word that answered it and still count as
-    /// answered: the CLI stamps the parent's notification and the agent's closing line within
-    /// the same instant, and a file's mtime can land a few milliseconds after either.
-    static let answerSlack: TimeInterval = 5
-
-    /// Whether the parent has heard back from an agent since the agent last wrote. A background
-    /// agent can stop, report, and pick itself back up; writing past its report makes it live
-    /// again, which is why this compares moments rather than asking whether any answer exists.
-    nonisolated static func isAnswered(
-        agentID: String, toolUseID: String?, lastWrite: Date, answers: [String: Date]
-    ) -> Bool {
-        let heard = [answers[agentID], toolUseID.flatMap { answers[$0] }].compactMap { $0 }.max()
-        guard let heard else { return false }
-        return heard >= lastWrite.addingTimeInterval(-answerSlack)
+    /// When one transcript last heard back from each call and each background task, and which
+    /// calls it launched into the background — see ``TranscriptAnswers``.
+    ///
+    /// Incremental: only complete lines appended since the last call are read, and only lines
+    /// carrying a result or a task notification are parsed. A full-file parse of a growing
+    /// transcript on every poll starves the actor for minutes.
+    private func fileAnswers(atPath path: String) -> TranscriptAnswers {
+        var cached = answerCache[path] ?? (0, TranscriptAnswers())
+        guard let handle = FileHandle(forReadingAtPath: path) else { return cached.answers }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
+        if size < cached.offset { cached = (0, TranscriptAnswers()) }
+        guard size > cached.offset else { return cached.answers }
+        try? handle.seek(toOffset: UInt64(cached.offset))
+        guard let data = try? handle.read(upToCount: size - cached.offset) else {
+            return cached.answers
+        }
+        cached.answers.merge(TranscriptParser.answers(in: data))
+        cached.offset += completeBytes(in: data)
+        answerCache[path] = cached
+        return cached.answers
     }
 
     private var metaToolUseIDs: [String: String] = [:]
@@ -307,22 +315,70 @@ actor TranscriptIndex {
         return id
     }
 
+    private var lastLineStamps: [String: (size: Int, stamp: Date?)] = [:]
+
+    /// The CLI's own stamp on a sidecar's last line, re-read only when the file has grown. The
+    /// answer that ends an agent is stamped by the same clock after that line is written, so the
+    /// two order exactly; a file's mtime lands a few milliseconds after either and does not.
+    private func lastLineStamp(atPath path: String) -> Date? {
+        let size = Self.statSize(path) ?? 0
+        if let known = lastLineStamps[path], known.size == size { return known.stamp }
+        let stamp = TranscriptParser.lastContentDate(atPath: path)
+        lastLineStamps[path] = (size, stamp)
+        return stamp
+    }
+
+    /// Where the machine's word on which sessions a live CLI is serving comes from.
+    private let owners: @Sendable () -> Set<String>?
+    private var ownersRead: (at: ContinuousClock.Instant, ids: Set<String>?)?
+    private static let ownersDebounce: Duration = .seconds(2)
+
+    /// Whether no live CLI is serving this session, as far as the machine can say. Background
+    /// agents and workflow runs live inside the CLI that launched them, so once no process holds
+    /// the session they are gone — whatever their ledger still says and however recently they
+    /// wrote. Nil from the source means the machine cannot say, and nothing is concluded from it.
+    private func isOwnerless(_ sessionID: String) -> Bool {
+        let now = ContinuousClock.now
+        if ownersRead == nil || now - (ownersRead?.at ?? now) > Self.ownersDebounce {
+            ownersRead = (now, owners())
+        }
+        guard let ids = ownersRead?.ids else { return false }
+        return !ids.contains(sessionID)
+    }
+
+    /// Whether an agent that has not reported back is still out. It is not when the parent's
+    /// answer came after its last line; it is not when it was a background agent or a fan-out's
+    /// and no live CLI serves the session any more.
+    private func isOut(
+        agentFile file: URL, agentID: String, inRun: Bool, lastWrite: Date,
+        answers: TranscriptAnswers, sessionID: String
+    ) -> Bool {
+        let toolUseID = toolUseID(forAgentFile: file)
+        if answers.answered(agentID: agentID, toolUseID: toolUseID, since: lastWrite) {
+            return false
+        }
+        let background = inRun || answers.launched(agentID: agentID, toolUseID: toolUseID)
+        return !(background && isOwnerless(sessionID))
+    }
+
     /// The newest write across a session's sidecars, twice: every file, and only the agents
-    /// nobody has answered for. The first says whether the session is worth looking at closely;
-    /// the second is the one that means work is out. Only files written inside the horizon are
-    /// judged — anything older is past every window a caller asks about, and judging it would
-    /// read a meta file per agent the session ever spawned.
+    /// still out. The first says whether the session is worth looking at closely; the second is
+    /// the one that means work is out. Only files written inside the horizon are judged —
+    /// anything older is past every window a caller asks about, and judging it would read a meta
+    /// file per agent the session ever spawned.
     private func sidecarWrites(transcriptPath: String) -> (any: Date?, unanswered: Date?) {
         let horizon = Date().addingTimeInterval(-Self.activityWindow * 2)
+        let sessionID = Self.sessionID(forTranscriptPath: transcriptPath)
         var any: Date?
         var unanswered: Date?
-        var heard: [String: Date]?
+        var heard: TranscriptAnswers?
         for dir in Self.sidecarDirs(transcriptPath: transcriptPath) {
             guard
                 let files = try? FileManager.default.contentsOfDirectory(
                     at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
                     options: .skipsHiddenFiles)
             else { continue }
+            let inRun = dir.lastPathComponent != "subagents"
             var finished: Set<String>?
             for file in files where file.pathExtension == "jsonl" {
                 guard
@@ -336,12 +392,11 @@ actor TranscriptIndex {
                     finished = finished ?? journalLedger(in: dir).completed
                     if finished?.contains(agentID) == true { continue }
                     heard = heard ?? answers(transcriptPath: transcriptPath)
-                    if Self.isAnswered(
-                        agentID: agentID, toolUseID: toolUseID(forAgentFile: file),
-                        lastWrite: written, answers: heard ?? [:])
-                    {
-                        continue
-                    }
+                    let out = isOut(
+                        agentFile: file, agentID: agentID, inRun: inRun,
+                        lastWrite: lastLineStamp(atPath: file.path) ?? written,
+                        answers: heard ?? TranscriptAnswers(), sessionID: sessionID)
+                    if !out { continue }
                 }
                 unanswered = max(unanswered ?? written, written)
             }
@@ -414,6 +469,7 @@ actor TranscriptIndex {
             let unfinished = ledger.started.subtracting(ledger.completed)
             guard !unfinished.isEmpty else { continue }
             guard let latest = Self.newestJSONL(in: dir), latest > threshold else { continue }
+            guard !isOwnerless(Self.sessionID(forTranscriptPath: transcriptPath)) else { continue }
             open += unfinished.count
         }
         return open
@@ -447,7 +503,7 @@ actor TranscriptIndex {
     ///   journal started and has no result for is out until the journal says otherwise, however
     ///   long it thinks; the tool-scale `threshold` is for the agents no ledger accounts for.
     private func subagents(
-        in dir: URL, threshold: Date, runThreshold: Date, answers: [String: Date]
+        in dir: URL, threshold: Date, runThreshold: Date, answers: TranscriptAnswers
     ) -> [SubagentSummary] {
         let ledger = journalLedger(in: dir)
         let journalCompleted = ledger.completed
@@ -462,7 +518,7 @@ actor TranscriptIndex {
                 let name = file.deletingPathExtension().lastPathComponent
                 guard name.hasPrefix("agent-") else { return nil }
                 let lastContent =
-                    TranscriptParser.lastContentDate(atPath: file.path)
+                    lastLineStamp(atPath: file.path)
                     ?? (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?
                     .contentModificationDate ?? .distantPast
                 var title = "Agent"
@@ -486,12 +542,15 @@ actor TranscriptIndex {
                 let agentID = String(name.dropFirst("agent-".count))
                 let completed =
                     journalCompleted.contains(agentID)
-                    || Self.isAnswered(
-                        agentID: agentID, toolUseID: toolUseID, lastWrite: lastContent,
-                        answers: answers)
+                    || answers.answered(agentID: agentID, toolUseID: toolUseID, since: lastContent)
                 let active =
                     !completed
                     && lastContent > (ledger.started.contains(agentID) ? runThreshold : threshold)
+                    && isOut(
+                        agentFile: file, agentID: agentID,
+                        inRun: dir.lastPathComponent != "subagents", lastWrite: lastContent,
+                        answers: answers,
+                        sessionID: Self.sessionID(forTranscriptPath: file.path))
                 var summary = SubagentSummary(
                     id: agentID,
                     title: title, agentType: agentType, toolUseID: toolUseID,
@@ -1047,6 +1106,40 @@ struct SubagentProgress: Sendable {
 }
 
 /// Parses Claude Code CLI transcript files (`.jsonl`, one JSON object per line).
+/// What a session's own records say about its calls and background tasks: when each was last
+/// heard back from, keyed by the call's `tool_use_id` and by the task's own id, and which calls
+/// launched an agent into the background.
+///
+/// An agent's sidecar going quiet is not the end of the agent, and its last write being recent is
+/// not proof it is still out: whoever spawned it is told in so many words when it finishes — a
+/// foreground call's `tool_result`, a background task's `<task-notification>` — and an agent that
+/// word has answered since its last line is finished work, however few seconds ago it wrote. A
+/// background launch's own `tool_result` answers only that the agent started, so it is recorded
+/// as a launch rather than as an answer.
+struct TranscriptAnswers: Sendable, Equatable {
+    var heard: [String: Date] = [:]
+    var launched: Set<String> = []
+
+    mutating func merge(_ other: TranscriptAnswers) {
+        heard.merge(other.heard, uniquingKeysWith: max)
+        launched.formUnion(other.launched)
+    }
+
+    /// Whether an agent was heard back from at or after its last line. Both stamps come from the
+    /// CLI's clock, and the answer is written after the line it answers, so this orders exactly.
+    /// An agent can stop, report, and pick itself back up; a line past its report makes it out
+    /// again, which is why this compares moments rather than asking whether any answer exists.
+    func answered(agentID: String, toolUseID: String?, since lastLine: Date) -> Bool {
+        let last = [heard[agentID], toolUseID.flatMap { heard[$0] }].compactMap { $0 }.max()
+        guard let last else { return false }
+        return last >= lastLine
+    }
+
+    func launched(agentID: String, toolUseID: String?) -> Bool {
+        launched.contains(agentID) || toolUseID.map(launched.contains) == true
+    }
+}
+
 enum TranscriptParser {
     private static let summaryScanLimit = 512 * 1024
     static let toolOutputLimit = 10_000
@@ -1311,15 +1404,15 @@ enum TranscriptParser {
         text.split(separator: "\n").first.map(String.init) ?? text
     }
 
-    /// When each call and each background task was last answered in these lines — see
-    /// ``TranscriptIndex/answers(transcriptPath:)``. A line is parsed only when a byte scan finds
-    /// a result or a task notification in it; everything else is skipped unread. The ids inside a
-    /// notification are pulled from its own tags, which the CLI writes the same way in the prompt
-    /// it hands the model and in the queue record it keeps while a turn is busy.
-    static func answers(in data: Data) -> [String: Date] {
+    /// What these lines say about calls and background tasks — see ``TranscriptAnswers``. A line
+    /// is parsed only when a byte scan finds a result or a task notification in it; everything
+    /// else is skipped unread. The ids inside a notification are pulled from its own tags, which
+    /// the CLI writes the same way in the prompt it hands the model and in the queue record it
+    /// keeps while a turn is busy.
+    static func answers(in data: Data) -> TranscriptAnswers {
         let result = Data("\"tool_use_id\":\"".utf8)
         let notification = Data("<task-id>".utf8)
-        var heard: [String: Date] = [:]
+        var answers = TranscriptAnswers()
         var start = data.startIndex
         while start < data.endIndex {
             guard let end = data[start...].firstIndex(of: 0x0A) else { break }
@@ -1335,20 +1428,27 @@ enum TranscriptParser {
             if answersTask {
                 ids += tagValues("task-id", in: line) + tagValues("tool-use-id", in: line)
             }
-            if answersCall, !isBackgroundLaunch(object) {
-                ids += toolUseIDs(in: line)
+            if answersCall {
+                if let agentID = backgroundLaunch(object) {
+                    answers.launched.formUnion(toolUseIDs(in: line))
+                    if !agentID.isEmpty { answers.launched.insert(agentID) }
+                } else {
+                    ids += toolUseIDs(in: line)
+                }
             }
-            for id in ids { heard[id] = max(heard[id] ?? stamp, stamp) }
+            for id in ids { answers.heard[id] = max(answers.heard[id] ?? stamp, stamp) }
         }
-        return heard
+        return answers
     }
 
     /// A background agent's launch is answered at once with an `async_launched` result, which
-    /// says it started rather than that it finished.
-    private static func isBackgroundLaunch(_ line: [String: Any]) -> Bool {
-        guard let result = line["toolUseResult"] as? [String: Any] else { return false }
-        return result["isAsync"] as? Bool == true
-            || result["status"] as? String == "async_launched"
+    /// says it started rather than that it finished. The agent's own id, empty when the result
+    /// does not name it; nil when the line is not a background launch.
+    private static func backgroundLaunch(_ line: [String: Any]) -> String? {
+        guard let result = line["toolUseResult"] as? [String: Any],
+            result["isAsync"] as? Bool == true || result["status"] as? String == "async_launched"
+        else { return nil }
+        return result["agentId"] as? String ?? ""
     }
 
     /// The id after each opening tag, up to the first byte an id cannot hold — which is the

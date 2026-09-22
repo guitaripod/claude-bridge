@@ -194,6 +194,74 @@ enum ProcessProbe {
         }
     #endif
 
+    /// The sessions a live Claude Code process is serving, read off the machine: a CLI that has
+    /// launched background work keeps a handle on that session's `<tmp>/claude-<uid>/<project>/
+    /// <session>/tasks` directory for the rest of its life, so the session ids behind those
+    /// handles are exactly the conversations whose background agents and runs can still be alive.
+    ///
+    /// The handle is the CLI's own implementation, not a promise, so the answer is only given when
+    /// the machine demonstrably speaks it: empty when no CLI is running at all, the set when at
+    /// least one CLI is seen holding a tasks directory, and nil — cannot say — when the process
+    /// table cannot be read, a CLI's handles cannot be, or CLIs are running and none holds one.
+    static func sessionsServedByLiveCLIs() -> Set<String>? {
+        #if canImport(Darwin)
+            return nil
+        #else
+            guard let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc") else {
+                return nil
+            }
+            var served = Set<String>()
+            var sawCLI = false
+            for entry in entries {
+                guard let pid = Int32(entry), isClaudeCLI(pid) else { continue }
+                sawCLI = true
+                guard
+                    let fds = try? FileManager.default.contentsOfDirectory(
+                        atPath: "/proc/\(pid)/fd")
+                else { return nil }
+                for fd in fds {
+                    guard
+                        let target = try? FileManager.default.destinationOfSymbolicLink(
+                            atPath: "/proc/\(pid)/fd/\(fd)"),
+                        let session = taskSession(in: target)
+                    else { continue }
+                    served.insert(session)
+                }
+            }
+            guard sawCLI else { return [] }
+            return served.isEmpty ? nil : served
+        #endif
+    }
+
+    /// The session a path under a CLI's task directory belongs to: the component before `tasks`,
+    /// under a `claude-<uid>` root.
+    static func taskSession(in path: String) -> String? {
+        let parts = path.split(separator: "/")
+        guard let tasks = parts.lastIndex(of: "tasks"), tasks >= 2,
+            parts[..<tasks].contains(where: { $0.hasPrefix("claude-") })
+        else { return nil }
+        return String(parts[tasks - 1])
+    }
+
+    /// A Claude Code process, however it was installed: the native binary names itself `claude`,
+    /// a package install runs under node with the package on its command line. The bridge itself
+    /// is `claude-bridge` and never matches.
+    private static func isClaudeCLI(_ pid: Int32) -> Bool {
+        if let comm = try? String(contentsOfFile: "/proc/\(pid)/comm", encoding: .utf8),
+            comm.trimmingCharacters(in: .whitespacesAndNewlines) == "claude"
+        {
+            return true
+        }
+        guard let data = FileManager.default.contents(atPath: "/proc/\(pid)/cmdline"),
+            !data.isEmpty
+        else { return false }
+        let arguments = data.split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
+        if let first = arguments.first, (first as NSString).lastPathComponent == "claude" {
+            return true
+        }
+        return arguments.prefix(3).contains { $0.contains("@anthropic-ai/claude-code") }
+    }
+
     static func commandLine(_ pid: Int32) -> String? {
         #if canImport(Darwin)
             let process = Process()

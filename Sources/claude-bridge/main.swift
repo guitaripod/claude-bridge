@@ -125,7 +125,9 @@ let tailnetGate: TailnetGate? =
 if !password.isEmpty || tailnetGate != nil {
     router.middlewares.add(AccessMiddleware(password: password, gate: tailnetGate))
 }
-let index = TranscriptIndex(root: URL(fileURLWithPath: projectsDir), defaults: machineDefaults)
+let index = TranscriptIndex(
+    root: URL(fileURLWithPath: projectsDir), defaults: machineDefaults,
+    owners: { ProcessProbe.sessionsServedByLiveCLIs() })
 let watcher = TranscriptWatcher(index: index, store: store)
 let hub = Hub()
 await store.attach(index: index)

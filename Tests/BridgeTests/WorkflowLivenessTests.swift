@@ -151,4 +151,21 @@ import Testing
         #expect(agents.filter { $0.active == true }.count == 3)
         #expect(agents.filter { $0.completed == true }.count == 1)
     }
+
+    /// A run lives inside the CLI that launched it. Once no CLI serves the session, its unbalanced
+    /// ledger is the record of a harness that died, and the row settles now rather than after
+    /// the half-hour bound.
+    @Test func aRunWhoseCLIIsGoneLetsTheRowSettle() async throws {
+        let world = try makeWorld(started: 8, results: 3, agentAge: 300, marker: false)
+        defer { try? FileManager.default.removeItem(at: world.root) }
+        let index = TranscriptIndex(
+            root: world.root,
+            defaults: MachineDefaults(
+                modelOverride: nil, effortOverride: nil, home: world.root.path),
+            owners: { [] })
+
+        #expect(!(await index.activeIDs(within: 180).contains(world.sessionID)))
+        #expect(!(await index.hasWorkingAgents(world.sessionID)))
+        #expect(await index.subagents(for: world.sessionID).filter { $0.active == true }.isEmpty)
+    }
 }

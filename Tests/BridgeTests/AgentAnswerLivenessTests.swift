@@ -50,7 +50,9 @@ import Testing
 
     /// A parent that launched one background agent and closed its turn, with the agent's sidecar
     /// last written `agentWrote` ago and whatever else the parent heard afterwards.
-    private func makeWorld(agentWrote: TimeInterval, heard: [String]) throws -> World {
+    private func makeWorld(
+        agentWrote: TimeInterval, heard: [String], nestedUnder parent: String? = nil
+    ) throws -> World {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("agent-answers-\(UUID().uuidString)")
         let project = root.appendingPathComponent("-tmp-project")
@@ -88,7 +90,7 @@ import Testing
                     "content": [["type": "text", "text": "started"]],
                 ],
             ]),
-        ] + heard
+        ] + (parent == nil ? heard : [])
         try (lines.joined(separator: "\n") + "\n").write(
             to: project.appendingPathComponent("\(sessionID).jsonl"), atomically: true,
             encoding: .utf8)
@@ -102,6 +104,11 @@ import Testing
             "message": ["role": "assistant", "content": [["type": "text", "text": "working"]]],
         ]).write(to: agentFile, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.modificationDate: wrote], ofItemAtPath: agentFile.path)
+        if let parent {
+            let spawner = sidecars.appendingPathComponent("agent-\(parent).jsonl")
+            try (heard.joined(separator: "\n") + "\n").write(
+                to: spawner, atomically: true, encoding: .utf8)
+        }
         try line(["agentType": "general-purpose", "description": "Sleep", "toolUseId": toolID])
             .write(
                 to: sidecars.appendingPathComponent("agent-\(agentID).meta.json"),
@@ -109,11 +116,14 @@ import Testing
         return World(root: root, sessionID: sessionID, agentFile: agentFile)
     }
 
-    private func index(_ world: World) -> TranscriptIndex {
+    private func index(
+        _ world: World, owners: @escaping @Sendable () -> Set<String>? = { nil }
+    ) -> TranscriptIndex {
         TranscriptIndex(
             root: world.root,
             defaults: MachineDefaults(
-                modelOverride: nil, effortOverride: nil, home: world.root.path))
+                modelOverride: nil, effortOverride: nil, home: world.root.path),
+            owners: owners)
     }
 
     @Test func anAgentThatReportedBackLetsTheRowSettleAtOnce() async throws {
@@ -184,9 +194,87 @@ import Testing
             in: Data((launch + "\n" + finished + "\n" + notification(at: at.addingTimeInterval(2))
                 + "\n" + "{\"type\":\"user\",\"tool_use_id\":\"toolu_torn\"").utf8))
 
-        #expect(heard["toolu_bg"] == nil)
-        #expect(heard["toolu_fg"] == at.addingTimeInterval(1))
-        #expect(heard[agentID] == at.addingTimeInterval(2))
-        #expect(heard["toolu_torn"] == nil)
+        #expect(heard.heard["toolu_bg"] == nil)
+        #expect(heard.launched.contains("toolu_bg"))
+        #expect(heard.heard["toolu_fg"] == at.addingTimeInterval(1))
+        #expect(!heard.launched.contains("toolu_fg"))
+        #expect(heard.heard[agentID] == at.addingTimeInterval(2))
+        #expect(heard.heard["toolu_torn"] == nil)
+    }
+
+    /// An agent an agent spawned reports to the agent that spawned it, never to the parent.
+    @Test func aNestedAgentIsAnsweredInItsSpawnersSidecar() async throws {
+        let world = try makeWorld(
+            agentWrote: 20, heard: [notification(at: Date().addingTimeInterval(-19))],
+            nestedUnder: "spawner")
+        defer { try? FileManager.default.removeItem(at: world.root) }
+        let index = index(world)
+
+        let agents = await index.subagents(for: world.sessionID)
+        #expect(agents.first { $0.id == agentID }?.completed == true)
+        #expect(agents.first { $0.id == agentID }?.active == false)
+    }
+
+    /// The answer and the line it answers are ordered by the CLI's own stamps, with no slack: a
+    /// line one second past the report is work the report did not cover.
+    @Test func aLineOneSecondPastTheReportIsStillOut() async throws {
+        let world = try makeWorld(
+            agentWrote: 20, heard: [notification(at: Date().addingTimeInterval(-21))])
+        defer { try? FileManager.default.removeItem(at: world.root) }
+
+        #expect(await index(world).activeIDs(within: 180).contains(world.sessionID))
+    }
+
+    /// A background agent lives inside the CLI that launched it; once no CLI serves the session
+    /// it is gone, however recently it wrote.
+    @Test func aBackgroundAgentWhoseCLIIsGoneIsNotOut() async throws {
+        let world = try makeWorld(agentWrote: 20, heard: [])
+        defer { try? FileManager.default.removeItem(at: world.root) }
+
+        let served = world.sessionID
+        #expect(!(await index(world, owners: { [] }).activeIDs(within: 180).contains(served)))
+        #expect(!(await index(world, owners: { ["someone-else"] }).hasWorkingAgents(served)))
+        #expect(await index(world, owners: { [served] }).activeIDs(within: 180).contains(served))
+        #expect(await index(world, owners: { nil }).activeIDs(within: 180).contains(served))
+    }
+
+    @Test func aTaskHandleNamesItsSession() {
+        #expect(
+            ProcessProbe.taskSession(
+                in: "/tmp/claude-1000/-home-marcus-Dev-app/0e7cd02f-aa7d/tasks") == "0e7cd02f-aa7d")
+        #expect(
+            ProcessProbe.taskSession(
+                in: "/tmp/claude-1000/-home-marcus-Dev-app/0e7cd02f-aa7d/tasks/b1.output")
+                == "0e7cd02f-aa7d")
+        #expect(ProcessProbe.taskSession(in: "/home/marcus/project/tasks") == nil)
+    }
+
+    /// The machine's word is read off the process table: a `claude` holding a session's tasks
+    /// directory is serving that session.
+    @Test func aLiveCLIHoldingATasksDirectoryServesItsSession() throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("claude-probe-\(UUID().uuidString)")
+        let session = UUID().uuidString
+        let tasks = root.appendingPathComponent("-tmp-project/\(session)/tasks")
+        try FileManager.default.createDirectory(at: tasks, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cli = root.appendingPathComponent("claude")
+        try "#!/bin/bash\nexec 7<\"$1\"\nwhile sleep 1; do :; done\n".write(
+            to: cli, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
+        let process = Process()
+        process.executableURL = cli
+        process.arguments = [tasks.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        defer { kill(process.processIdentifier, SIGKILL) }
+        var served: Set<String>?
+        for _ in 0..<50 {
+            served = ProcessProbe.sessionsServedByLiveCLIs()
+            if served?.contains(session) == true { break }
+            usleep(50_000)
+        }
+        #expect(served?.contains(session) == true)
     }
 }
