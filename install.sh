@@ -236,6 +236,7 @@ Type=simple
 ExecStart=$RUNNER
 Restart=always
 RestartSec=3
+TimeoutStopSec=15
 
 [Install]
 WantedBy=default.target

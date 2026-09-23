@@ -84,6 +84,13 @@ enforceFailClosedStartup(
 /// prevent saying.
 _ = BridgeVersion.running
 
+/// Stamped now, for the same reason. A static is set the first time something reads it, and the
+/// first thing to read this one used to be the first update check — two minutes after launch, or
+/// whenever a client asked. A build landing within a minute after that looked no newer than the
+/// process, so the bridge refused the restart it owed, saying it already ran the build in its
+/// checkout.
+_ = UpdateService.processStarted
+
 try? FileManager.default.createDirectory(
     at: URL(fileURLWithPath: workdir), withIntermediateDirectories: true)
 
