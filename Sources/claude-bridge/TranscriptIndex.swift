@@ -683,12 +683,17 @@ actor TranscriptIndex {
         }
     }
 
+    /// When each conversation last moved: its newest timestamped line, the date a discovered chat
+    /// already wears, and never the file's. The CLI files its bookkeeping — `last-prompt`,
+    /// `cost-state`, `mode` and the like, none of it timestamped — whenever a process leaves a
+    /// session, so a process reaped half an hour after the last word moved its chat half an hour up
+    /// the list, and a restart of this service moved every chat it had a process for to the top.
     func transcriptDates() -> [String: Date] {
         scan()
         var dates: [String: Date] = [:]
         for slot in cache.values {
             guard let entry = slot.entry else { continue }
-            dates[entry.id] = slot.mtime
+            dates[entry.id] = entry.updatedAt
         }
         return dates
     }
@@ -1186,24 +1191,35 @@ enum TranscriptParser {
             createdAt: createdAt ?? updatedAt, updatedAt: updatedAt, path: file.path)
     }
 
-    /// Timestamp of the last conversation line in a transcript. An interactive
-    /// CLI left open keeps touching the file (trailing `last-prompt` metadata,
-    /// no timestamp), so file mtime alone reads attached-but-idle sessions as
-    /// active forever.
+    /// Timestamp of the last conversation line in a transcript: a prompt, an answer, or a note the
+    /// CLI or a hook filed inside a turn. Never the file's date and never the CLI's bookkeeping. An
+    /// interactive CLI left open keeps touching the file (trailing `last-prompt` metadata, no
+    /// timestamp), so file mtime alone reads attached-but-idle sessions as active forever; and a
+    /// process leaving a session files a queue dequeue or an artifact link that is timestamped, so
+    /// a reaped process moved its chat up the list. Widens once when the tail is one enormous tool
+    /// result with nothing but that bookkeeping after it.
     static func lastContentDate(atPath path: String) -> Date? {
         guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
         defer { try? handle.close() }
         let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
-        let window = min(size, 64 * 1024)
-        try? handle.seek(toOffset: UInt64(size - window))
-        guard let data = try? handle.read(upToCount: window) else { return nil }
-        var found: Date?
-        forEachJSONLineReversed(in: data) { line in
-            found = (line["timestamp"] as? String).flatMap(parseTimestamp)
-            return found == nil
+        for window in [64 * 1024, 4 * 1024 * 1024] {
+            let span = min(size, window)
+            try? handle.seek(toOffset: UInt64(size - span))
+            guard let data = try? handle.read(upToCount: span) else { break }
+            var found: Date?
+            forEachJSONLineReversed(in: data) { line in
+                guard let type = line["type"] as? String, conversationLineTypes.contains(type)
+                else { return true }
+                found = (line["timestamp"] as? String).flatMap(parseTimestamp)
+                return found == nil
+            }
+            if let found { return found }
+            if span == size { break }
         }
-        return found
+        return nil
     }
+
+    private static let conversationLineTypes: Set<String> = ["user", "assistant", "system", "attachment"]
 
     /// The model and effort of the transcript's last real answer. Read from the tail because a
     /// conversation can change either mid-way — `/model`, `/effort`, or a client sending its own

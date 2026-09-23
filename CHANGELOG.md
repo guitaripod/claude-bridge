@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.10.1 — 2026-09-23
+
+- A chat is dated by the last thing said in it: it no longer moves up the list half an hour after it went quiet, and a restart no longer moves every chat it had open to the top.
+
 ## 1.10.0 — 2026-09-23
 
 - Updates are followed step by step — download, build, waiting for idle, restart — and every update reports how it ended and which version it landed on.
