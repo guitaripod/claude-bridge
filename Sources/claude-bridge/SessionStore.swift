@@ -341,8 +341,16 @@ actor SessionStore {
         session.customTitle = true
         sessions[id] = session
         persistNow()
+        let pusher = self.pusher
+        Task { await pusher.retitle(sessionID: id, title: title) }
         return true
     }
+
+    /// Every conversation with a turn this bridge is holding a slot for, running or queued.
+    func sessionsInFlight() -> Set<String> { inFlight }
+
+    /// Every conversation the journal says had a turn open when this process last stopped.
+    func journaledSessions() -> Set<String> { Set(journal.turns.keys) }
 
     func delete(_ id: String) {
         sessions[id] = nil
@@ -613,7 +621,8 @@ actor SessionStore {
         broadcaster(for: id).send(event)
         mirrorLiveTurn(id, event)
         let pusher = self.pusher
-        Task { await pusher.noteEvent(event, sessionID: id) }
+        let now = Date()
+        Task { await pusher.noteEvent(event, sessionID: id, now: now) }
     }
 
     /// Every line the conversation's process writes, folded into whatever turn is open. A line
@@ -1165,6 +1174,9 @@ actor SessionStore {
             journal.write(to: journalURL)
         }
         guard openTurns[id] != nil else { return (false, discarded) }
+        let pusher = self.pusher
+        let now = Date()
+        Task { await pusher.noteStopped(sessionID: id, now: now) }
         guard let process = processes[id] else {
             guard let pid = turnProcessIDs[id] else { return (false, discarded) }
             kill(pid, SIGTERM)
@@ -1313,8 +1325,11 @@ actor SessionStore {
         let title = session.title
         let claudeID = session.claudeSessionID ?? id
         let index = self.index
+        let ending = Self.ending(of: outcome.messages)
+        let now = Date()
         Task {
-            await pusher.endTurn(sessionID: id, toolCount: toolCount, failed: false)
+            await pusher.endTurn(
+                sessionID: id, toolCount: toolCount, ending: ending, title: title, now: now)
             let goal = await index?.goal(for: claudeID)
             await devicePusher.pushTurnEnd(
                 sessionID: id, title: title, toolCount: toolCount, failed: false,
@@ -1520,6 +1535,17 @@ actor SessionStore {
         liveTurns[id] = nil
         clearJournal(id)
         settleResumedInterruption(id)
+        if let session = sessions[id] {
+            let answer = Array(session.messages.reversed().prefix { $0.role != .user }.reversed())
+            let ending = Self.ending(of: answer)
+            let title = session.title
+            let pusher = self.pusher
+            let now = Date()
+            Task {
+                await pusher.endTurn(
+                    sessionID: id, toolCount: nil, ending: ending, title: title, now: now)
+            }
+        }
         let owed = record.queued.map(QueuedPrompt.init)
         guard let first = owed.first else {
             inFlight.remove(id)
@@ -1601,8 +1627,10 @@ actor SessionStore {
         let title = session.title
         let tools = interruption.progress.toolCount
         let duration = interruption.detectedAt.timeIntervalSince(interruption.startedAt)
+        let now = Date()
         Task {
-            await pusher.endTurn(sessionID: id, toolCount: tools, failed: true)
+            await pusher.endTurn(
+                sessionID: id, toolCount: tools, ending: .interrupted, title: title, now: now)
             await devicePusher.pushTurnEnd(
                 sessionID: id, title: title, toolCount: tools, failed: true,
                 duration: duration, goal: nil)
@@ -1693,6 +1721,25 @@ actor SessionStore {
         session.autoTitled = true
         sessions[id] = session
         persist()
+        let pusher = self.pusher
+        Task { await pusher.retitle(sessionID: id, title: title) }
+    }
+
+    /// How a turn's own messages say it ended: on a question it is still waiting to have answered
+    /// — the newest `AskUserQuestion` call has no result, which is exactly how the app reads a
+    /// question out of a transcript — with nothing at all, or simply finished.
+    static func ending(of messages: [Message]) -> TurnEnding {
+        let answers = messages.filter { $0.role == .assistant }
+        for message in answers.reversed() {
+            for part in message.parts.reversed() {
+                guard case .tool(let call) = part,
+                    call.name.caseInsensitiveCompare("AskUserQuestion") == .orderedSame
+                else { continue }
+                if call.status == .running { return .question }
+                return .finished
+            }
+        }
+        return !answers.isEmpty && answers.allSatisfy(isBlank) ? .answerless : .finished
     }
 
     private static func plainText(_ message: Message) -> String {

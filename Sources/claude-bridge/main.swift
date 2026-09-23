@@ -137,10 +137,12 @@ await store.installHubTap { id, event in
 let observer = ObserverLoop(index: index, store: store, hub: hub)
 Task { await observer.run() }
 Task { await hub.runHeartbeats() }
-await store.pusher.endOrphans()
 // Before anything is served: decide what became of every turn that was open when this process last
 // stopped. A client that connects first would otherwise be told a cut-off conversation is idle.
+let journaled = await store.journaledSessions()
 await store.recoverJournaledTurns()
+await store.pusher.restore(journaled: journaled)
+Task { await store.pusher.runClock(inFlight: { await store.sessionsInFlight() }) }
 let updater = UpdateService(stateDirectory: storeURL.deletingLastPathComponent())
 let auth = AuthService(claudePath: claudePath, workdir: workdir)
 // What a restart would destroy, and what has to reach disk before one. Composed here because no

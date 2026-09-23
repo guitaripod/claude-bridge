@@ -591,7 +591,8 @@ func registerRoutes(
         guard let body = try? await decodeBody(LiveActivityRegistration.self, request) else {
             return jsonResponse(["error": "bad request"], status: .badRequest)
         }
-        await store.pusher.register(body, sessionID: id)
+        await store.pusher.register(
+            body, sessionID: id, turnOpen: await store.hasQueuedOrRunningTurn(id))
         return jsonResponse(["ok": true])
     }
 
