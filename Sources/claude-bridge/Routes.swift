@@ -282,8 +282,9 @@ func registerRoutes(
     /// What version this bridge runs, whether a newer one exists, and what happened to the last
     /// update — so a client can offer the update rather than leaving a phone user to ssh in.
     router.get("update") { request, _ in
-        let refreshing = request.uri.queryParameters.get("check") != "false"
-        return jsonResponse(await updater.status(refreshing: refreshing))
+        let check = request.uri.queryParameters.get("check")
+        return jsonResponse(
+            await updater.status(refreshing: check != "false", fetchingNow: check == "now"))
     }
 
     /// Runs the update. Answers immediately with the status to poll: the work outlives this
