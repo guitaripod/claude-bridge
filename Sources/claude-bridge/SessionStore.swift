@@ -2082,4 +2082,13 @@ enum JSONCoding {
         encoder.dateEncodingStrategy = .iso8601
         return encoder
     }()
+    /// The same encoding with its keys in one order. A validated answer is tagged by the digest of
+    /// its bytes, and Foundation is free to write an object's keys in a different order each time,
+    /// which would give one unchanged transcript a new tag on every read.
+    static let stableEncoder: JSONEncoder = {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        return encoder
+    }()
 }

@@ -29,6 +29,25 @@ private func jsonResponse<T: Encodable>(_ value: T, status: HTTPResponse.Status 
     return Response(status: status, headers: headers, body: .init(byteBuffer: buffer))
 }
 
+/// An answer the client may already hold (see ``Validation``): tagged, and a 304 with no body when
+/// the request carries that tag.
+private func validatedJSONResponse<T: Encodable>(_ value: T, request: Request) -> Response {
+    guard let data = try? JSONCoding.stableEncoder.encode(value) else { return jsonResponse(value) }
+    var headers = HTTPFields()
+    headers[.cacheControl] = "no-cache"
+    switch Validation.reply(body: data, ifNoneMatch: request.headers[.ifNoneMatch]) {
+    case .unchanged(let tag):
+        headers[.eTag] = tag
+        return Response(status: .notModified, headers: headers)
+    case .full(let body, let tag):
+        headers[.eTag] = tag
+        headers[.contentType] = "application/json"
+        var buffer = ByteBuffer()
+        buffer.writeBytes(body)
+        return Response(status: .ok, headers: headers, body: .init(byteBuffer: buffer))
+    }
+}
+
 /// A prompt the bridge accepted, and whether it is running now or waiting behind a turn already
 /// in flight — a client that sent it while another client's turn was running needs to be able to
 /// say so rather than showing it as sent-and-ignored.
@@ -420,7 +439,7 @@ func registerRoutes(
         return jsonResponse(["error": "not found"], status: .notFound)
     }
 
-    router.get("sessions/:id") { _, context in
+    router.get("sessions/:id") { request, context in
         let id = context.parameters.get("id") ?? ""
         if var session = await store.get(id) {
             let live = await liveness(of: session)
@@ -456,7 +475,7 @@ func registerRoutes(
                 }
                 session.goal = await index.goal(for: claudeID)
             }
-            return jsonResponse(session)
+            return validatedJSONResponse(session, request: request)
         }
         if var discovered = await index.session(id) {
             discovered.goal = await index.goal(for: id)
@@ -468,7 +487,7 @@ func registerRoutes(
                 discovered.active = open
                 discovered.turnOpen = open
             }
-            return jsonResponse(discovered)
+            return validatedJSONResponse(discovered, request: request)
         }
         return jsonResponse(["error": "not found"], status: .notFound)
     }
