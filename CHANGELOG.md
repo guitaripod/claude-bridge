@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.11.2 — 2026-09-24
+
+- On a Mac, the bridge stops asking for its privacy permissions again after every update: each build is now signed with a certificate from the Mac's keychain, so a permission given once carries over to later builds. The first update after this one asks one last time. A Mac with no signing certificate keeps asking, and the update log says so.
+
 ## 1.11.1 — 2026-09-24
 
 - Pressing Restart on a bridge with a newer build waiting no longer gets refused with "already running the build in its checkout" when that build landed soon after the bridge started.

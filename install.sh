@@ -145,7 +145,34 @@ build() {
     ( cd "$SRC" && swift package clean ) >>"$LOG" 2>&1 || true
     ( cd "$SRC" && swift build -c release ) >>"$LOG" 2>&1 || fail "$(build_reason)"
   fi
+  sign_build
   stamp_build
+}
+
+# A macOS privacy grant (Full Disk Access, Documents, data from other apps) is kept against the
+# binary's signature, and the linker's ad-hoc one is a hash of this exact build: every update is a
+# stranger to the grants the last one was given, and the Mac asks again for all of them. Signed
+# with a certificate from the keychain the grant follows the name and the signer instead, so it is
+# given once. The identity is chosen once and remembered, because a second certificate would be a
+# stranger too; a machine with none keeps the ad-hoc signature and says what that costs.
+sign_build() {
+  [ "$(uname -s)" = "Darwin" ] || return 0
+  local binary identity remembered="$STATE_DIR/sign-identity"
+  binary="$( cd "$SRC" && swift build -c release --show-bin-path )/claude-bridge"
+  identity="${BRIDGE_SIGN_IDENTITY:-$(cat "$remembered" 2>/dev/null || true)}"
+  if [ -z "$identity" ]; then
+    identity="$(security find-identity -v -p codesigning 2>/dev/null |
+      awk '/"(Developer ID Application|Apple Development):/ {print $2; exit}')"
+  fi
+  if [ -z "$identity" ]; then
+    say "no signing certificate here; macOS will ask for its privacy permissions again after each update"
+    return 0
+  fi
+  if codesign --force --timestamp=none --identifier "$LABEL" --sign "$identity" "$binary" >>"$LOG" 2>&1; then
+    printf '%s\n' "$identity" >"$remembered"
+  else
+    say "could not sign the build with $identity; macOS will ask for its privacy permissions again"
+  fi
 }
 
 # What the binary that was just produced was built from.
