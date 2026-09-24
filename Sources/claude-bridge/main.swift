@@ -152,6 +152,7 @@ await store.pusher.restore(journaled: journaled)
 Task { await store.pusher.runClock(inFlight: { await store.sessionsInFlight() }) }
 let updater = UpdateService(stateDirectory: storeURL.deletingLastPathComponent())
 let auth = AuthService(claudePath: claudePath, workdir: workdir)
+let permissions = MachinePermissionService(home: home)
 // What a restart would destroy, and what has to reach disk before one. Composed here because no
 // single part of the bridge knows all of it, and answered as one value so the ticker that decides
 // to restart and the barrier that performs it can never disagree.
@@ -168,7 +169,7 @@ await updater.resume()
 await updater.startAutomation()
 registerRoutes(
     router, store: store, index: index, watcher: watcher, updater: updater, auth: auth,
-    hub: hub, observer: observer, defaults: machineDefaults, hasAuth: !password.isEmpty || tailnetGate != nil,
+    permissions: permissions, hub: hub, observer: observer, defaults: machineDefaults, hasAuth: !password.isEmpty || tailnetGate != nil,
     projectsDir: projectsDir)
 startExternalIdleSweep(index: index, store: store)
 

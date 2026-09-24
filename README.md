@@ -130,6 +130,8 @@ identity when the gate is on — see Security.
 | POST | `/auth/login` | — | starts `claude auth login` on a pseudo-terminal and answers with the URL it printed |
 | POST | `/auth/code` | `{code}` | types the code the browser produced; answers with the status once the machine is signed in (`400` with `error` if it wasn't accepted) |
 | POST | `/auth/cancel` | — | drops a sign-in that was left waiting |
+| GET | `/permissions` | — | the operating-system grants the bridge's agents run under (`platform`, `host`, `executable`, `grants: [{id, state}]`, `requestedAt`); on a Mac, Full Disk Access judged by whether a child can open the privacy database, which never raises a prompt; `grants` is empty on Linux |
+| POST | `/permissions/request` | `{id}` | opens System Settings at that grant's list on the Mac and shows the bridge's binary in Finder beside it; answers with the status (`400` for an unknown id or on Linux) |
 | GET | `/update` | `?check=false` to skip the remote fetch | `UpdateStatus` — checkout version, the running binary's own stamp, `restartRequired`/`canRestart`, newer commits and their subjects, whether this install can update itself, the `obstacle` in the way named file by file, what the machine is `busy` with, its `automation` policy, the `toolchain` that would build it, an explicit `remote` block, and the phase of the last update |
 | POST | `/update` | — | `202 UpdateStatus` once the update is running (`409` when it cannot, with `reason`); poll `GET /update` for `phase`: `running` → `building` → `waiting` → `restarting` → `succeeded`/`failed` |
 | POST | `/update/restart` | — | `202 UpdateStatus` — loads a build already on disk, behind the quiet barrier; `409` without a supervisor or with nothing to load |

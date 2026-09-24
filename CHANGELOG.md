@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.12.0 — 2026-09-24
+
+- On a Mac, Tailscode can tell whether the bridge has Full Disk Access and walk you through giving it: one press opens System Settings at the right list on the Mac with the bridge shown in Finder beside it, and the app notices the moment the switch is on. Without it, macOS stops an agent at a permission dialog on a screen nobody is watching.
+
 ## 1.11.3 — 2026-09-24
 
 - On a Mac, 1.11.2's signed build was removed by macOS as malware ("Malware Blocked and Moved to Trash") and refused at every launch after. Builds are signed ad hoc again, under a requirement that names the bridge rather than the exact build, so privacy permissions still carry over between updates without a certificate.

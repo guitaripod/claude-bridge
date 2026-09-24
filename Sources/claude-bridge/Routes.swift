@@ -170,7 +170,8 @@ struct AutoUpdateRequest: Decodable {
 
 func registerRoutes(
     _ router: Router<BridgeRequestContext>, store: SessionStore, index: TranscriptIndex,
-    watcher: TranscriptWatcher, updater: UpdateService, auth: AuthService, hub: Hub,
+    watcher: TranscriptWatcher, updater: UpdateService, auth: AuthService,
+    permissions: MachinePermissionService, hub: Hub,
     observer: ObserverLoop, defaults: MachineDefaults, hasAuth: Bool, projectsDir: String
 ) {
     @Sendable func adoptIfNeeded(_ id: String) async {
@@ -300,6 +301,26 @@ func registerRoutes(
 
     /// What version this bridge runs, whether a newer one exists, and what happened to the last
     /// update — so a client can offer the update rather than leaving a phone user to ssh in.
+    /// What the operating system lets this bridge touch, read without ever raising a prompt. A
+    /// client shows it where the server is explained and walks a person through the one grant a
+    /// Mac needs before an agent can work in their folders unattended.
+    router.get("permissions") { _, _ in
+        jsonResponse(await permissions.status())
+    }
+
+    /// Opens the grant's pane in System Settings on this machine, with the bridge shown in Finder
+    /// beside it. The switch itself is the person's to flip; nothing can flip it for them.
+    router.post("permissions/request") { request, _ in
+        guard let body = try? await decodeBody(PermissionRequest.self, request) else {
+            return jsonResponse(["error": "id required"], status: .badRequest)
+        }
+        do {
+            return jsonResponse(try await permissions.request(body.id))
+        } catch let error as MachinePermissionError {
+            return jsonResponse(["error": error.message], status: .badRequest)
+        }
+    }
+
     router.get("update") { request, _ in
         let check = request.uri.queryParameters.get("check")
         return jsonResponse(
