@@ -33,6 +33,7 @@ struct PermissionRequest: Decodable {
 actor MachinePermissionService {
     private let home: String
     private var requestedAt: Date?
+    private var lastProbe: [String] = []
 
     init(home: String) {
         self.home = home
@@ -78,13 +79,33 @@ actor MachinePermissionService {
 
     /// Asked of a fresh child rather than of this process: a child is what an agent is, it answers
     /// to the bridge's grant the same way, and it reads a grant switched on since the bridge started
-    /// instead of whatever this long-lived process was told the first time it looked.
+    /// instead of whatever this long-lived process was told the first time it looked. Two places
+    /// only Full Disk Access opens and none ever prompts for: Safari's folder, which every Mac has,
+    /// and the privacy database itself.
     private func hasFullDiskAccess() -> Bool {
-        let database = URL(fileURLWithPath: home)
-            .appendingPathComponent("Library/Application Support/com.apple.TCC/TCC.db")
+        let library = URL(fileURLWithPath: home).appendingPathComponent("Library")
+        let probes: [(String, [String])] = [
+            ("/bin/ls", [library.appendingPathComponent("Safari").path]),
+            ("/usr/bin/head", ["-c", "1", library.appendingPathComponent("Application Support/com.apple.TCC/TCC.db").path]),
+        ]
+        var answers: [String] = []
+        var granted = false
+        for (tool, arguments) in probes {
+            let opened = Self.succeeds(tool, arguments)
+            answers.append("\(arguments.last ?? tool)=\(opened)")
+            granted = granted || opened
+        }
+        if lastProbe != answers {
+            lastProbe = answers
+            print("[permissions] full disk access probe: \(answers.joined(separator: ", "))")
+        }
+        return granted
+    }
+
+    private static func succeeds(_ tool: String, _ arguments: [String]) -> Bool {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/head")
-        process.arguments = ["-c", "1", database.path]
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         guard (try? process.run()) != nil else { return false }
