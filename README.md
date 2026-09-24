@@ -4,8 +4,9 @@ Expose a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) subscript
 structured HTTP sessions that any client can drive.
 
 claude-bridge is a small Swift [Hummingbird](https://github.com/hummingbird-project/hummingbird)
-server that runs the `claude` CLI headlessly — one
-`claude -p --output-format stream-json --include-partial-messages` process per turn — and turns
+server that runs the `claude` CLI headlessly — one long-lived
+`claude -p --input-format stream-json --output-format stream-json` process per conversation, kept
+between turns so work a turn leaves running in the background outlives it — and turns
 its stream-JSON output into clean REST + SSE: persistent multi-session chat, token-by-token
 streaming, structured tool calls, reasoning blocks, session resume, clear, and fork.
 
@@ -138,11 +139,13 @@ identity when the gate is on — see Security.
 | POST | `/update/auto` | `{enabled}` | `UpdateStatus` — turns unattended updating on or off on this machine |
 | GET | `/sessions` | — | `[SessionSummary]`, newest first, store + discovered transcripts merged |
 | POST | `/sessions` | `{title?, directory?, model?, effort?}` | the created `Session`; `directory` sets the project directory its turns run in |
-| GET | `/sessions/:id` | — | `Session` (404 if unknown), including the turn in flight |
+| GET | `/sessions/:id` | — | `Session` (404 if unknown), including the turn in flight; tagged, so `If-None-Match` gets a `304` |
+| GET | `/sessions/:id/revision` | — | `{updatedAt, active, turnOpen, background*}` — the session's state in one small answer, for a client polling while its stream is quiet |
 | PATCH | `/sessions/:id` | `{title}` | `{"ok": true}` (404 if unknown) |
 | DELETE | `/sessions/:id` | — | `{"ok": true}` |
 | POST | `/sessions/:id/message` | `{text, model?, effort?, attachments?}` | `202 {"ok": true, "queued": false}`; the turn runs async, watch `/events`. A prompt sent while this bridge is already running a turn on the session is accepted and **queued** behind it — `202 {"ok": true, "queued": true, "position": n}` — so two clients on one session cannot start two `claude` processes against one transcript. `409` when the session is being written by a turn started outside this bridge (a terminal), which it cannot serialize against |
 | POST | `/sessions/:id/abort` | — | `{"ok": true, "stopped": bool, "discarded": n}`; stops the turn in flight and discards anything queued behind it. `409` when there is nothing to stop from here |
+| POST | `/sessions/:id/background/stop` | — | `{ended}` — ends the background shells the conversation's process is carrying; `409 {error}` names why it would not |
 | POST | `/sessions/:id/clear` | — | `{"ok": true}`; drops history and the resumable Claude session id. `409` while a turn is running or queued — fork instead |
 | POST | `/sessions/:id/fork` | — | new `Session` (404 if unknown) seeded with the source's history; its first turn runs `--fork-session` so it diverges instead of mutating the parent |
 | GET | `/sessions/:id/events` | — | `text/event-stream` of per-session bridge events (below) |
@@ -211,7 +214,7 @@ on it.
 
 A session runs one turn. A prompt that arrives while a turn is in flight is appended to the
 transcript and broadcast like any other, then queued behind it and started when that turn ends —
-so a phone and a desktop can both drive one session without two `claude -p --resume` processes
+so a phone and a desktop can both drive one session without two `claude` processes
 running against one transcript in one working directory, each blind to the other's edits.
 
 The session goes `idle` only when nothing is left waiting, which is what stops a client's own
@@ -271,6 +274,7 @@ Each event on `/sessions/:id/events` is one `data: <json>\n\n` frame:
 | `status` | `status` | `"running"` when a turn starts, `"idle"` when it ends |
 | `goal` | `goal?` | The session's `/goal` changed; the field is absent once nothing is being pursued |
 | `compaction` | `phase`, `error?` | A compaction started, finished, or failed — the turn is still running throughout. The seam itself arrives as a `system` message upsert with one `compaction` part, carrying the numbers at once and the summary once the transcript has it; what the model says after it is a new assistant message |
+| `background` | `tasks?`, `task?`, `since?`, `stalled?` | The background work the conversation's process carries changed; absent fields once nothing is running. No turn is open either way |
 | `interrupted` | `interruption?` | A turn was cut off by the machine, with what it had already done; the field is absent once it is picked back up or dismissed |
 | `error` | `error` | Turn-level failure (e.g. the `claude` binary could not be launched) |
 
@@ -306,7 +310,7 @@ of state worth setting from a phone and then walking away from. The CLI records 
 transcript as `goal_status` attachments, so the bridge reads goal state from the same incremental
 fold that serves messages and reports it as `Session.goal`, as a `goal` SSE event when it changes,
 and in the turn-end push (`Goal reached: …` rather than `Done in 2m · 6 tools`). A goal survives
-the bridge respawning `claude -p --resume` per message: the CLI restores it from the last
+the bridge respawning the conversation's process with `--resume`: the CLI restores it from the last
 `goal_status` record unless that record is met or failed.
 `GoalStatus`: `{condition, met, failed?, reason?, iterations?, durationMs?, tokens?, updatedAt?}`.
 
@@ -358,6 +362,11 @@ Everything is environment variables. Empty values fall back to the default.
 | `BRIDGE_MODEL` | machine's | Default model for new sessions. Unset, it follows `~/.claude/settings.json` (`model`), falling back to `sonnet` |
 | `BRIDGE_EFFORT` | machine's | Default reasoning effort. Unset, it follows `~/.claude/settings.json` (`effortLevel`), falling back to `medium` |
 | `BRIDGE_AUTO_RESUME` | `0` | Resume interrupted turns automatically, machine-wide |
+| `BRIDGE_PROCESS_TTL` | `1800` | Seconds an idle conversation's process is kept with nothing running |
+| `BRIDGE_PROCESS_POOL` | `4` | Idle processes kept at once; past this the least recently used goes |
+| `BRIDGE_LAUNCH_TIMEOUT` | `300` | Seconds a process that has never written a line gets before its launch is called failed |
+| `BRIDGE_TURN_SILENCE_TTL` | `7200` | Seconds an open turn may go without a line from its process before it is ended |
+| `BRIDGE_STALL_WINDOW` | `600` | Seconds a background shell past its budget must show no CPU and no output before it is ended; `0` leaves it to the person |
 | `BRIDGE_STORE` | `~/.claude-bridge/sessions.json` | Session persistence file |
 | `BRIDGE_PROJECTS` | `~/.claude/projects` | Claude Code CLI transcript root scanned for discoverable sessions |
 | `BRIDGE_SRC` | `~/.claude-bridge/src` | The checkout self-update operates on (set by the installer's generated runner) |
