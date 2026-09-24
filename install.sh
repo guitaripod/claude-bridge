@@ -150,29 +150,22 @@ build() {
 }
 
 # A macOS privacy grant (Full Disk Access, Documents, data from other apps) is kept against the
-# binary's signature, and the linker's ad-hoc one is a hash of this exact build: every update is a
-# stranger to the grants the last one was given, and the Mac asks again for all of them. Signed
-# with a certificate from the keychain the grant follows the name and the signer instead, so it is
-# given once. The identity is chosen once and remembered, because a second certificate would be a
-# stranger too; a machine with none keeps the ad-hoc signature and says what that costs.
+# binary's designated requirement, and the linker's ad-hoc one is a hash of this exact build: every
+# update is a stranger to the grants the last one was given, and the Mac asks again for all of them.
+# The build is re-signed ad hoc under the service's own identifier with a requirement that names
+# only that identifier, so a grant follows the name instead of the bytes. It must stay ad hoc: a
+# certificate gives the binary a team identity XProtect's behaviour rules judge as distributed,
+# unnotarized software, and what the agents under the bridge do (the Claude CLI probes browser
+# profile folders only the browser's own team may touch) got a certificate-signed bridge moved to
+# the Trash as malware, with every later build under that identity refused at launch.
 sign_build() {
   [ "$(uname -s)" = "Darwin" ] || return 0
-  local binary identity remembered="$STATE_DIR/sign-identity"
+  local binary
   binary="$( cd "$SRC" && swift build -c release --show-bin-path )/claude-bridge"
-  identity="${BRIDGE_SIGN_IDENTITY:-$(cat "$remembered" 2>/dev/null || true)}"
-  if [ -z "$identity" ]; then
-    identity="$(security find-identity -v -p codesigning 2>/dev/null |
-      awk '/"(Developer ID Application|Apple Development):/ {print $2; exit}')"
-  fi
-  if [ -z "$identity" ]; then
-    say "no signing certificate here; macOS will ask for its privacy permissions again after each update"
-    return 0
-  fi
-  if codesign --force --timestamp=none --identifier "$LABEL" --sign "$identity" "$binary" >>"$LOG" 2>&1; then
-    printf '%s\n' "$identity" >"$remembered"
-  else
-    say "could not sign the build with $identity; macOS will ask for its privacy permissions again"
-  fi
+  rm -f "$STATE_DIR/sign-identity"
+  codesign --force --sign - --identifier "$LABEL" \
+    --requirements "=designated => identifier \"$LABEL\"" "$binary" >>"$LOG" 2>&1 ||
+    say "could not re-sign the build; macOS will ask for its privacy permissions again"
 }
 
 # What the binary that was just produced was built from.
