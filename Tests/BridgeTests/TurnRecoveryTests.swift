@@ -86,13 +86,13 @@ private struct Wreckage {
 
 private func record(
     session: String, claudeID: String?, pid: Int32? = nil, startedAt: Date = Date(),
-    queued: [QueuedRecord] = []
+    queued: [QueuedRecord] = [], stopped: Bool? = nil, failed: Bool? = nil
 ) -> TurnRecord {
     TurnRecord(
         turnID: "turn-1", sessionID: session, claudeSessionID: claudeID,
         prompt: "Fix the flaky test", displayPrompt: "Fix the flaky test", model: "opus",
         effort: "high", fork: false, directory: "/tmp/work", startedAt: startedAt, pid: pid,
-        queued: queued)
+        queued: queued, stopped: stopped, failed: failed)
 }
 
 @Suite("Turn journal")
@@ -111,6 +111,39 @@ struct TurnJournalTests {
         #expect(reloaded?.pid == 4242)
         #expect(reloaded?.claudeSessionID == "c1")
         #expect(reloaded?.queued.first?.displayPrompt == "and then deploy")
+        #expect(reloaded?.stopped == nil)
+        #expect(reloaded?.failed == nil)
+    }
+
+    @Test("A stop pressed or a failure reported before the crash survives the process that saw it")
+    func roundTripsStoppedAndFailed() throws {
+        let wreck = try Wreckage()
+        defer { wreck.cleanup() }
+        wreck.seedJournal(record(session: "s1", claudeID: "c1", stopped: true))
+        #expect(wreck.journal().turns["s1"]?.stopped == true)
+        #expect(wreck.journal().turns["s1"]?.failed == nil)
+
+        wreck.seedJournal(record(session: "s2", claudeID: "c2", failed: true))
+        #expect(wreck.journal().turns["s2"]?.failed == true)
+        #expect(wreck.journal().turns["s2"]?.stopped == nil)
+    }
+
+    @Test("A journal a bridge with no notion of stopped/failed wrote still decodes")
+    func olderJournalWithoutTheFieldsStillDecodes() throws {
+        let wreck = try Wreckage()
+        defer { wreck.cleanup() }
+        let url = TurnJournal.url(besides: wreck.storeURL)
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let json = """
+            {"turns":{"s1":{"turnID":"turn-1","sessionID":"s1","prompt":"Fix the flaky test",
+            "displayPrompt":"Fix the flaky test","model":"opus","effort":"high","fork":false,
+            "startedAt":"\(stamp)","queued":[]}}}
+            """
+        try json.write(to: url, atomically: true, encoding: .utf8)
+        let loaded = TurnJournal.load(from: url)
+        #expect(loaded.turns["s1"]?.turnID == "turn-1")
+        #expect(loaded.turns["s1"]?.stopped == nil)
+        #expect(loaded.turns["s1"]?.failed == nil)
     }
 }
 
@@ -287,6 +320,40 @@ struct RecoveryTests {
         }.joined()
         #expect(text?.contains("Fixed the ordering bug") == true)
         #expect(wreck.journal().turns.isEmpty)
+    }
+
+    @Test("A stop pressed before the crash settles as cancelled, not as a plain finish")
+    func settlesStoppedAsCancelled() async throws {
+        let wreck = try Wreckage()
+        defer { wreck.cleanup() }
+        let first = wreck.store()
+        let session = await first.create(CreateRequest(title: "Flaky", directory: nil))
+        let transcriptID = UUID().uuidString
+        try wreck.writeTranscript(id: transcriptID, closed: true)
+        wreck.seedJournal(record(session: session.id, claudeID: transcriptID, stopped: true))
+
+        let store = wreck.store()
+        await store.attach(index: wreck.index())
+        await store.recoverJournaledTurns()
+
+        #expect(await store.lastEnding(session.id)?.ending == .cancelled)
+    }
+
+    @Test("A failure reported before the crash settles as failed, not as a plain finish")
+    func settlesFailedAsFailed() async throws {
+        let wreck = try Wreckage()
+        defer { wreck.cleanup() }
+        let first = wreck.store()
+        let session = await first.create(CreateRequest(title: "Flaky", directory: nil))
+        let transcriptID = UUID().uuidString
+        try wreck.writeTranscript(id: transcriptID, closed: true)
+        wreck.seedJournal(record(session: session.id, claudeID: transcriptID, failed: true))
+
+        let store = wreck.store()
+        await store.attach(index: wreck.index())
+        await store.recoverJournaledTurns()
+
+        #expect(await store.lastEnding(session.id)?.ending == .failed)
     }
 
     @Test("A session the journal names but the store lost leaves nothing behind")

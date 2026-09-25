@@ -630,7 +630,13 @@ actor SessionStore {
     /// do from a detached task, done in order on the actor — so the mirror can never see a turn's
     /// final message after the turn has settled.
     private func publish(_ id: String, _ event: BridgeEvent) {
-        if case .error = event { failedTurns.insert(id) }
+        if case .error = event {
+            failedTurns.insert(id)
+            if journal.turns[id] != nil {
+                journal.turns[id]?.failed = true
+                journal.write(to: journalURL)
+            }
+        }
         broadcaster(for: id).send(event)
         mirrorLiveTurn(id, event)
         let pusher = self.pusher
@@ -1186,11 +1192,13 @@ actor SessionStore {
     /// background work it carries; a process that does not answer the interrupt is terminated.
     func abortTurn(_ id: String) -> (stopped: Bool, discarded: Int) {
         let discarded = pendingPrompts.removeValue(forKey: id)?.count ?? 0
+        let stopping = openTurns[id] != nil
         if journal.turns[id] != nil {
             journal.turns[id]?.queued = []
+            if stopping { journal.turns[id]?.stopped = true }
             journal.write(to: journalURL)
         }
-        guard openTurns[id] != nil else { return (false, discarded) }
+        guard stopping else { return (false, discarded) }
         stoppedTurns.insert(id)
         let pusher = self.pusher
         let now = Date()
@@ -1571,7 +1579,8 @@ actor SessionStore {
                 return false
             }
             let waitEnding = TurnWaitEnding(
-                settled: CardDetail.settled(ending: ending, stopped: false, failed: false))
+                settled: CardDetail.settled(
+                    ending: ending, stopped: record.stopped ?? false, failed: record.failed ?? false))
             lastEndings[id] = LastTurnEnding(
                 ending: waitEnding, title: title, toolCount: toolCount,
                 duration: now.timeIntervalSince(record.startedAt), lastMessageID: answer.last?.id,

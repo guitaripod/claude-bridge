@@ -8,6 +8,7 @@ here above the version a machine is running.
 
 - A new route, `GET /sessions/:id/wait`, answers only once a turn ends or stops to ask you something — a background URLSession can hold it while the app is closed and be woken by the answer, with nothing passing through Midgar or Apple. `/status` reports `turnWait` so a client can tell a bridge too old for the route from a session it does not know.
 - `POST /push/device` now says whether this bridge actually holds an APNs key (`delivers`), so a client can tell a real push from one an old bridge only pretended to accept.
+- A turn stopped or failed right before a restart (a self-update's `exit(0)`, say) now settles as `cancelled`/`failed` on `/wait` rather than a plain `finished`: the stop and the failure are now written to the turn's journal record as they happen, not just held in memory.
 
 ## 1.12.1 — 2026-09-25
 

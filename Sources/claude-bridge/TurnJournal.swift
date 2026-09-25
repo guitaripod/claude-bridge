@@ -33,6 +33,13 @@ struct TurnRecord: Codable, Sendable {
     /// Prompts that were waiting behind this turn. They are the part of an interruption most easily
     /// lost and least easily reconstructed — nobody remembers what they queued twenty minutes ago.
     var queued: [QueuedRecord] = []
+    /// Somebody pressed stop on this turn before the bridge went down with it. Optional so a
+    /// journal written by an older bridge still decodes — absent reads as `false`, same as before
+    /// this field existed.
+    var stopped: Bool?
+    /// The turn reported a failure before the bridge went down with it. Same optionality as
+    /// ``stopped`` and for the same reason.
+    var failed: Bool?
 }
 
 struct QueuedRecord: Codable, Sendable {
