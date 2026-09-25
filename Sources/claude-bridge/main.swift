@@ -170,7 +170,8 @@ await updater.startAutomation()
 registerRoutes(
     router, store: store, index: index, watcher: watcher, updater: updater, auth: auth,
     permissions: permissions, hub: hub, observer: observer, defaults: machineDefaults, hasAuth: !password.isEmpty || tailnetGate != nil,
-    projectsDir: projectsDir)
+    projectsDir: projectsDir,
+    waitMax: Double(env("BRIDGE_WAIT_MAX", "10800")) ?? 10800)
 startExternalIdleSweep(index: index, store: store)
 
 let app = Application(

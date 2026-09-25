@@ -105,6 +105,23 @@ enum TurnEnding: Sendable, Equatable {
     case interrupted
 }
 
+extension CardDetail {
+    /// How a turn's ending reads once it settles — the one place that decides it, so a Live
+    /// Activity card and a `/wait` answer with no card at all read a stop or a failure the same
+    /// way. A stop somebody pressed and a failure the turn reported along the way outrank a plain
+    /// finish; a question or an interruption are what they are regardless of either.
+    static func settled(ending: TurnEnding, stopped: Bool, failed: Bool) -> CardDetail {
+        switch ending {
+        case .question: return .question
+        case .interrupted: return .interrupted
+        case .finished, .answerless:
+            if stopped { return .cancelled }
+            if failed { return .failed }
+            return ending == .answerless ? .answerless : .finished
+        }
+    }
+}
+
 /// One conversation's card as this bridge last drew it.
 struct LiveActivityCard: Codable, Sendable, Equatable {
     var sessionID: String
@@ -372,14 +389,7 @@ actor LiveActivityPusher {
     }
 
     private static func settledDetail(_ card: LiveActivityCard, _ ending: TurnEnding) -> CardDetail {
-        switch ending {
-        case .question: return .question
-        case .interrupted: return .interrupted
-        case .finished, .answerless:
-            if card.stopped { return .cancelled }
-            if card.failed { return .failed }
-            return ending == .answerless ? .answerless : .finished
-        }
+        CardDetail.settled(ending: ending, stopped: card.stopped, failed: card.failed)
     }
 
     static func payload(

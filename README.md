@@ -125,7 +125,7 @@ identity when the gate is on — see Security.
 | Method | Path | Body | Response |
 |---|---|---|---|
 | GET | `/health` | — | `ok` |
-| GET | `/status` | — | `{"agent": "claude", "model": …, "version": …, "authenticated": bool, "proto": 2, "epoch": …}` — `proto`/`epoch` announce the sequenced `/stream` protocol |
+| GET | `/status` | — | `{"agent": "claude", "model": …, "version": …, "authenticated": bool, "proto": 2, "epoch": …, "turnWait": 1}` — `proto`/`epoch` announce the sequenced `/stream` protocol, `turnWait` the protocol version of `/sessions/:id/wait` |
 | GET | `/stream` | `Last-Event-ID` header or `?since=epoch:seq` | one sequenced SSE stream of everything this bridge knows is happening (below) |
 | GET | `/auth` | — | whether the CLI is signed in, as whom, and the sign-in in progress if there is one |
 | POST | `/auth/login` | — | starts `claude auth login` on a pseudo-terminal and answers with the URL it printed |
@@ -149,6 +149,7 @@ identity when the gate is on — see Security.
 | POST | `/sessions/:id/clear` | — | `{"ok": true}`; drops history and the resumable Claude session id. `409` while a turn is running or queued — fork instead |
 | POST | `/sessions/:id/fork` | — | new `Session` (404 if unknown) seeded with the source's history; its first turn runs `--fork-session` so it diverges instead of mutating the parent |
 | GET | `/sessions/:id/events` | — | `text/event-stream` of per-session bridge events (below) |
+| GET | `/sessions/:id/wait` | — | holds until the turn ends or needs you, then one `TurnWait` JSON object (below); safe for a background URLSession |
 | GET | `/sessions/:id/usage` | — | `{costUSD?, tokens?}` for the session's last turn |
 | GET | `/sessions/:id/spend` | — | the whole conversation priced turn by turn from the CLI's own transcript — per-turn token tiers (cache write/read split), per-model, always an API-equivalent estimate |
 | GET | `/sessions/:id/interruption` | — | the state of a turn the machine cut off, as `{"interruption": Interruption\|null}` — `null` when there is none |
@@ -171,7 +172,7 @@ identity when the gate is on — see Security.
 | GET | `/files/raw` | `?path=`, `?tool=`, `?session=` | the file's bytes with its MIME type — what an image part points at; a deleted file falls back to the copy that session's transcript kept for that tool call |
 | GET | `/attachments/:session/:name` | — | the bytes a prompt carried, served back with its MIME type |
 | POST | `/sessions/:id/live-activity` | `LiveActivityRegistration` | registers an ActivityKit push token for this session |
-| POST | `/push/device` | `{token, environment}` | registers a device token for turn-end pushes (requires an authenticated bridge — a password or the tailnet gate) |
+| POST | `/push/device` | `{token, environment}` | `{"ok": true, "delivers": bool}` — registers a device token for turn-end pushes; `delivers` says whether this bridge actually holds an APNs key, so a client can tell a real push from one an older bridge only pretended to accept (requires an authenticated bridge — a password or the tailnet gate) |
 | POST | `/push/device/unregister` | `{token}` | forgets it |
 
 `Session`: `{id, title, directory?, claudeSessionID?, priorClaudeSessionIDs?, model, effort,
@@ -280,6 +281,40 @@ Each event on `/sessions/:id/events` is one `data: <json>\n\n` frame:
 
 A subscriber gets a `status` frame immediately on connect, so a client that attaches mid-turn
 knows the session is running without waiting for the next token.
+
+## Waiting on a turn
+
+`GET /sessions/:id/wait` is for a client that is about to stop listening — the app going to the
+background, a process handing the question to something that isn't a live socket — and wants to
+be told, once, when there is finally something to say. It carries no cursor and no state: any
+number of these can be open on one session at once, a client that already knows how the turn ended
+gets the same answer as one that never asked before, and it is safe to hand to a background
+URLSession because the request has no side effect and asking twice changes nothing.
+
+The response starts arriving at once — a single `\n` the moment the connection opens, so the
+headers and a first byte leave immediately — with another `\n` every ten seconds while the hold
+continues, and finishes with exactly one JSON object. A dropped connection is not an answer: it is
+silence, and the only thing to do with silence is ask again.
+
+```json
+{"state":"ended","waited":true,"ending":"finished","title":"Fix the queue","toolCount":4,
+ "background":1,"duration":192.4,"lastMessageID":"…","endedAt":"2026-09-25T16:19:55Z"}
+```
+
+`state` is `"ended"` (nothing is queued or running any more), `"needsYou"` (the turn stopped on an
+`AskUserQuestion` it is still waiting to have answered), or `"running"` (the hold reached its cap
+and the turn is still going — ask again). `waited` is `false` only when nothing was open the
+moment the request arrived. Every other field is omitted, never written `null`, when this bridge
+has nothing to say about it; `ending` is one of `finished`, `answerless`, `failed`, `interrupted`,
+`cancelled`, `question` — the same vocabulary the app's Live Activities already read, so a card and
+a `/wait` answer for the same turn never disagree. A hold is capped at `BRIDGE_WAIT_MAX` seconds
+(default 10800, three hours); past it the answer is `{"state":"running","waited":true}` and the
+caller is expected to open another wait rather than treat it as an ending.
+
+This bridge runs Claude with a fixed permission mode, so no turn ever stops on an interactive
+approval prompt — `state: "needsYou"` here only ever means a question, never `ending: "approval"`.
+That case, and `ending: "lost"`, are carried on the wire for the app's sake (the same vocabulary
+covers every backend) but this bridge does not produce them.
 
 ## One stream of everything
 

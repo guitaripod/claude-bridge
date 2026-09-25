@@ -85,6 +85,16 @@ actor SessionStore {
     /// when it matters most.
     private var journal: TurnJournal
     private let journalURL: URL
+    /// A turn stopped by `abortTurn`, or one that reported an error before it closed — the same two
+    /// facts a Live Activity card keeps, tracked here too because a session nobody has ever opened
+    /// a card for has no card to ask. Set when a turn opens, consumed by ``lastEndings`` when it
+    /// closes.
+    private var stoppedTurns: Set<String> = []
+    private var failedTurns: Set<String> = []
+    /// What `/sessions/:id/wait` answers once a session is idle, recorded at the same choke points
+    /// that settle a Live Activity card. Transient like the rest of this turn-scoped bookkeeping —
+    /// a restart loses it, exactly as it loses ``autoContinues`` and everything else above.
+    private var lastEndings: [String: LastTurnEnding] = [:]
 
     private struct QueuedPrompt {
         let prompt: String
@@ -520,6 +530,8 @@ actor SessionStore {
         // turn runner did — and a line the process writes in the meantime finds a turn to land
         // in rather than opening one of its own beside this one.
         let messageID = UUID().uuidString
+        stoppedTurns.remove(id)
+        failedTurns.remove(id)
         openTurns[id] = OpenTurn(
             assembler: Assembler(messageID: messageID), startedAt: Date(),
             turnClaudeID: turnClaudeID, resume: resume, reportedSessionID: resume)
@@ -618,6 +630,7 @@ actor SessionStore {
     /// do from a detached task, done in order on the actor — so the mirror can never see a turn's
     /// final message after the turn has settled.
     private func publish(_ id: String, _ event: BridgeEvent) {
+        if case .error = event { failedTurns.insert(id) }
         broadcaster(for: id).send(event)
         mirrorLiveTurn(id, event)
         let pusher = self.pusher
@@ -682,6 +695,8 @@ actor SessionStore {
             pid: turnProcessIDs[id], queued: (pendingPrompts[id] ?? []).map(\.record))
         journal.write(to: journalURL)
         let messageID = UUID().uuidString
+        stoppedTurns.remove(id)
+        failedTurns.remove(id)
         openTurns[id] = OpenTurn(
             assembler: Assembler(messageID: messageID), startedAt: Date(),
             turnClaudeID: turnClaudeID, resume: session.claudeSessionID,
@@ -740,6 +755,8 @@ actor SessionStore {
     private var carriedWork: [String: BackgroundWork] = [:]
 
     func backgroundWork(for id: String) -> BackgroundWork? { carriedWork[id] }
+
+    func lastEnding(_ id: String) -> LastTurnEnding? { lastEndings[id] }
 
     private func noteBackgroundWork(_ id: String, from process: ClaudeProcess, _ work: BackgroundWork?) {
         guard processes[id] === process else { return }
@@ -1174,6 +1191,7 @@ actor SessionStore {
             journal.write(to: journalURL)
         }
         guard openTurns[id] != nil else { return (false, discarded) }
+        stoppedTurns.insert(id)
         let pusher = self.pusher
         let now = Date()
         Task { await pusher.noteStopped(sessionID: id, now: now) }
@@ -1327,6 +1345,13 @@ actor SessionStore {
         let index = self.index
         let ending = Self.ending(of: outcome.messages)
         let now = Date()
+        let waitEnding = TurnWaitEnding(
+            settled: CardDetail.settled(
+                ending: ending, stopped: stoppedTurns.remove(id) != nil,
+                failed: failedTurns.remove(id) != nil))
+        lastEndings[id] = LastTurnEnding(
+            ending: waitEnding, title: title, toolCount: toolCount, duration: turnDuration,
+            lastMessageID: outcome.messages.last?.id, endedAt: now)
         Task {
             await pusher.endTurn(
                 sessionID: id, toolCount: toolCount, ending: ending, title: title, now: now)
@@ -1541,6 +1566,16 @@ actor SessionStore {
             let title = session.title
             let pusher = self.pusher
             let now = Date()
+            let toolCount = answer.flatMap(\.parts).count { part in
+                if case .tool = part { return true }
+                return false
+            }
+            let waitEnding = TurnWaitEnding(
+                settled: CardDetail.settled(ending: ending, stopped: false, failed: false))
+            lastEndings[id] = LastTurnEnding(
+                ending: waitEnding, title: title, toolCount: toolCount,
+                duration: now.timeIntervalSince(record.startedAt), lastMessageID: answer.last?.id,
+                endedAt: now)
             Task {
                 await pusher.endTurn(
                     sessionID: id, toolCount: nil, ending: ending, title: title, now: now)
@@ -1628,6 +1663,9 @@ actor SessionStore {
         let tools = interruption.progress.toolCount
         let duration = interruption.detectedAt.timeIntervalSince(interruption.startedAt)
         let now = Date()
+        lastEndings[id] = LastTurnEnding(
+            ending: .interrupted, title: title, toolCount: tools, duration: duration,
+            lastMessageID: nil, endedAt: now)
         Task {
             await pusher.endTurn(
                 sessionID: id, toolCount: tools, ending: .interrupted, title: title, now: now)

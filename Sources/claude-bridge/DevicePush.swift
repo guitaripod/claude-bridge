@@ -133,6 +133,10 @@ actor DevicePusher {
         devices = Self.load(from: devicesURL)
     }
 
+    /// Whether this bridge holds an APNs client at all, so a registering client can tell a real
+    /// push from one that only ever answers `{"ok":true}` because there is nothing behind it.
+    var delivers: Bool { client != nil }
+
     func register(token: String, environment: String) {
         devices[token] = DeviceRegistration(
             token: token, environment: environment, lastSeenAt: Date())

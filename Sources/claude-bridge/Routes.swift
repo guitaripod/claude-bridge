@@ -158,6 +158,9 @@ struct BridgeStatus: Encodable {
     /// Protocol 2: this bridge serves `GET /stream` — one sequenced, replayable event stream.
     let proto: Int
     let epoch: String
+    /// Protocol version of `GET /sessions/:id/wait`, so a client can tell "too old to have this
+    /// route" from "session not found" rather than guessing from a 404.
+    let turnWait: Int
 }
 
 struct AuthCodeRequest: Decodable {
@@ -172,7 +175,8 @@ func registerRoutes(
     _ router: Router<BridgeRequestContext>, store: SessionStore, index: TranscriptIndex,
     watcher: TranscriptWatcher, updater: UpdateService, auth: AuthService,
     permissions: MachinePermissionService, hub: Hub,
-    observer: ObserverLoop, defaults: MachineDefaults, hasAuth: Bool, projectsDir: String
+    observer: ObserverLoop, defaults: MachineDefaults, hasAuth: Bool, projectsDir: String,
+    waitMax: TimeInterval = 10800
 ) {
     @Sendable func adoptIfNeeded(_ id: String) async {
         guard await store.get(id) == nil, let discovered = await index.session(id) else { return }
@@ -188,7 +192,7 @@ func registerRoutes(
                 version: BridgeVersion.describe(source: BridgeVersion.sourceDirectory()),
                 authenticated: await auth.status().loggedIn,
                 access: context.access,
-                proto: 2, epoch: await hub.epoch))
+                proto: 2, epoch: await hub.epoch, turnWait: 1))
     }
 
     /// One sequenced stream of everything: session deltas, list rows, agents, statuses. Every
@@ -432,6 +436,78 @@ func registerRoutes(
         return (held || turnOpen || (observed?.active ?? false), turnOpen)
     }
 
+    /// A request answered only when this session's turn ends or needs the person — safe to hand to
+    /// a background URLSession, since the wire carries no side effect and any number of these may
+    /// be open on one session at once. Writes a single `\n` at once (so headers and a first byte
+    /// leave the moment the connection opens), another every ten seconds while it holds, and
+    /// exactly one ``TurnWait`` at the end. A client that goes away ends the hold: `Task.sleep` and
+    /// the writer both throw the moment the connection is gone, the same signal `/events` reads a
+    /// dead subscriber from, and there is nothing else here to leak.
+    router.get("sessions/:id/wait") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        await adoptIfNeeded(id)
+        guard await store.get(id) != nil else {
+            return jsonResponse(["error": "not found"], status: .notFound)
+        }
+        await watcher.ensureTail(sessionID: id)
+
+        @Sendable func reading() async -> TurnWait? {
+            guard let session = await store.get(id) else {
+                return TurnWaitResolution.reading(turnOpen: false, lastEnding: nil, background: nil)
+            }
+            let live = await liveness(of: session)
+            let lastEnding = await store.lastEnding(id)
+            let background = await store.backgroundWork(for: id)?.tasks
+            return TurnWaitResolution.reading(
+                turnOpen: live.turnOpen, lastEnding: lastEnding, background: background)
+        }
+
+        let deadline = Date().addingTimeInterval(waitMax)
+        let body = ResponseBody { writer in
+            func send<Value: Encodable>(_ value: Value) async throws {
+                let data = (try? JSONCoding.encoder.encode(value)) ?? Data("{}".utf8)
+                var buffer = ByteBuffer()
+                buffer.writeBytes(data)
+                try await writer.write(buffer)
+            }
+            func heartbeat() async throws {
+                var buffer = ByteBuffer()
+                buffer.writeString("\n")
+                try await writer.write(buffer)
+            }
+            try await heartbeat()
+            if var resolved = await reading() {
+                resolved.waited = false
+                try await send(resolved)
+                try await writer.finish(nil)
+                return
+            }
+            var lastHeartbeat = Date()
+            while true {
+                try await Task.sleep(for: .seconds(1))
+                if var resolved = await reading() {
+                    resolved.waited = true
+                    try await send(resolved)
+                    try await writer.finish(nil)
+                    return
+                }
+                let now = Date()
+                if now >= deadline {
+                    try await send(TurnWaitResolution.capped())
+                    try await writer.finish(nil)
+                    return
+                }
+                if now.timeIntervalSince(lastHeartbeat) >= 10 {
+                    try await heartbeat()
+                    lastHeartbeat = now
+                }
+            }
+        }
+        var headers = HTTPFields()
+        headers[.contentType] = "application/json"
+        return Response(status: .ok, headers: headers, body: body)
+    }
+
     /// The bridge's record of one session in one small answer, for a client asking on a clock
     /// while its stream is quiet. What the observer computed within the last second answers the
     /// wider reading and the stamp; the turn itself is read the way `GET /sessions/:id` reads it.
@@ -655,7 +731,8 @@ func registerRoutes(
             return jsonResponse(["error": "bad request"], status: .badRequest)
         }
         await store.devicePusher.register(token: body.token, environment: body.environment)
-        return jsonResponse(["ok": true])
+        let delivers = await store.devicePusher.delivers
+        return jsonResponse(["ok": true, "delivers": delivers])
     }
 
     router.post("push/device/unregister") { request, _ in
