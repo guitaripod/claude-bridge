@@ -4,6 +4,11 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.12.1 — 2026-09-25
+
+- The bridge no longer grows by gigabytes a day until Linux kills it, taking every running chat with it. Checking which chats a live Claude process still serves leaked a little memory for every kernel thread on the machine, every two seconds, and a busy day added up to 15 GB.
+- A client that drops its live connection no longer leaves the bridge holding a dead subscriber and re-reading that chat's transcript every second for the rest of its life.
+
 ## 1.12.0 — 2026-09-24
 
 - On a Mac, Tailscode can tell whether the bridge has Full Disk Access and walk you through giving it: one press opens System Settings at the right list on the Mac with the bridge shown in Finder beside it, and the app notices the moment the switch is on. Without it, macOS stops an agent at a permission dialog on a screen nobody is watching.

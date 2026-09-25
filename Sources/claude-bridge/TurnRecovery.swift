@@ -65,7 +65,7 @@ enum ProcessProbe {
             // without CONFIG_PROC_CHILDREN. Either way an unreadable answer counts as "has a
             // child", because a probe that cannot see is not evidence that nothing is there.
             let children = "/proc/\(pid)/task/\(pid)/children"
-            if let data = FileManager.default.contents(atPath: children) {
+            if let data = readProcFile(children) {
                 return !String(decoding: data, as: UTF8.self)
                     .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
@@ -107,8 +107,7 @@ enum ProcessProbe {
                 var found: [Int32] = []
                 var listed = false
                 for thread in threads {
-                    guard let data = FileManager.default.contents(
-                        atPath: "/proc/\(pid)/task/\(thread)/children")
+                    guard let data = readProcFile("/proc/\(pid)/task/\(thread)/children")
                     else { continue }
                     listed = true
                     found += String(decoding: data, as: UTF8.self)
@@ -182,6 +181,25 @@ enum ProcessProbe {
         return days * 86400 + seconds
     }
 
+    /// A `/proc` file read whole, empty when it is empty, nil when it cannot be opened or read.
+    ///
+    /// Read through a handle rather than `FileManager.contents(atPath:)`, `Data(contentsOf:)`
+    /// or `String(contentsOfFile:)`: Foundation's whole-file readers leak the 4 KB buffer they
+    /// allocate for a file whose size reads as zero whenever the read comes back empty, and
+    /// procfs reports every file's size as zero while a kernel thread's `cmdline` and most
+    /// `children` lists really are empty. The owners probe walks every process on the machine
+    /// every two seconds and the stall probe every thread of every live CLI, so the bridge
+    /// leaked about a megabyte a second on a busy machine until the kernel killed it.
+    static func readProcFile(_ path: String) -> Data? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        do {
+            return try handle.readToEnd() ?? Data()
+        } catch {
+            return nil
+        }
+    }
+
     #if !canImport(Darwin)
         /// The fields of `/proc/<pid>/stat` after the bracketed command name, so a name with
         /// spaces or parentheses in it cannot shift every column that follows.
@@ -252,7 +270,7 @@ enum ProcessProbe {
         {
             return true
         }
-        guard let data = FileManager.default.contents(atPath: "/proc/\(pid)/cmdline"),
+        guard let data = readProcFile("/proc/\(pid)/cmdline"),
             !data.isEmpty
         else { return false }
         let arguments = data.split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
@@ -276,7 +294,7 @@ enum ProcessProbe {
             return String(data: data, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         #else
-            guard let data = FileManager.default.contents(atPath: "/proc/\(pid)/cmdline") else {
+            guard let data = readProcFile("/proc/\(pid)/cmdline") else {
                 return nil
             }
             return String(decoding: data, as: UTF8.self).replacingOccurrences(of: "\0", with: " ")

@@ -244,18 +244,23 @@ func registerRoutes(
                 }
             }
 
-            let hello = StreamHello(
-                proto: 2, epoch: epoch, seq: attachment.headSeq, oldestSeq: oldest,
-                heartbeat: 10, reset: attachment.tooOld)
-            try await writeFrame(seq: attachment.headSeq, event: "hello", json: encode(hello))
-            for frame in attachment.replay { try await writeHub(frame) }
+            do {
+                let hello = StreamHello(
+                    proto: 2, epoch: epoch, seq: attachment.headSeq, oldestSeq: oldest,
+                    heartbeat: 10, reset: attachment.tooOld)
+                try await writeFrame(seq: attachment.headSeq, event: "hello", json: encode(hello))
+                for frame in attachment.replay { try await writeHub(frame) }
 
-            try await withGracefulShutdownHandler {
-                for await frame in attachment.stream {
-                    try await writeHub(frame)
+                try await withGracefulShutdownHandler {
+                    for await frame in attachment.stream {
+                        try await writeHub(frame)
+                    }
+                } onGracefulShutdown: {
+                    Task { await hub.detach(attachment.id) }
                 }
-            } onGracefulShutdown: {
-                Task { await hub.detach(attachment.id) }
+            } catch {
+                await hub.detach(attachment.id)
+                throw error
             }
             await hub.detach(attachment.id)
             try await writer.finish(nil)
@@ -935,14 +940,20 @@ func registerRoutes(
                 buffer.writeString("\n\n")
                 try await writer.write(buffer)
             }
-            try await write(.status(running ? "running" : "idle"))
-            try await withGracefulShutdownHandler {
-                for await event in stream {
-                    try await write(event)
+            do {
+                try await write(.status(running ? "running" : "idle"))
+                try await withGracefulShutdownHandler {
+                    for await event in stream {
+                        try await write(event)
+                    }
+                } onGracefulShutdown: {
+                    caster.close(subscriberID)
                 }
-            } onGracefulShutdown: {
+            } catch {
                 caster.close(subscriberID)
+                throw error
             }
+            caster.close(subscriberID)
             try await writer.finish(nil)
         }
         var headers = HTTPFields()
