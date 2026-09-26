@@ -180,24 +180,116 @@ struct LiveActivityPushTests {
         #expect(pushes.last?.state["statusText"] as? String == "Waiting for your answer")
     }
 
-    @Test("A failure reported mid-turn, and a stop somebody pressed, outrank a plain finish")
-    func failuresAndStops() async {
+    @Test("A failure reported mid-turn outranks a plain finish, and an interruption is its own")
+    func failures() async {
         let recorder = Recorder()
         let pusher = LiveActivityPusher(transport: recorder)
         await pusher.register(registration(), sessionID: "a", turnOpen: true)
         await pusher.noteEvent(.error("API Error: 529"), sessionID: "a")
         await pusher.endTurn(sessionID: "a", toolCount: 0, ending: .finished)
-        await pusher.register(registration(token: "def"), sessionID: "b", turnOpen: true)
-        await pusher.noteStopped(sessionID: "b")
-        await pusher.endTurn(sessionID: "b", toolCount: 0, ending: .answerless)
         await pusher.register(registration(token: "ghi"), sessionID: "c", turnOpen: true)
         await pusher.endTurn(sessionID: "c", toolCount: 0, ending: .interrupted)
         #expect(await pusher.card("a")?.detail == "failed")
-        #expect(await pusher.card("b")?.detail == "cancelled")
         #expect(await pusher.card("c")?.detail == "interrupted")
         await pusher.settled()
         let phases = await recorder.pushes().compactMap(\.phase)
-        #expect(phases == ["error", "done", "error"])
+        #expect(phases == ["error", "error"])
+    }
+
+    @Test("A stopped turn takes its card down at once, whatever else it ended on")
+    func stopEndsTheCard() async {
+        let recorder = Recorder()
+        let pusher = LiveActivityPusher(transport: recorder)
+        let stoppedAt = start.addingTimeInterval(40)
+        await pusher.register(registration(), sessionID: "s", turnOpen: true)
+        await pusher.noteEvent(.error("API Error: 529"), sessionID: "s", now: start.addingTimeInterval(10))
+        await pusher.noteStopped(sessionID: "s", now: start.addingTimeInterval(20))
+        await pusher.endTurn(sessionID: "s", toolCount: 0, ending: .answerless, now: stoppedAt)
+        await pusher.settled()
+        let pushes = await recorder.pushes()
+        #expect(pushes.count == 1)
+        #expect(pushes[0].event == "end")
+        #expect(pushes[0].detail == "cancelled")
+        #expect(pushes[0].aps["dismissal-date"] as? Int == Int(stoppedAt.timeIntervalSince1970))
+        #expect(await pusher.card("s") == nil)
+        await pusher.tick(now: stoppedAt.addingTimeInterval(3600), inFlight: [])
+        await pusher.settled()
+        #expect(await recorder.pushes().count == 1)
+    }
+
+    @Test("A tool that finishes hands the card back to thinking, keeping the tool as context")
+    func toolFinishing() async {
+        let recorder = Recorder()
+        let pusher = LiveActivityPusher(transport: recorder)
+        func finished(_ id: String, _ name: String = "Bash") -> BridgeEvent {
+            .toolUpserted(
+                messageID: "m", ToolCall(id: id, name: name, input: "", status: .completed))
+        }
+        await pusher.register(registration(), sessionID: "s", turnOpen: true)
+        await pusher.noteEvent(running("t1"), sessionID: "s", now: start.addingTimeInterval(1))
+        await pusher.noteEvent(running("t2", "Read"), sessionID: "s", now: start.addingTimeInterval(2))
+        await pusher.noteEvent(finished("t2", "Read"), sessionID: "s", now: start.addingTimeInterval(3))
+        #expect(await pusher.card("s")?.detail == "tool")
+        #expect(await pusher.card("s")?.tool == "Bash")
+        await pusher.noteEvent(finished("t1"), sessionID: "s", now: start.addingTimeInterval(4))
+        #expect(await pusher.card("s")?.detail == "thinking")
+        #expect(await pusher.card("s")?.tool == "Bash")
+        await pusher.noteEvent(finished("t1"), sessionID: "s", now: start.addingTimeInterval(5))
+        await pusher.noteEvent(finished("old"), sessionID: "s", now: start.addingTimeInterval(6))
+        await pusher.settled()
+        let pushes = await recorder.pushes()
+        #expect(pushes.map(\.detail) == ["tool", "thinking"])
+        #expect(pushes.last?.state["lastTool"] as? String == "Bash")
+        #expect(pushes.last?.priority == "10")
+        #expect(await pusher.card("s")?.toolCount == 2)
+    }
+
+    @Test("A token handed over again leaves a settled card settled, and it still retires on time")
+    func tokenRefresh() async {
+        let recorder = Recorder()
+        let pusher = LiveActivityPusher(transport: recorder)
+        let ended = start.addingTimeInterval(90)
+        await pusher.register(registration(), sessionID: "s", turnOpen: true)
+        await pusher.endTurn(sessionID: "s", toolCount: 4, ending: .finished, now: ended)
+        await pusher.register(registration(token: "rotated"), sessionID: "s", turnOpen: false)
+        let card = await pusher.card("s")
+        #expect(card?.isSettled == true)
+        #expect(card?.endedAt == ended)
+        #expect(card?.toolCount == 4)
+        #expect(card?.detail == "finished")
+        #expect(card?.registration.token == "rotated")
+        await pusher.tick(now: ended.addingTimeInterval(3600), inFlight: [])
+        await pusher.settled()
+        #expect(await recorder.pushes().last?.event == "end")
+        #expect(await pusher.card("s") == nil)
+    }
+
+    @Test("A token handed over mid-turn keeps what the card is saying")
+    func tokenRefreshMidTurn() async {
+        let pusher = LiveActivityPusher(transport: Recorder())
+        await pusher.register(registration(), sessionID: "s", turnOpen: true)
+        await pusher.noteEvent(running("t1", "Edit"), sessionID: "s", now: start.addingTimeInterval(5))
+        await pusher.register(registration(), sessionID: "s", turnOpen: true)
+        #expect(await pusher.card("s")?.detail == "tool")
+        #expect(await pusher.card("s")?.toolCount == 1)
+    }
+
+    @Test("A card the phone takes back for its next turn starts that turn from the beginning")
+    func takeBack() async {
+        let pusher = LiveActivityPusher(transport: Recorder())
+        await pusher.register(registration(), sessionID: "s", turnOpen: true)
+        await pusher.endTurn(
+            sessionID: "s", toolCount: 2, ending: .finished, now: start.addingTimeInterval(60))
+        let next = start.addingTimeInterval(900)
+        await pusher.register(
+            LiveActivityRegistration(
+                token: "abc", environment: "production", startedAt: next, title: "Fix the queue"),
+            sessionID: "s", turnOpen: true)
+        let card = await pusher.card("s")
+        #expect(card?.isSettled == false)
+        #expect(card?.startedAt == next)
+        #expect(card?.detail == "thinking")
+        #expect(card?.toolCount == 0)
     }
 
     @Test("A tool is counted once however often it is written")

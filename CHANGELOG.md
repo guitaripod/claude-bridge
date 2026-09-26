@@ -4,6 +4,12 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.13.1 — 2026-09-27
+
+- The Live Activity stops saying a tool is running once it has finished: between tools the card reads *Thinking…* again, keeping the last tool as context, where it used to say *Running Bash* for as long as the model thought about what to do next.
+- A finished turn's card leaves the Dynamic Island on time again. Starting a Live Activity for one chat made the phone hand over every other card's address, and the bridge took that for a new turn, forgot the card had settled, and never took it off the island; the phone could show *Done* there for hours.
+- A turn somebody stopped takes its card down at once instead of leaving *Cancelled* on the Lock Screen for an hour.
+
 ## 1.13.0 — 2026-09-25
 
 - A new route, `GET /sessions/:id/wait`, answers only once a turn ends or stops to ask you something — a background URLSession can hold it while the app is closed and be woken by the answer, with nothing passing through Midgar or Apple. `/status` reports `turnWait` so a client can tell a bridge too old for the route from a session it does not know.

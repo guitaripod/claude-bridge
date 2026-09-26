@@ -163,6 +163,12 @@ struct LiveActivityCard: Codable, Sendable, Equatable {
 /// Cards persist beside the session store, so a restart neither forgets a card waiting to be read
 /// nor leaves a live one standing forever over a turn that did not survive it.
 actor LiveActivityPusher {
+    /// A tool the machine is running for the card's turn right now.
+    private struct OpenTool: Sendable {
+        let id: String
+        let name: String
+    }
+
     static let island: TimeInterval = 60 * 60
     static let lockScreen: TimeInterval = 4 * 60 * 60
     static let staleAfter: TimeInterval = 30 * 60
@@ -177,6 +183,7 @@ actor LiveActivityPusher {
     private let activitiesURL: URL?
     private var cards: [String: LiveActivityCard]
     private var countedTools: [String: Set<String>] = [:]
+    private var openTools: [String: [OpenTool]] = [:]
     private var deliveries: [String: (id: UUID, task: Task<Void, Never>)] = [:]
 
     init(client: APNSClient?, activitiesURL: URL? = nil) {
@@ -195,8 +202,23 @@ actor LiveActivityPusher {
 
     /// A card the app just started or took back for a new turn. Nothing is pushed: the app drew
     /// it a moment ago.
+    ///
+    /// The phone also hands over a card's token when nothing about the card changed — iOS hands the
+    /// app every standing card's token again whenever it starts another one — and such a
+    /// registration is told apart by its clock: a card taken back for a new turn starts later than
+    /// the one on file, while a token handed over again carries the card's own start. It changes
+    /// the address and nothing else, so a settled card stays settled and still leaves the Dynamic
+    /// Island on time.
     func register(_ registration: LiveActivityRegistration, sessionID: String, turnOpen: Bool) {
         let previous = cards[sessionID]
+        if var card = previous, Self.isRefresh(registration, of: card) {
+            card.registration = registration
+            if card.title.isEmpty { card.title = registration.title }
+            cards[sessionID] = card
+            persist()
+            log("token refreshed for \(sessionID) (\(registration.environment))")
+            return
+        }
         let sameTurn = previous.map { !$0.isSettled && $0.turnOpen && turnOpen } ?? false
         cards[sessionID] = LiveActivityCard(
             sessionID: sessionID, registration: registration,
@@ -209,7 +231,7 @@ actor LiveActivityPusher {
             background: previous?.background ?? 0, failed: sameTurn && previous?.failed == true,
             stopped: false, turnOpen: turnOpen, endedAt: nil, lastPushAt: Date(),
             lastEventAt: Date())
-        if !sameTurn { countedTools[sessionID] = nil }
+        if !sameTurn { forgetTools(sessionID) }
         persist()
         log("token registered for \(sessionID) (\(registration.environment))")
     }
@@ -246,13 +268,25 @@ actor LiveActivityPusher {
         let before = card.detail
         switch event {
         case .toolUpserted(_, let tool):
-            guard tool.status == .running else { return }
-            card.detail =
-                (tool.name.caseInsensitiveCompare("AskUserQuestion") == .orderedSame
-                    ? CardDetail.question : CardDetail.tool).rawValue
-            card.tool = tool.name
-            if countedTools[sessionID, default: []].insert(tool.id).inserted {
-                card.toolCount += 1
+            if tool.status == .running {
+                if !openTools[sessionID, default: []].contains(where: { $0.id == tool.id }) {
+                    openTools[sessionID, default: []].append(OpenTool(id: tool.id, name: tool.name))
+                }
+                card.detail = Self.detail(runningTool: tool.name).rawValue
+                card.tool = tool.name
+                if countedTools[sessionID, default: []].insert(tool.id).inserted {
+                    card.toolCount += 1
+                }
+            } else {
+                guard let index = openTools[sessionID]?.firstIndex(where: { $0.id == tool.id })
+                else { return }
+                openTools[sessionID]?.remove(at: index)
+                if let still = openTools[sessionID]?.last {
+                    card.detail = Self.detail(runningTool: still.name).rawValue
+                    card.tool = still.name
+                } else {
+                    card.detail = CardDetail.thinking.rawValue
+                }
             }
         case .partTextDelta:
             card.detail = CardDetail.writing.rawValue
@@ -279,7 +313,9 @@ actor LiveActivityPusher {
         cards[sessionID] = card
     }
 
-    /// The turn ended. The card settles on how, and stays for somebody to read it.
+    /// The turn ended. The card settles on how, and stays for somebody to read it — unless
+    /// somebody stopped it, which is never news to the person who pressed stop, so that card goes
+    /// at once.
     func endTurn(
         sessionID: String, toolCount: Int?, ending: TurnEnding, title: String? = nil,
         now: Date = Date()
@@ -293,8 +329,15 @@ actor LiveActivityPusher {
         card.turnOpen = false
         if card.endedAt == nil { card.endedAt = now }
         card.lastPushAt = now
+        forgetTools(sessionID)
+        guard card.reading != .cancelled else {
+            cards[sessionID] = nil
+            persist()
+            push(card, event: "end", priority: "10", now: now, dismissal: now)
+            log("card ended with its stopped turn for \(sessionID)")
+            return
+        }
         cards[sessionID] = card
-        countedTools[sessionID] = nil
         persist()
         push(card, event: "update", priority: "10", now: now)
     }
@@ -368,7 +411,7 @@ actor LiveActivityPusher {
     private func retire(_ card: LiveActivityCard, now: Date) {
         guard let endedAt = card.endedAt else { return }
         cards[card.sessionID] = nil
-        countedTools[card.sessionID] = nil
+        forgetTools(card.sessionID)
         persist()
         let leaves = endedAt.addingTimeInterval(Self.lockScreen)
         push(card, event: "end", priority: "10", now: now, dismissal: max(leaves, now))
@@ -385,11 +428,30 @@ actor LiveActivityPusher {
         card.turnOpen = true
         card.endedAt = nil
         card.lastPushAt = now
-        countedTools[card.sessionID] = nil
+        forgetTools(card.sessionID)
     }
 
     private static func settledDetail(_ card: LiveActivityCard, _ ending: TurnEnding) -> CardDetail {
         CardDetail.settled(ending: ending, stopped: card.stopped, failed: card.failed)
+    }
+
+    /// What a card says while this tool is out on the machine: the one tool that stops the turn to
+    /// ask something reads as the question it is.
+    private static func detail(runningTool name: String) -> CardDetail {
+        name.caseInsensitiveCompare("AskUserQuestion") == .orderedSame ? .question : .tool
+    }
+
+    /// Whether a registration only hands over the address of the card already on file: it starts
+    /// no later than that card did, where a card taken back for a new turn starts after it.
+    private static func isRefresh(
+        _ registration: LiveActivityRegistration, of card: LiveActivityCard
+    ) -> Bool {
+        registration.startedAt.timeIntervalSince(card.startedAt) < 1
+    }
+
+    private func forgetTools(_ sessionID: String) {
+        countedTools[sessionID] = nil
+        openTools[sessionID] = nil
     }
 
     static func payload(
@@ -468,7 +530,7 @@ actor LiveActivityPusher {
         let dead = status == 410 || Self.deadTokenReasons.contains(reason ?? "")
         guard dead, cards[sessionID]?.registration.token == token else { return }
         cards[sessionID] = nil
-        countedTools[sessionID] = nil
+        forgetTools(sessionID)
         persist()
         log("dropped the card for \(sessionID): its token is dead")
     }
