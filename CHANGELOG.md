@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.14.0 — 2026-10-10
+
+- The bridge now keeps what a person decides about each conversation — saved, pinned, archived and when it was last read — so every device reads the same answer from the machine that holds the chat. `PATCH /sessions/:id` takes `pinned`, `archived` and `read` (`seen` or `unread`) beside `saved`, each stamped with when the person decided so a phone that was offline cannot overrule a later choice, and every conversation in a listing or a live `list.upsert` carries them. `/status` reports `marks` so a client can tell a bridge that holds them from one that does not.
+
 ## 1.13.2 — 2026-10-10
 
 - A phone that comes back after a long absence is no longer replayed the whole of what happened meanwhile. A client more than a thousand frames behind is told its window is gone and joins at the present, so it reads the conversation once instead of watching hours of text deltas and list moves arrive one at a time.

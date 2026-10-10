@@ -161,6 +161,9 @@ struct BridgeStatus: Encodable {
     /// Protocol version of `GET /sessions/:id/wait`, so a client can tell "too old to have this
     /// route" from "session not found" rather than guessing from a 404.
     let turnWait: Int
+    /// Protocol version of the per-conversation marks — saved, pinned, archived, last look — so a
+    /// client can tell a bridge that holds them from one that cannot without a listing.
+    let marks: Int
 }
 
 struct AuthCodeRequest: Decodable {
@@ -192,7 +195,7 @@ func registerRoutes(
                 version: BridgeVersion.describe(source: BridgeVersion.sourceDirectory()),
                 authenticated: await auth.status().loggedIn,
                 access: context.access,
-                proto: 2, epoch: await hub.epoch, turnWait: 1))
+                proto: 2, epoch: await hub.epoch, turnWait: 1, marks: 1))
     }
 
     /// One sequenced stream of everything: session deltas, list rows, agents, statuses. Every
@@ -384,7 +387,7 @@ func registerRoutes(
         let (claimed, hidden) = await store.excludedTranscriptIDs()
         let discovered = await index.list(excluding: claimed, hidden: hidden)
         return jsonResponse(
-            await store.stampingSaved(stored + discovered).sorted { $0.updatedAt > $1.updatedAt })
+            await store.stampingMarks(stored + discovered).sorted { $0.updatedAt > $1.updatedAt })
     }
 
     router.post("sessions") { request, _ in
@@ -787,9 +790,8 @@ func registerRoutes(
         else {
             return jsonResponse(["error": "bad request"], status: .badRequest)
         }
-        if let saved = body.saved {
-            await store.setSaved(id, saved)
-        }
+        await store.applyMarks(
+            id, body.marks, updatedAt: await observer.summary(for: id)?.updatedAt)
         guard let title = body.cleanTitle else { return jsonResponse(["ok": true]) }
         await adoptIfNeeded(id)
         guard await store.rename(id, title: title) else {

@@ -284,6 +284,16 @@ struct SessionSummary: Codable, Sendable, Equatable {
     /// rather than to the phone that made it: a bookmark is a fact about a conversation, and a
     /// person who saved a chat from the couch is looking for it at the desk an hour later.
     var saved: Bool?
+    /// Pinned to the top of a list, ordered by `pinnedAt` so every client orders pins alike. A
+    /// bridge that speaks marks always says it, false included: its presence is how a client tells
+    /// *not pinned* from *this bridge cannot say*.
+    var pinned: Bool?
+    var pinnedAt: Date?
+    var archived: Bool?
+    /// When the person last looked at the conversation, in this bridge's clock so it compares
+    /// directly with `updatedAt`. A chat is unread when `updatedAt` is more than a second past it.
+    /// Absent until some client has marked the chat.
+    var readAt: Date?
     /// This turn is one the bridge started by itself to finish background work the previous turn
     /// was killed in the middle of. A row that cannot say this shows a conversation apparently
     /// talking to itself.
@@ -329,11 +339,17 @@ struct RenameRequest: Codable, Sendable {
     var title: String
 }
 
-/// What a client wants changed about a session record. Both fields are optional and a patch that
-/// names neither is refused, so a client that sends only a bookmark cannot silently blank a title.
+/// What a client wants changed about a session record. Every field is optional and a patch that
+/// names none of them is refused, so a client that sends only a bookmark cannot silently blank a
+/// title. `at` is when the person decided, on the client's clock: it orders marks, and alone it
+/// asks for nothing.
 struct SessionPatch: Codable, Sendable {
     var title: String?
     var saved: Bool?
+    var pinned: Bool?
+    var archived: Bool?
+    var read: ReadMark?
+    var at: Date?
 
     var cleanTitle: String? {
         guard let title = title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty
@@ -341,7 +357,13 @@ struct SessionPatch: Codable, Sendable {
         return title
     }
 
-    var isEmpty: Bool { cleanTitle == nil && saved == nil }
+    var marks: MarkChange {
+        MarkChange(saved: saved, pinned: pinned, archived: archived, read: read, at: at)
+    }
+
+    var isEmpty: Bool {
+        cleanTitle == nil && saved == nil && pinned == nil && archived == nil && read == nil
+    }
 }
 
 struct UsageSummary: Codable, Sendable {

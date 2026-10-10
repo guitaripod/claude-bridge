@@ -125,7 +125,7 @@ identity when the gate is on — see Security.
 | Method | Path | Body | Response |
 |---|---|---|---|
 | GET | `/health` | — | `ok` |
-| GET | `/status` | — | `{"agent": "claude", "model": …, "version": …, "authenticated": bool, "proto": 2, "epoch": …, "turnWait": 1}` — `proto`/`epoch` announce the sequenced `/stream` protocol, `turnWait` the protocol version of `/sessions/:id/wait` |
+| GET | `/status` | — | `{"agent": "claude", "model": …, "version": …, "authenticated": bool, "proto": 2, "epoch": …, "turnWait": 1, "marks": 1}` — `proto`/`epoch` announce the sequenced `/stream` protocol, `turnWait` the protocol version of `/sessions/:id/wait`, `marks` that conversations carry `saved`/`pinned`/`archived`/`readAt` |
 | GET | `/stream` | `Last-Event-ID` header or `?since=epoch:seq` | one sequenced SSE stream of everything this bridge knows is happening (below) |
 | GET | `/auth` | — | whether the CLI is signed in, as whom, and the sign-in in progress if there is one |
 | POST | `/auth/login` | — | starts `claude auth login` on a pseudo-terminal and answers with the URL it printed |
@@ -141,7 +141,7 @@ identity when the gate is on — see Security.
 | POST | `/sessions` | `{title?, directory?, model?, effort?}` | the created `Session`; `directory` sets the project directory its turns run in |
 | GET | `/sessions/:id` | — | `Session` (404 if unknown), including the turn in flight; tagged, so `If-None-Match` gets a `304` |
 | GET | `/sessions/:id/revision` | — | `{updatedAt, active, turnOpen, background*}` — the session's state in one small answer, for a client polling while its stream is quiet |
-| PATCH | `/sessions/:id` | `{title}` | `{"ok": true}` (404 if unknown) |
+| PATCH | `/sessions/:id` | `{title?, saved?, pinned?, archived?, read?: "seen"\|"unread", at?}` | `{"ok": true}` (404 if a title names an unknown session; marks are accepted for any id). `at` is when the person decided: each mark keeps the later decision, not the later arrival |
 | DELETE | `/sessions/:id` | — | `{"ok": true}` |
 | POST | `/sessions/:id/message` | `{text, model?, effort?, attachments?}` | `202 {"ok": true, "queued": false}`; the turn runs async, watch `/events`. A prompt sent while this bridge is already running a turn on the session is accepted and **queued** behind it — `202 {"ok": true, "queued": true, "position": n}` — so two clients on one session cannot start two `claude` processes against one transcript. `409` when the session is being written by a turn started outside this bridge (a terminal), which it cannot serialize against |
 | POST | `/sessions/:id/abort` | — | `{"ok": true, "stopped": bool, "discarded": n}`; stops the turn in flight and discards anything queued behind it. `409` when there is nothing to stop from here |

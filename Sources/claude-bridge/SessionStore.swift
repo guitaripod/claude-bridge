@@ -59,7 +59,8 @@ actor SessionStore {
     let pusher: LiveActivityPusher
     let devicePusher: DevicePusher
     private var hiddenTranscripts: Set<String>
-    private var savedSessions: Set<String>
+    private var marks: MarksLedger
+    private var marksDirty = false
     /// Counted, not a set: a `--fork-session` turn resumes its parent's Claude id, so parent and
     /// fork can legitimately hold the same key at once and whichever finishes first must not
     /// declare the other's turn over.
@@ -201,7 +202,8 @@ actor SessionStore {
         journalURL = TurnJournal.url(besides: storeURL)
         journal = TurnJournal.load(from: journalURL)
         hiddenTranscripts = Self.loadHidden(from: Self.hiddenURL(for: storeURL))
-        savedSessions = Self.loadSaved(from: Self.savedURL(for: storeURL))
+        marks = MarksLedger.load(
+            from: Self.marksURL(for: storeURL), legacySaved: Self.savedURL(for: storeURL))
         for session in Self.loadStored(from: storeURL) {
             sessions[session.id] = session
             order.append(session.id)
@@ -255,28 +257,36 @@ actor SessionStore {
 
     func get(_ id: String) -> Session? { sessions[id] }
 
-    /// The conversations bookmarked on this machine. Kept beside the store rather than inside a
-    /// session record so a transcript the bridge has only discovered can be bookmarked without
-    /// being adopted into a store that would then own its title.
-    func saved() -> Set<String> { savedSessions }
+    /// The conversations bookmarked on this machine.
+    func saved() -> Set<String> { marks.savedIDs }
 
+    /// Records what a person decided about a conversation. Kept beside the store rather than
+    /// inside a session record so a transcript the bridge has only discovered can be marked
+    /// without being adopted into a store that would then own its title. The bookmark is also
+    /// written where a downgraded bridge reads it.
     @discardableResult
-    func setSaved(_ id: String, _ saved: Bool) -> Bool {
-        let changed = saved ? savedSessions.insert(id).inserted : savedSessions.remove(id) != nil
-        guard changed else { return false }
-        persistSaved()
+    func applyMarks(_ id: String, _ change: MarkChange, updatedAt: Date?, now: Date = Date())
+        -> Bool
+    {
+        let bookmarked = marks.savedIDs
+        guard marks.apply(change, to: id, updatedAt: updatedAt, now: now) else { return false }
+        persistMarks(bookmarkedBefore: bookmarked)
         return true
     }
 
-    /// The same rows, each carrying whether it is bookmarked. Applied to the whole listing rather
-    /// than inside ``list(activeClaudeIDs:transcriptDates:agents:settings:)``, because half of a
-    /// listing is transcripts the store has never adopted.
-    func stampingSaved(_ summaries: [SessionSummary]) -> [SessionSummary] {
-        summaries.map { summary in
-            var stamped = summary
-            stamped.saved = savedSessions.contains(summary.id)
-            return stamped
-        }
+    /// The same rows, each carrying what the person decided about it. Applied to the whole
+    /// listing rather than inside ``list(activeClaudeIDs:transcriptDates:agents:settings:)``,
+    /// because half of a listing is transcripts the store has never adopted.
+    func stampingMarks(_ summaries: [SessionSummary], now: Date = Date()) -> [SessionSummary] {
+        if marks.noteListed(summaries.map(\.id), now: now) { marksDirty = true }
+        return summaries.map { marks.stamping($0) }
+    }
+
+    /// Forgets the marks of conversations nothing has listed for a month, and writes down the
+    /// sightings that kept the others alive.
+    func pruneMarks(listed: Set<String>, now: Date = Date()) {
+        let dropped = marks.prune(listed: listed, now: now)
+        if dropped || marksDirty { persistMarks() }
     }
 
     /// Claude session ids already represented by a stored session, plus transcripts the user
@@ -368,6 +378,14 @@ actor SessionStore {
         broadcasters[id] = nil
         dropProcess(id)
         persistNow()
+        forgetMarks(id)
+    }
+
+    /// A deleted conversation takes its marks with it, the bookmark file included.
+    private func forgetMarks(_ id: String) {
+        let bookmarked = marks.savedIDs
+        guard marks.remove(id) else { return }
+        persistMarks(bookmarkedBefore: bookmarked)
     }
 
     /// Every transcript id a session has owned — its current and prior Claude
@@ -1854,19 +1872,17 @@ actor SessionStore {
         storeURL.deletingLastPathComponent().appendingPathComponent("saved.json")
     }
 
-    private static func loadSaved(from url: URL) -> Set<String> {
-        guard let data = try? Data(contentsOf: url),
-            let ids = try? JSONCoding.decoder.decode([String].self, from: data)
-        else { return [] }
-        return Set(ids)
+    private static func marksURL(for storeURL: URL) -> URL {
+        storeURL.deletingLastPathComponent().appendingPathComponent("marks.json")
     }
 
-    private func persistSaved() {
-        let url = Self.savedURL(for: storeURL)
-        guard let data = try? JSONCoding.encoder.encode(savedSessions.sorted()) else { return }
-        try? FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: url, options: .atomic)
+    /// Writes the ledger, and the older bookmark file beside it when the set of bookmarks moved.
+    private func persistMarks(bookmarkedBefore: Set<String>? = nil) {
+        marksDirty = false
+        marks.write(to: Self.marksURL(for: storeURL))
+        if let bookmarkedBefore, marks.savedIDs != bookmarkedBefore {
+            marks.writeLegacySaved(to: Self.savedURL(for: storeURL))
+        }
     }
 
     private static func hiddenURL(for storeURL: URL) -> URL {

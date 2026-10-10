@@ -130,6 +130,9 @@ actor ObserverLoop {
     private var suppressedUntil: [String: Date] = [:]
     private static let runnerGrace: TimeInterval = 5
     private var tick = 0
+    /// Sweeps run once a second, so this is hourly: how often forgotten conversations' marks are
+    /// pruned and the sightings that kept the others alive are written down.
+    private static let marksPruneInterval = 3600
     /// Whether this loop has counted the world even once. Before it has, "nothing is running" is
     /// something nobody has established rather than something anybody knows.
     var hasSwept: Bool { tick > 0 }
@@ -158,6 +161,9 @@ actor ObserverLoop {
             await publishAgentChanges()
         }
         await publishListChanges()
+        if tick % Self.marksPruneInterval == 0 {
+            await store.pruneMarks(listed: Set(lastSummaries.keys))
+        }
         await publishTranscriptGrowth()
     }
 
@@ -183,7 +189,7 @@ actor ObserverLoop {
         let (claimed, hidden) = await store.excludedTranscriptIDs()
         let discovered = await index.list(excluding: claimed, hidden: hidden)
         var byID: [String: SessionSummary] = [:]
-        for summary in await store.stampingSaved(stored + discovered) { byID[summary.id] = summary }
+        for summary in await store.stampingMarks(stored + discovered) { byID[summary.id] = summary }
         return byID
     }
 
