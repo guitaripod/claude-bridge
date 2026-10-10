@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.13.2 — 2026-10-10
+
+- A phone that comes back after a long absence is no longer replayed the whole of what happened meanwhile. A client more than a thousand frames behind is told its window is gone and joins at the present, so it reads the conversation once instead of watching hours of text deltas and list moves arrive one at a time.
+
 ## 1.13.1 — 2026-09-27
 
 - The Live Activity stops saying a tool is running once it has finished: between tools the card reads *Thinking…* again, keeping the last tool as context, where it used to say *Running Bash* for as long as the model thought about what to do next.

@@ -38,6 +38,21 @@ import Testing
         await hub.detach(attachment.id)
     }
 
+    @Test func aLongAbsenceJoinsAtTheHeadInsteadOfReplayingTheRing() async {
+        let hub = Hub()
+        for index in 1...(Hub.replayLimit + 50) {
+            await hub.publish(.listRemove(id: "s\(index)"))
+        }
+        let long = await hub.attach(sinceEpoch: hub.epoch, sinceSeq: 10)
+        #expect(long.tooOld)
+        #expect(long.replay.isEmpty)
+        await hub.detach(long.id)
+        let short = await hub.attach(sinceEpoch: hub.epoch, sinceSeq: 50)
+        #expect(!short.tooOld)
+        #expect(short.replay.count == Hub.replayLimit)
+        await hub.detach(short.id)
+    }
+
     /// A frame published concurrently with an attach lands exactly once: in the replay or in the
     /// live stream, never both, never neither.
     @Test func attachRaceLosesNothingAndDuplicatesNothing() async {

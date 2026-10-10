@@ -24,6 +24,12 @@ actor Hub {
     private(set) var seq: UInt64 = 0
     private var ring: [HubFrame] = []
     private static let ringLimit = 8192
+    /// The most a reconnecting client is handed as a replay. A client that was away for an hour
+    /// would otherwise be sent most of the ring — thousands of text deltas and list moves — to
+    /// apply one at a time as though they were live; past this it is told the window is gone
+    /// (`reset`), joins at the head and reads the present once, which is what a replay that long
+    /// amounts to anyway.
+    static let replayLimit = 1000
     private var subscribers: [UUID: AsyncStream<HubFrame>.Continuation] = [:]
 
     init() {
@@ -73,7 +79,9 @@ actor Hub {
         var replay: [HubFrame] = []
         var tooOld = false
         if let sinceEpoch, let sinceSeq {
-            if sinceEpoch == epoch, sinceSeq &+ 1 >= oldestReplayableSeq {
+            if sinceEpoch == epoch, sinceSeq &+ 1 >= oldestReplayableSeq,
+                sinceSeq > seq || seq - sinceSeq <= UInt64(Self.replayLimit)
+            {
                 replay = ring.filter { $0.seq > sinceSeq }
             } else {
                 tooOld = true
