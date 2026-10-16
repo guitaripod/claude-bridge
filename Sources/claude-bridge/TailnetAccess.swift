@@ -141,11 +141,13 @@ actor TailnetGate {
 
     /// The CLI to ask, wherever this platform keeps it. Nil means tailscale is not on this machine,
     /// in which case there is no tailnet to trust and the gate stays shut.
+    static let knownCLIPaths = [
+        "/usr/bin/tailscale", "/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale",
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+    ]
+
     static func locateCLI(override: String?) -> String? {
-        var candidates = [
-            "/usr/bin/tailscale", "/usr/local/bin/tailscale", "/opt/homebrew/bin/tailscale",
-            "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-        ]
+        var candidates = knownCLIPaths
         if let override, !override.isEmpty { candidates.insert(override, at: 0) }
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }

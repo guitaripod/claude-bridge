@@ -38,7 +38,7 @@ import Testing
     }
 
     @Test func anArgumentTheBridgeDoesNotKnowIsRefusedRatherThanIgnored() {
-        #expect(BridgeVersion.unknownCommand(["claude-bridge", "pair"]) == "pair")
+        #expect(BridgeVersion.unknownCommand(["claude-bridge", "frobnicate"]) == "frobnicate")
         #expect(BridgeVersion.unknownCommand(["claude-bridge", "--port", "1"]) == "--port")
         #expect(BridgeVersion.unknownCommand(["claude-bridge"]) == nil)
         #expect(BridgeVersion.unknownCommand(["claude-bridge", "--version"]) == nil)

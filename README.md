@@ -46,10 +46,10 @@ curl -fsSL https://raw.githubusercontent.com/guitaripod/claude-bridge/master/ins
 
 Downloads the latest release for this machine into `~/.claude-bridge/bin`, checks its SHA-256
 (integrity; the download itself is HTTPS from GitHub), generates a password, and registers a service that survives a reboot — `systemctl --user` on
-Linux, a launch agent on macOS. It prints the address, username and password to paste into a
-client — including a single `http://… BRIDGE_PASSWORD=…` line that
-[Tailscode](https://github.com/guitaripod/Tailscode) reads whole, filling both fields from one
-paste. Config lives in `~/.claude-bridge/config.env`; edit it and restart the service to change
+Linux, a launch agent on macOS. It ends by printing a pairing link and a QR code that
+[Tailscode](https://github.com/guitaripod/Tailscode) scans (see [Pairing a phone](#pairing-a-phone));
+a program too old to know `pair` gets the address, username and password plus a single
+`http://… BRIDGE_PASSWORD=…` line that Tailscode reads whole instead. Config lives in `~/.claude-bridge/config.env`; edit it and restart the service to change
 the port, model, or APNs key.
 
 Before it installs anything it looks at the machine and says what it found, in plain words:
@@ -59,8 +59,9 @@ Before it installs anything it looks at the machine and says what it found, in p
   on, because the bridge still works on that computer and on the home network.
 - **Claude Code**: installed, and signed in (`claude auth status`)?
 
-It ends with a short list of what is still left to do, only the things that are actually left,
-and then the pairing details.
+It ends with a short list of what is still left to do, only the things that are actually left
+(Tailscale on this computer and on the phone, signing Claude Code in), and then the pairing link
+and code.
 
 If there is no prebuilt program for the machine, the download fails, or the checksum does not
 match, the installer says why in one sentence and builds from source instead (clone into
@@ -86,13 +87,40 @@ Re-running the installer updates in place and keeps your config and service. It 
 an existing `config.env`. (The program is replaced on disk; the running bridge keeps the old one
 until the service restarts.)
 
-A bridge installed from source can also be updated from your phone: `GET /update` reports the state, `POST /update` fetches, rebuilds
+A bridge can also be updated from your phone: `GET /update` reports the state, `POST /update` fetches, rebuilds
 and restarts, reporting progress through a state file that outlives the restart.
 [Tailscode](https://github.com/guitaripod/Tailscode) exposes this as a button on the server
 screen, so the machine never needs an ssh session to keep current. An update refuses to run on a
-checkout with uncommitted changes, and names the files rather than only saying so. A prebuilt
-install has no checkout, so it reports that it cannot update itself and is updated by re-running
-the installer.
+checkout with uncommitted changes, and names the files rather than only saying so.
+
+**A prebuilt install updates itself too, without a checkout.** The installer leaves two things in
+the state directory: `install.json` (`{"mode":"release","repo":…,"base":…}`, where releases are
+published) and `install.sh` with its `install.sh.sha256`, the installer that arrived inside the
+release archive and was verified by the archive's own checksum. The bridge then answers `GET
+/update` in exactly the shape a checkout gives:
+
+- *What is newer* is the release's `latest.txt`, read with one conditional request (`ETag`) at
+  most every five minutes however often a client asks (Check now has a ten-second floor), and
+  compared as numbers (`1.10.0` is newer than `1.9.0`). A pointer that is not a plain dotted
+  version is reported in `remote.error` and never acted on; with no network the answer keeps what
+  was last heard, `remote.ok` is `false`, and the error says it could not reach the project.
+- *What is new* is the `CHANGELOG-<version>.md` asset of that release (the changelog as of it,
+  fetched once per version), cut down to the releases newer than the one running: `release.version`
+  is the offered version, `release.commitsPastTag` is `0`, `release.notes` carries the sections.
+  A release that publishes no such asset costs only the notes.
+- *Doing it* is `POST /update` running the kept installer as `install.sh --update --managed`
+  after checking it against its checksum again; it downloads the archive, refuses it unless its
+  SHA-256 matches and the program starts, and only then puts it in place. A checksum that does not
+  match leaves the running program, the installer and the record as they were, fails the job in
+  its `download` step with the sentence the installer wrote, and counts against the unattended
+  backoff like a build that does not compile. The quiet barrier, the phases, the job and the
+  unattended policy are the checkout path's, untouched.
+
+Only `behind` (the number of commits) is absent: a release machine does not count in commits. A
+checkout wins over a record, and a machine installed by an older installer, without `install.json`
+or a kept installer, says what is missing (`obstacle.kind` `noInstaller`) and is brought across by
+running the install command once. `install.sh --update` on such a machine does the same download
+and install by hand, finding the release where `install.json` says.
 
 **The restart never takes a turn with it.** Stopping this process is how the new binary gets
 loaded, and on Linux the supervisor tears down the whole control group — every `claude` the bridge
@@ -132,8 +160,47 @@ archive runs on Ubuntu 22.04 and newer, Debian 12, Fedora and the like; it needs
 `macos-15`, then publishes them with `latest.txt`, the pointer the installer reads. Nothing in the
 workflow has been run yet.
 
+Each archive also holds `install.sh`, and `CHANGELOG-<version>.md` (the changelog as of that
+release, from its own heading down) is published beside it for the bridge to read.
+`scripts/package-release.sh --notes-only` writes just that file once for all platforms.
+
 `scripts/test-install.sh` exercises the installer offline against a fake release, with a `PATH`
-that holds no `swift` and no `git`.
+that holds no `swift` and no `git`. `scripts/fake-release-server.py` is the release server the Swift
+tests use (ETag, request log); the tests install from it into temporary homes and run whole
+updates against it.
+
+The bridge depends on CodingAgentKit's `PairingKit` product for the link format and the QR
+encoder. `Package.swift` takes a sibling working copy (`../CodingAgentKit`) when there is one and
+the published tag (`Kit.version`) otherwise; `CLAUDE_BRIDGE_KIT_REMOTE=1` forces the tag, which a
+release build should set.
+
+## Pairing a phone
+
+```sh
+claude-bridge pair                 # the link, a QR code, how to show it again
+claude-bridge pair --link-only     # just the link, for scripts
+claude-bridge pair --json          # everything, machine-readable
+```
+
+prints the `tailscode://connect?v=1&host=…&port=…&agent=claude&name=…[&key=…]` link the Tailscode
+apps open, and a QR code of it for the phone's camera (colours on a terminal, plain blocks in a
+pipe; `--color always|never` decides). It reads the port and password from the environment, then
+from `config.env` in the state directory, so it works from a shell as well as from the installer.
+
+- **Host**: this computer's MagicDNS name from `tailscale status --json`, else its tailnet IPv4,
+  else IPv6. On a machine that is not on a tailnet (no Tailscale, signed out, turned off, not
+  answering) it is the hostname with a plain note saying so, and no code, because a phone away
+  from this network cannot use it; `--any-host` prints the code anyway, and `--link-only` refuses
+  (exit 3) without it.
+- **`key`** (the password) goes in the link only when the machine does not vouch for its tailnet:
+  `BRIDGE_TAILNET_AUTH=off`, or no tailscale CLI, or tailscaled not answering, with a password set
+  — the same three conditions under which the bridge's own door admits nobody without it. A
+  machine whose tailnet gate is up gets a link without a password. The key is shown only on the
+  terminal that asked, `PairingLink` redacts it everywhere it is printed by that type, and
+  `--json` carries `redacted` beside `link`.
+- **name** is the hostname, without its domain.
+
+The installer ends by running exactly this.
 
 ## Running it by hand
 
@@ -443,6 +510,7 @@ Everything is environment variables. Empty values fall back to the default.
 | `BRIDGE_STALL_WINDOW` | `600` | Seconds a background shell past its budget must show no CPU and no output before it is ended; `0` leaves it to the person |
 | `BRIDGE_STORE` | `~/.claude-bridge/sessions.json` | Session persistence file |
 | `BRIDGE_PROJECTS` | `~/.claude/projects` | Claude Code CLI transcript root scanned for discoverable sessions |
+| `BRIDGE_RELEASE_BASE` | the project's `releases/latest/download` | Installer only: where `latest.txt`, the archives and `CHANGELOG-<version>.md` are served from. A prebuilt install records the one it used in `install.json` and the bridge reads it from there |
 | `BRIDGE_SRC` | `~/.claude-bridge/src` | The checkout self-update operates on (set by the installer's generated runner) |
 | `BRIDGE_STATE_DIR` | `~/.claude-bridge` | Where the running binary's build stamp (`build.json`) is read from; update state always lives in `BRIDGE_STORE`'s directory |
 | `BRIDGE_OPENCODE_DB` | auto | Path to opencode's local database, for `/usage/opencode` |
