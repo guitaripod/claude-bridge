@@ -4,6 +4,11 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## Unreleased
+
+- Installing no longer needs Swift or git. The installer downloads a prebuilt program for the machine (Linux x86_64 and aarch64, macOS on Apple silicon), checks its SHA-256 and starts it, in seconds instead of a long build. It builds from source only when there is no program for the machine, the download fails or does not check out, or `--from-source` asks, and then says why in one sentence and where to get Swift if it is missing.
+- The installer looks at the machine first and says in plain words whether Tailscale is installed and signed in and whether Claude Code is installed and signed in, carries on either way, and ends with what is actually left to do. `--no-service` installs everything except the service. The bridge answers `--version`, and refuses an argument it does not know rather than starting a second server.
+
 ## 1.14.0 — 2026-10-10
 
 - The bridge now keeps what a person decides about each conversation — saved, pinned, archived and when it was last read — so every device reads the same answer from the machine that holds the chat. `PATCH /sessions/:id` takes `pinned`, `archived` and `read` (`seen` or `unread`) beside `saved`, each stamped with when the person decided so a phone that was offline cannot overrule a later choice, and every conversation in a listing or a live `list.upsert` carries them. `/status` reports `marks` so a client can tell a bridge that holds them from one that does not.

@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+#
+# Runs install.sh offline against a fake release served from this machine, with a throwaway HOME
+# and a PATH that holds no swift and no git, and checks what a stranger's install would leave
+# behind. Nothing here touches the real ~/.claude-bridge, a real service manager or the network:
+# systemctl, launchctl and loginctl on the PATH are recording stand-ins.
+#
+#   scripts/test-install.sh
+
+# shellcheck disable=SC2016,SC2086,SC2206
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMP="$(mktemp -d)"
+PASSED=0
+FAILED=0
+SERVER_PID=""
+
+cleanup() {
+  [ -z "$SERVER_PID" ] || kill -KILL "$SERVER_PID" 2>/dev/null || true
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+pass() { PASSED=$(( PASSED + 1 )); printf 'ok    %s\n' "$1"; }
+flunk() { FAILED=$(( FAILED + 1 )); printf 'FAIL  %s\n' "$1"; [ -z "${2:-}" ] || printf '%s\n' "$2" | sed 's/^/        /'; }
+
+check() {
+  local name="$1"
+  shift
+  if "$@"; then pass "$name"; else flunk "$name"; fi
+}
+
+has() { printf '%s' "$1" | grep -Fq -- "$2"; }
+
+expect_has() {
+  if has "$1" "$2"; then pass "$3"; else flunk "$3" "wanted: $2
+got:
+$(printf '%s' "$1" | tail -25)"; fi
+}
+
+expect_lacks() {
+  if has "$1" "$2"; then flunk "$3" "did not want: $2"; else pass "$3"; fi
+}
+
+PLATFORM="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
+case "$PLATFORM" in
+  linux-x86_64|linux-aarch64|darwin-arm64) ;;
+  *) printf 'no prebuilt release exists for %s; nothing to test here\n' "$PLATFORM"; exit 0 ;;
+esac
+
+TOOLS="$TMP/tools"
+mkdir -p "$TOOLS"
+for tool in uname date mkdir mktemp curl tar awk sed head tr cut base64 df sha256sum shasum grep \
+  cat chmod mv cp rm touch find dirname sleep hostname id tail ls strip stat gzip; do
+  path="$(command -v "$tool" 2>/dev/null || true)"
+  [ -z "$path" ] || ln -s "$path" "$TOOLS/$tool"
+done
+BASH_BIN="$(command -v bash)"
+
+check "the test PATH holds neither swift nor git" \
+  bash -c "! PATH='$TOOLS' command -v swift && ! PATH='$TOOLS' command -v git"
+
+FAKE="$TMP/fake/claude-bridge"
+mkdir -p "$TMP/fake"
+cat >"$FAKE" <<'FAKE_EOF'
+#!/bin/sh
+case "${1:-}" in
+  --version) echo "claude-bridge 9.9.9" ;;
+  pair)
+    if [ -f "$BRIDGE_STATE_DIR/pair-ok" ]; then echo "PAIRING-LINK tailscode://connect?v=1&fake=1"; exit 0; fi
+    echo "unknown command" >&2
+    exit 2 ;;
+  *) echo "serving" ;;
+esac
+FAKE_EOF
+chmod 755 "$FAKE"
+touch -d '2001-01-01' "$FAKE"
+
+WWW="$TMP/www"
+mkdir -p "$WWW/good" "$WWW/badsum" "$WWW/noasset" "$WWW/nostart"
+"$ROOT/scripts/package-release.sh" --binary "$FAKE" --version 9.9.9 --out "$WWW/good" >"$TMP/package.log" 2>&1
+ASSET="claude-bridge-9.9.9-$PLATFORM.tar.gz"
+printf '9.9.9\n' >"$WWW/good/latest.txt"
+printf 'ok\n' >"$WWW/health"
+
+check "the package script names the archive and its checksum" \
+  test -f "$WWW/good/$ASSET" -a -f "$WWW/good/$ASSET.sha256"
+check "the archive holds the program and the license, flat" \
+  test "$(tar -tzf "$WWW/good/$ASSET" | LC_ALL=C sort | tr '\n' ' ')" = "LICENSE claude-bridge "
+check "the checksum file verifies with sha256sum" \
+  bash -c "cd '$WWW/good' && sha256sum -c '$ASSET.sha256' >/dev/null"
+
+cp "$WWW/good/latest.txt" "$WWW/good/$ASSET" "$WWW/badsum/"
+printf '%064d  %s\n' 0 "$ASSET" >"$WWW/badsum/$ASSET.sha256"
+cp "$WWW/good/latest.txt" "$WWW/noasset/"
+cp "$WWW/good/latest.txt" "$WWW/nostart/"
+BROKEN="$TMP/broken"
+mkdir -p "$BROKEN"
+printf '#!/bin/sh\nexit 3\n' >"$BROKEN/claude-bridge"
+chmod 755 "$BROKEN/claude-bridge"
+tar -czf "$WWW/nostart/$ASSET" -C "$BROKEN" claude-bridge
+printf '%s  %s\n' "$(sha256sum "$WWW/nostart/$ASSET" | cut -d' ' -f1)" "$ASSET" >"$WWW/nostart/$ASSET.sha256"
+
+python3 -u -m http.server 0 --bind 127.0.0.1 --directory "$WWW" >"$TMP/server.log" 2>&1 &
+SERVER_PID=$!
+SERVER_PORT=""
+for _ in $(seq 1 50); do
+  SERVER_PORT="$(sed -n 's/.*port \([0-9][0-9]*\).*/\1/p' "$TMP/server.log" | head -1)"
+  [ -n "$SERVER_PORT" ] && break
+  sleep 0.1
+done
+[ -n "$SERVER_PORT" ] || { echo "the fake release server did not start"; exit 1; }
+SERVER="http://127.0.0.1:$SERVER_PORT"
+
+CLOSED_PORT="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+
+SHIMS=""
+HOME_COUNT=0
+OUT=""
+RC=0
+STATE=""
+HOME_DIR=""
+SERVICE_LOG="$TMP/service.log"
+
+fresh_home() {
+  HOME_COUNT=$(( HOME_COUNT + 1 ))
+  HOME_DIR="$TMP/home$HOME_COUNT"
+  STATE="$HOME_DIR/state"
+  SHIMS="$TMP/shims$HOME_COUNT"
+  mkdir -p "$HOME_DIR" "$SHIMS"
+  rm -f "$SERVICE_LOG"
+}
+
+shim() {
+  printf '#!/bin/sh\n%s\n' "$2" >"$SHIMS/$1"
+  chmod 755 "$SHIMS/$1"
+}
+
+recording_service_shims() {
+  local name
+  for name in systemctl loginctl launchctl; do
+    shim "$name" "echo \"$name \$*\" >>'$SERVICE_LOG'
+case \"\$*\" in *is-active*|*is-enabled*) exit 1;; esac"
+  done
+}
+
+install() {
+  local base="$SERVER/good"
+  case "${BASE:-}" in "") ;; *) base="$BASE" ;; esac
+  local environment=(env -i HOME="$HOME_DIR" USER=tester PATH="$SHIMS:$TOOLS"
+    BRIDGE_STATE_DIR="$STATE" BRIDGE_RELEASE_BASE="$base" BRIDGE_PORT="${PORT:-$SERVER_PORT}"
+    BRIDGE_HEALTH_ATTEMPTS=2 BRIDGE_TAILSCALE="$TMP/no-tailscale" ${ENV_EXTRA:-})
+  if [ -n "${PIPED:-}" ]; then
+    OUT="$(cat "$ROOT/install.sh" | "${environment[@]}" "$BASH_BIN" -s -- "$@" 2>&1)" && RC=0 || RC=$?
+  else
+    OUT="$("${environment[@]}" "$BASH_BIN" "$ROOT/install.sh" "$@" 2>&1)" && RC=0 || RC=$?
+  fi
+}
+
+json_field() {
+  python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); v=d.get(sys.argv[2]); print("" if v is None else v)' "$1" "$2"
+}
+
+phase_words() { sed -n 's/.*"phase":"\([a-z]*\)".*/\1/p' "$1" | tr '\n' ' '; }
+
+stat_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"; }
+
+fresh_home
+BASE="" PORT="" ENV_EXTRA="BRIDGE_PASSWORD=sekret123" install --no-service
+expect_has "$OUT" "downloading the latest claude-bridge for $PLATFORM" "binary install: says what it is downloading"
+check "binary install: succeeds without swift or git" test "$RC" -eq 0
+check "binary install: the program lands in the state dir's bin" test -x "$STATE/bin/claude-bridge"
+check "binary install: the installed program runs" \
+  test "$("$STATE/bin/claude-bridge" --version)" = "claude-bridge 9.9.9"
+check "binary install: no checkout is made" test ! -e "$HOME_DIR/.claude-bridge/src" -a ! -e "$STATE/src"
+check "binary install: the program is stamped as arriving now, not as built in 2001" \
+  test "$(( $(date +%s) - $(stat_mtime "$STATE/bin/claude-bridge") ))" -lt 300
+check "binary install: no download leftovers" test -z "$(find "$STATE" -maxdepth 1 -name '.download.*')"
+check "binary install: config holds the injected password" \
+  grep -Fxq 'export BRIDGE_PASSWORD="sekret123"' "$STATE/config.env"
+check "binary install: config holds the port and bind" \
+  bash -c "grep -Fxq 'export BRIDGE_PORT=$SERVER_PORT' '$STATE/config.env' && grep -Fxq 'export BRIDGE_BIND=0.0.0.0' '$STATE/config.env'"
+check "binary install: config is private" test "$(stat -c %a "$STATE/config.env" 2>/dev/null || stat -f %Lp "$STATE/config.env")" = 600
+check "binary install: runner execs the installed program with the state dir" \
+  bash -c "grep -Fxq 'exec \"$STATE/bin/claude-bridge\"' '$STATE/run.sh' && grep -Fxq 'export BRIDGE_STATE_DIR=\"$STATE\"' '$STATE/run.sh' && grep -Fq '. \"$STATE/config.env\"' '$STATE/run.sh' && test -x '$STATE/run.sh' && test -f '$STATE/run.sh.sha'"
+check "binary install: build stamp names the version and a time the bridge can parse" \
+  bash -c "test \"\$(python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d[\"version\"])' '$STATE/build.json')\" = 9.9.9 && grep -Eq '\"builtAt\":\"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z\"' '$STATE/build.json'"
+check "binary install: no phase file outside an update" test ! -e "$STATE/update.state.json"
+check "--no-service: no unit or launch agent is written" test ! -e "$HOME_DIR/.config/systemd" -a ! -e "$HOME_DIR/Library"
+check "--no-service: no service manager is called" test ! -s "$SERVICE_LOG"
+expect_has "$OUT" "Tailscale: not installed" "pre-flight: reports a missing Tailscale"
+expect_has "$OUT" "Claude Code: not installed" "pre-flight: reports a missing Claude Code"
+expect_has "$OUT" "What is left to do" "ending: lists what is left"
+expect_has "$OUT" "https://tailscale.com/download" "ending: says where to get Tailscale"
+expect_has "$OUT" "installed but not started" "ending: says it did not start a service"
+expect_has "$OUT" "Password  sekret123" "ending: prints the password when the program cannot pair"
+expect_has "$OUT" "BRIDGE_PASSWORD=sekret123" "ending: prints the one line the app takes"
+expect_lacks "$OUT" "Building from source" "binary install: never mentions a source build"
+
+before_listing="$(cd "$STATE" && find . -type f | sort)"
+before_config="$(cksum <"$STATE/config.env")"
+before_runner="$(cksum <"$STATE/run.sh")"
+before_time="$(stat_mtime "$STATE/bin/claude-bridge")"
+sleep 1
+BASE="" PORT="" ENV_EXTRA="" install --no-service
+check "re-run: succeeds" test "$RC" -eq 0
+check "re-run: leaves the same files behind" test "$(cd "$STATE" && find . -type f | sort)" = "$before_listing"
+check "re-run: keeps the config" test "$(cksum <"$STATE/config.env")" = "$before_config"
+check "re-run: keeps the runner" test "$(cksum <"$STATE/run.sh")" = "$before_runner"
+check "re-run: puts the program in place again" test "$(stat_mtime "$STATE/bin/claude-bridge")" -gt "$before_time"
+expect_has "$OUT" "Password  sekret123" "re-run: prints the password the config already had"
+
+BASE="" PORT="" ENV_EXTRA="BRIDGE_PASSWORD=other" install --no-service
+expect_has "$OUT" "keeping the password already in" "re-run: a different injected password does not rotate the config"
+check "re-run: the config still has the first password" grep -Fxq 'export BRIDGE_PASSWORD="sekret123"' "$STATE/config.env"
+
+printf '# my own arrangement\n' >>"$STATE/run.sh"
+BASE="" PORT="" ENV_EXTRA="" install --no-service
+expect_has "$OUT" "has been edited since this script wrote it" "re-run: an edited runner is left alone"
+check "re-run: the edit survives" grep -Fxq '# my own arrangement' "$STATE/run.sh"
+
+touch "$STATE/pair-ok"
+BASE="" PORT="" ENV_EXTRA="" install --no-service
+expect_has "$OUT" "PAIRING-LINK" "pairing: runs the program's own pair command when it has one"
+expect_lacks "$OUT" "Password  " "pairing: does not print the password block instead"
+
+fresh_home
+recording_service_shims
+BASE="" PORT="" ENV_EXTRA="BRIDGE_UNIT=test-bridge.service" install
+if [ "$(uname -s)" = Linux ]; then
+  check "service: succeeds" test "$RC" -eq 0
+  check "service: writes the unit with the runner as its command" \
+    grep -Fxq "ExecStart=$STATE/run.sh" "$HOME_DIR/.config/systemd/user/test-bridge.service"
+  check "service: enables and starts it as a user service" \
+    bash -c "grep -Fxq 'systemctl --user daemon-reload' '$SERVICE_LOG' && grep -Fxq 'systemctl --user enable --now test-bridge.service' '$SERVICE_LOG'"
+  expect_has "$OUT" "claude-bridge is running." "ending: says running once the bridge answers"
+fi
+
+fresh_home
+recording_service_shims
+BASE="" PORT="$CLOSED_PORT" ENV_EXTRA="BRIDGE_UNIT=test-bridge.service" install
+if [ "$(uname -s)" = Linux ]; then
+  expect_has "$OUT" "is installed, but it is not answering on port $CLOSED_PORT" "ending: does not claim a bridge that does not answer is running"
+  expect_has "$OUT" "journalctl --user -u test-bridge.service" "ending: says where to look"
+  expect_lacks "$OUT" "claude-bridge is running." "ending: no false running"
+fi
+
+fresh_home
+shim tailscale 'case "$1" in status) echo "Logged out."; echo "Log in at: https://login.tailscale.com/a/x"; exit 1;; esac'
+shim claude 'echo "{\"loggedIn\": false}"'
+BASE="" PORT="" ENV_EXTRA="BRIDGE_CLAUDE=$SHIMS/claude BRIDGE_TAILSCALE=$SHIMS/tailscale" install --no-service
+expect_has "$OUT" "Tailscale: installed, but not signed in" "pre-flight: a signed-out Tailscale is named"
+expect_has "$OUT" "sudo tailscale up" "pre-flight: and the fix is given"
+expect_has "$OUT" "Claude Code: installed, but not signed in" "pre-flight: a signed-out Claude Code is named"
+check "pre-flight: the install carries on regardless" test "$RC" -eq 0 -a -x "$STATE/bin/claude-bridge"
+
+fresh_home
+shim tailscale 'case "$1" in status) echo "100.64.0.7 box tester linux -"; exit 0;; ip) echo 100.64.0.7;; esac'
+shim claude 'echo "{\"loggedIn\": true}"'
+BASE="" PORT="" ENV_EXTRA="BRIDGE_CLAUDE=$SHIMS/claude BRIDGE_TAILSCALE=$SHIMS/tailscale" install --no-service
+expect_has "$OUT" "Tailscale: connected" "pre-flight: a connected Tailscale is named"
+expect_has "$OUT" "Claude Code: installed and signed in" "pre-flight: a signed-in Claude Code is named"
+expect_has "$OUT" "Nothing else is left to do" "ending: an empty list says so"
+expect_has "$OUT" "http://100.64.0.7:$SERVER_PORT" "ending: the address is the tailnet one"
+
+fresh_home
+BASE="$SERVER/badsum" PORT="" ENV_EXTRA="" install --no-service
+check "bad checksum: aborts when there is no way to build" test "$RC" -ne 0
+expect_has "$OUT" "Building from source instead, because the download did not match its checksum and was thrown away; that takes 5 to 15 minutes" "bad checksum: one sentence says why and how long"
+expect_has "$OUT" "https://www.swift.org/install/" "bad checksum: and how to get Swift"
+check "bad checksum: nothing was installed" test ! -e "$STATE/bin/claude-bridge" -a ! -e "$STATE/config.env"
+
+fresh_home
+shim git 'if [ "$1" = clone ]; then echo "$*" >>"'"$TMP"'/git.log"; exit 1; fi; exit 0'
+shim swift 'exit 0'
+rm -f "$TMP/git.log"
+BASE="$SERVER/badsum" PORT="" ENV_EXTRA="" install --no-service
+check "bad checksum: with a toolchain the source build is what runs" grep -q "clone" "$TMP/git.log"
+expect_has "$OUT" "cloning https://github.com/guitaripod/claude-bridge into $HOME_DIR/.claude-bridge/src" "bad checksum: and it clones the repo"
+
+fresh_home
+BASE="$SERVER/noasset" PORT="" ENV_EXTRA="" install --no-service
+expect_has "$OUT" "because no prebuilt program has been published for $PLATFORM" "missing asset: falls back and says why"
+
+fresh_home
+BASE="$SERVER/nothing-here" PORT="" ENV_EXTRA="" install --no-service
+expect_has "$OUT" "because no prebuilt release has been published yet" "missing release: falls back and says why"
+
+fresh_home
+BASE="http://127.0.0.1:$CLOSED_PORT" PORT="" ENV_EXTRA="" install --no-service
+expect_has "$OUT" "because the prebuilt release could not be downloaded" "no network: falls back and says why"
+
+fresh_home
+BASE="$SERVER/nostart" PORT="" ENV_EXTRA="" install --no-service
+expect_has "$OUT" "because the prebuilt program does not start on this machine" "a program that will not run here: falls back and says why"
+check "a program that will not run here: is not installed" test ! -e "$STATE/bin/claude-bridge"
+
+fresh_home
+shim uname 'case "$1" in -s) echo Plan9;; -m) echo mips;; *) exec '"$(command -v uname)"' "$@";; esac'
+BASE="" PORT="" ENV_EXTRA="" install --no-service
+expect_has "$OUT" "because there is no prebuilt program for Plan9 on mips" "unsupported platform: falls back and says why"
+
+fresh_home
+BASE="" PORT="" ENV_EXTRA="" install --no-service --from-source
+expect_has "$OUT" "Building from source, as you asked; that takes 5 to 15 minutes" "--from-source: says so and how long"
+expect_lacks "$OUT" "downloading" "--from-source: downloads nothing"
+
+fresh_home
+BASE="" PORT="" ENV_EXTRA="BRIDGE_PASSWORD=sekret123" install --no-service >/dev/null
+PHASES="$TMP/phases.log"
+rm -f "$PHASES"
+real_tar="$(command -v tar)"
+real_touch="$(command -v touch)"
+shim tar 'cat "'"$STATE"'/update.state.json" >>"'"$PHASES"'"; exec '"$real_tar"' "$@"'
+shim touch 'cat "'"$STATE"'/update.state.json" >>"'"$PHASES"'"; exec '"$real_touch"' "$@"'
+before_config="$(cksum <"$STATE/config.env")"
+before_time="$(stat_mtime "$STATE/bin/claude-bridge")"
+sleep 1
+BASE="" PORT="" ENV_EXTRA="" install --update --managed
+check "managed update: succeeds" test "$RC" -eq 0
+check "managed update: says nothing on stdout" test -z "$OUT"
+check "managed update: the phases go running, then building" test "$(phase_words "$PHASES")" = "running building "
+check "managed update: ends at restarting and leaves the service alone" test "$(json_field "$STATE/update.state.json" phase)" = restarting -a ! -s "$SERVICE_LOG"
+check "managed update: the state file has a start time and the installer's pid" \
+  bash -c "grep -Eq '^\\{\"phase\":\"restarting\",\"startedAt\":\"[0-9T:Z-]+\",\"pid\":[0-9]+\\}\$' '$STATE/update.state.json'"
+check "managed update: the log says what happened" bash -c "grep -Fq 'downloading the latest claude-bridge' '$STATE/update.log' && grep -Fq 'installed claude-bridge 9.9.9' '$STATE/update.log'"
+check "managed update: the config is untouched" test "$(cksum <"$STATE/config.env")" = "$before_config"
+check "managed update: the new program is stamped as newer than the old" test "$(stat_mtime "$STATE/bin/claude-bridge")" -gt "$before_time"
+
+BASE="" PORT="" ENV_EXTRA="" install --update
+check "unmanaged update: succeeds and ends at succeeded with a finish time" \
+  test "$RC" -eq 0 -a "$(json_field "$STATE/update.state.json" phase)" = succeeded -a -n "$(json_field "$STATE/update.state.json" finishedAt)"
+
+before_binary="$(cksum <"$STATE/bin/claude-bridge")"
+before_runner="$(cksum <"$STATE/run.sh")"
+BASE="$SERVER/badsum" PORT="" ENV_EXTRA="" install --update --managed
+check "failed update: exits non-zero" test "$RC" -ne 0
+check "failed update: records failed, and the phase it failed in" \
+  test "$(json_field "$STATE/update.state.json" phase)" = failed -a "$(json_field "$STATE/update.state.json" failedIn)" = running -a -n "$(json_field "$STATE/update.state.json" finishedAt)"
+check "failed update: the last log line is a sentence for a person" \
+  test "$(grep '^error: ' "$STATE/update.log" | tail -1)" = "error: the download did not match its checksum and was thrown away"
+check "failed update: the installed program and runner are untouched" \
+  test "$(cksum <"$STATE/bin/claude-bridge")" = "$before_binary" -a "$(cksum <"$STATE/run.sh")" = "$before_runner"
+
+fresh_home
+mkdir -p "$STATE/src/.git"
+shim git 'case "$1 $2" in "-C "*) shift 2;; esac; case "$1" in status) exit 0;; fetch) exit 1;; esac; exit 0'
+shim swift 'exit 0'
+BASE="http://127.0.0.1:$CLOSED_PORT" PORT="" ENV_EXTRA="BRIDGE_SRC=$STATE/src" install --update --managed
+check "update of a source install stays a source update: no download is tried" \
+  bash -c "! grep -Fq downloading '$STATE/update.log' && grep -Fq 'error: could not reach' '$STATE/update.log'"
+
+fresh_home
+shim tailscale 'cat >/dev/null; case "$1" in status) exit 0;; ip) echo 100.64.0.9;; esac'
+shim claude 'cat >/dev/null; echo "{\"loggedIn\": true}"'
+PIPED=1 BASE="" PORT="" ENV_EXTRA="BRIDGE_PASSWORD=sekret123 BRIDGE_CLAUDE=$SHIMS/claude BRIDGE_TAILSCALE=$SHIMS/tailscale" install --no-service
+check "piped through bash like the one-liner: tools that read stdin cannot eat the script" test "$RC" -eq 0 -a -x "$STATE/bin/claude-bridge"
+expect_has "$OUT" "http://100.64.0.9:$SERVER_PORT BRIDGE_PASSWORD=sekret123" "piped through bash like the one-liner: reaches the ending"
+
+printf '\n%s passed, %s failed\n' "$PASSED" "$FAILED"
+[ "$FAILED" -eq 0 ]

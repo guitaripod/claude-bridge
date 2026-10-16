@@ -2,12 +2,39 @@ import Foundation
 
 /// Which build of itself the bridge is running.
 ///
-/// The bridge is installed from source — a git checkout plus `swift build` — so the honest answer
+/// A bridge built from source is a git checkout plus `swift build`, so the honest answer there
 /// comes from git rather than a constant baked in at compile time: a tag when the checkout sits on
 /// one, otherwise the tag it descends from and the commit. The constant is the fallback for an
-/// install that shipped without its `.git` directory.
+/// install that shipped without its `.git` directory, and the answer to `--version` for the
+/// prebuilt binary a release carries, which has no checkout to ask.
+///
+/// It is the single source of the version a release is packaged under: it must equal the newest
+/// numbered heading of CHANGELOG.md (an `Unreleased` section above it does not count), and
+/// `VersionTests` fails the build of any release that forgot to move it.
 enum BridgeVersion {
-    static let fallback = "1.6.0"
+    static let fallback = "1.14.0"
+
+    /// Whether the command line only asks which build this is. Answered before anything else
+    /// starts, so a script can ask an installed binary what it is without a port being bound or a
+    /// store being opened.
+    static func isVersionRequest(_ arguments: [String]) -> Bool {
+        arguments.dropFirst().first.map { $0 == "--version" || $0 == "version" } ?? false
+    }
+
+    static func versionLine() -> String { "claude-bridge \(fallback)" }
+
+    /// The first word on the command line that this bridge does not know, if any.
+    ///
+    /// The bridge started with no arguments is the service, so an argument it silently ignored
+    /// would turn a mistyped command, or a command only a newer bridge understands, into a second
+    /// server on the same state. The installer asks the bridge things such as `pair`, and a bridge
+    /// too old for the question must refuse it rather than answer by starting.
+    static func unknownCommand(_ arguments: [String]) -> String? {
+        guard let first = arguments.dropFirst().first, !isVersionRequest(arguments) else {
+            return nil
+        }
+        return first
+    }
 
     static func describe(source: String?) -> String {
         guard let source,

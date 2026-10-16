@@ -50,6 +50,17 @@ func startExternalIdleSweep(index: TranscriptIndex, store: SessionStore) {
     }
 }
 
+if BridgeVersion.isVersionRequest(CommandLine.arguments) {
+    print(BridgeVersion.versionLine())
+    exit(0)
+}
+
+if let unknown = BridgeVersion.unknownCommand(CommandLine.arguments) {
+    FileHandle.standardError.write(
+        Data("claude-bridge: unknown command \"\(unknown)\". Started with no arguments it serves; --version prints the version.\n".utf8))
+    exit(2)
+}
+
 // A prompt written to a CLI that has just exited must come back as an error, not take the bridge
 // down with it.
 signal(SIGPIPE, SIG_IGN)

@@ -30,7 +30,10 @@ Known consumers:
 
 ## Requirements
 
-- Swift 6 toolchain (macOS 14+ or Linux) and `git`.
+- Linux (x86_64 or aarch64, glibc 2.35 or newer, which is every mainstream distribution since 2022)
+  or macOS 14+ on Apple silicon, and `curl`. **No Swift toolchain and no `git`**: the installer
+  downloads a prebuilt program. A Swift 6 toolchain and `git` are needed only on a machine the
+  prebuilt program does not fit, or with `--from-source`.
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and logged in
   (`claude` must work interactively for the user running the bridge).
 - `sqlite3` only if you want the opencode Go quota gauge.
@@ -41,12 +44,30 @@ Known consumers:
 curl -fsSL https://raw.githubusercontent.com/guitaripod/claude-bridge/master/install.sh | bash
 ```
 
-Clones into `~/.claude-bridge/src`, builds it, generates a password, and registers a service that
-survives a reboot — `systemctl --user` on Linux, a launch agent on macOS. It prints the address,
-username and password to paste into a client — including a single `http://… BRIDGE_PASSWORD=…`
-line that [Tailscode](https://github.com/guitaripod/Tailscode) reads whole, filling both fields
-from one paste. Config lives in `~/.claude-bridge/config.env`; edit it and restart the service to
-change the port, model, or APNs key.
+Downloads the latest release for this machine into `~/.claude-bridge/bin`, checks its SHA-256
+(integrity; the download itself is HTTPS from GitHub), generates a password, and registers a service that survives a reboot — `systemctl --user` on
+Linux, a launch agent on macOS. It prints the address, username and password to paste into a
+client — including a single `http://… BRIDGE_PASSWORD=…` line that
+[Tailscode](https://github.com/guitaripod/Tailscode) reads whole, filling both fields from one
+paste. Config lives in `~/.claude-bridge/config.env`; edit it and restart the service to change
+the port, model, or APNs key.
+
+Before it installs anything it looks at the machine and says what it found, in plain words:
+
+- **Tailscale**: installed, signed in and connected? It is what lets a phone reach the machine
+  from anywhere. If it is missing or signed out the installer says exactly what to do and carries
+  on, because the bridge still works on that computer and on the home network.
+- **Claude Code**: installed, and signed in (`claude auth status`)?
+
+It ends with a short list of what is still left to do, only the things that are actually left,
+and then the pairing details.
+
+If there is no prebuilt program for the machine, the download fails, or the checksum does not
+match, the installer says why in one sentence and builds from source instead (clone into
+`~/.claude-bridge/src`, `swift build`; 5 to 15 minutes), and if Swift is missing then, says where
+to get it: <https://www.swift.org/install/>. `--from-source` asks for that build directly, and
+`--no-service` installs everything except the service. A machine that already has a source
+checkout keeps building from it.
 
 A client that already minted a password can bake it into the one-liner, so both sides carry the
 same one without anyone retyping it (an existing config's password is never overwritten):
@@ -62,13 +83,16 @@ curl -fsSL https://raw.githubusercontent.com/guitaripod/claude-bridge/master/ins
 ```
 
 Re-running the installer updates in place and keeps your config and service. It never overwrites
-an existing `config.env`.
+an existing `config.env`. (The program is replaced on disk; the running bridge keeps the old one
+until the service restarts.)
 
-Or update it from your phone: `GET /update` reports the state, `POST /update` fetches, rebuilds
+A bridge installed from source can also be updated from your phone: `GET /update` reports the state, `POST /update` fetches, rebuilds
 and restarts, reporting progress through a state file that outlives the restart.
 [Tailscode](https://github.com/guitaripod/Tailscode) exposes this as a button on the server
 screen, so the machine never needs an ssh session to keep current. An update refuses to run on a
-checkout with uncommitted changes, and names the files rather than only saying so.
+checkout with uncommitted changes, and names the files rather than only saying so. A prebuilt
+install has no checkout, so it reports that it cannot update itself and is updated by re-running
+the installer.
 
 **The restart never takes a turn with it.** Stopping this process is how the new binary gets
 loaded, and on Linux the supervisor tears down the whole control group — every `claude` the bridge
@@ -95,6 +119,21 @@ stamp of the binary actually **running** (`running`, `builtAt` — the installer
 `build.json` after every build), because those part company between a build and a restart —
 `restartRequired` says so explicitly. The `remote` block records whether the remote was actually
 reached and when, so a fetch that failed can never read as "up to date".
+
+## Releases and the installer
+
+`scripts/package-release.sh` builds `swift build -c release --static-swift-stdlib` and packs
+`claude-bridge-<version>-<os>-<arch>.tar.gz` with its `.sha256` into `dist/`; the version is the
+newest numbered heading of `CHANGELOG.md`, which must equal `BridgeVersion.fallback` (a test checks
+it) and what the binary prints for `--version`. `.github/workflows/release.yml` runs it on a pushed
+`X.Y.Z` tag for linux-x86_64 and linux-aarch64 inside `swift:6.4.1-jammy` (glibc 2.35, so the
+archive runs on Ubuntu 22.04 and newer, Debian 12, Fedora and the like; it needs the system's
+`libcurl.so.4`, which any machine that can run the installer's `curl` has) and for darwin-arm64 on
+`macos-15`, then publishes them with `latest.txt`, the pointer the installer reads. Nothing in the
+workflow has been run yet.
+
+`scripts/test-install.sh` exercises the installer offline against a fake release, with a `PATH`
+that holds no `swift` and no `git`.
 
 ## Running it by hand
 
