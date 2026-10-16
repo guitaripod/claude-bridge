@@ -14,6 +14,10 @@ here above the version a machine is running.
 - Release archives now carry the installer they were made with, and each release publishes `CHANGELOG-<version>.md` beside them.
 - The installer's time limit on the programs it asks things of no longer leaves a sleeping timer behind for the rest of the limit.
 
+## 1.15.0 — 2026-10-16
+
+- A turn's push now says what happened, not only that it did. Beside the English alert it carries a `notice`: how long the turn took, how many tools it ran, how many lines it added and removed, the first of what it answered, the question it stopped on with its options, or the error and the prompt that failed. The phone writes the sentences in its own language from those facts and draws the buttons, a reply field and a long look from them. The alert also names its `category`, `relevance-score` and `target-content-id`, and a question is marked time sensitive. A phone that does not read the notice shows the same alert as before. The whole body stays under 3,800 bytes: the answer is shortened first, then the prompt, then the options' reasons.
+
 ## 1.14.0 — 2026-10-10
 
 - The bridge now keeps what a person decides about each conversation — saved, pinned, archived and when it was last read — so every device reads the same answer from the machine that holds the chat. `PATCH /sessions/:id` takes `pinned`, `archived` and `read` (`seen` or `unread`) beside `saved`, each stamped with when the person decided so a phone that was offline cannot overrule a later choice, and every conversation in a listing or a live `list.upsert` carries them. `/status` reports `marks` so a client can tell a bridge that holds them from one that does not.

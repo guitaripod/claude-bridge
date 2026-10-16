@@ -155,7 +155,7 @@ actor DevicePusher {
 
     func pushTurnEnd(
         sessionID: String, title: String, toolCount: Int, failed: Bool, duration: TimeInterval,
-        goal: GoalStatus? = nil
+        goal: GoalStatus? = nil, notice: NoticePush.Additions? = nil
     ) async {
         guard let client, !devices.isEmpty else { return }
         var payload: [String: Any] = [
@@ -173,6 +173,7 @@ actor DevicePusher {
             "sessionID": sessionID,
         ]
         if let usage = await Self.usageObject() { payload["usage"] = usage }
+        if let notice { payload = NoticePush.fitted(NoticePush.merged(payload, with: notice)) }
         await fanOut(
             payload: payload, topic: client.bundleTopic, pushType: "alert", priority: "10",
             collapseID: Self.truncated("done:\(sessionID)", toBytes: 64), label: "alert")
