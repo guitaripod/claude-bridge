@@ -92,6 +92,7 @@ actor SessionStore {
     /// closes.
     private var stoppedTurns: Set<String> = []
     private var failedTurns: Set<String> = []
+    private var failedMessages: [String: String] = [:]
     /// What `/sessions/:id/wait` answers once a session is idle, recorded at the same choke points
     /// that settle a Live Activity card. Transient like the rest of this turn-scoped bookkeeping —
     /// a restart loses it, exactly as it loses ``autoContinues`` and everything else above.
@@ -550,6 +551,7 @@ actor SessionStore {
         let messageID = UUID().uuidString
         stoppedTurns.remove(id)
         failedTurns.remove(id)
+        failedMessages[id] = nil
         openTurns[id] = OpenTurn(
             assembler: Assembler(messageID: messageID), startedAt: Date(),
             turnClaudeID: turnClaudeID, resume: resume, reportedSessionID: resume)
@@ -648,8 +650,9 @@ actor SessionStore {
     /// do from a detached task, done in order on the actor — so the mirror can never see a turn's
     /// final message after the turn has settled.
     private func publish(_ id: String, _ event: BridgeEvent) {
-        if case .error = event {
+        if case .error(let message) = event {
             failedTurns.insert(id)
+            failedMessages[id] = message
             if journal.turns[id] != nil {
                 journal.turns[id]?.failed = true
                 journal.write(to: journalURL)
@@ -721,6 +724,7 @@ actor SessionStore {
         let messageID = UUID().uuidString
         stoppedTurns.remove(id)
         failedTurns.remove(id)
+        failedMessages[id] = nil
         openTurns[id] = OpenTurn(
             assembler: Assembler(messageID: messageID), startedAt: Date(),
             turnClaudeID: turnClaudeID, resume: session.claudeSessionID,
@@ -1371,20 +1375,26 @@ actor SessionStore {
         let index = self.index
         let ending = Self.ending(of: outcome.messages)
         let now = Date()
-        let waitEnding = TurnWaitEnding(
-            settled: CardDetail.settled(
-                ending: ending, stopped: stoppedTurns.remove(id) != nil,
-                failed: failedTurns.remove(id) != nil))
+        let failureText = failedMessages.removeValue(forKey: id)
+        let settled = CardDetail.settled(
+            ending: ending, stopped: stoppedTurns.remove(id) != nil,
+            failed: failedTurns.remove(id) != nil)
+        let waitEnding = TurnWaitEnding(settled: settled)
         lastEndings[id] = LastTurnEnding(
             ending: waitEnding, title: title, toolCount: toolCount, duration: turnDuration,
             lastMessageID: outcome.messages.last?.id, endedAt: now)
+        let notice = NoticePush.additions(
+            sessionID: id, messages: outcome.messages, settled: settled,
+            duration: turnDuration, toolCount: toolCount,
+            prompt: NoticePush.lastUserPrompt(in: session.messages),
+            server: NoticePush.serverName, errorText: failureText)
         Task {
             await pusher.endTurn(
                 sessionID: id, toolCount: toolCount, ending: ending, title: title, now: now)
             let goal = await index?.goal(for: claudeID)
             await devicePusher.pushTurnEnd(
                 sessionID: id, title: title, toolCount: toolCount, failed: false,
-                duration: turnDuration, goal: goal)
+                duration: turnDuration, goal: goal, notice: notice)
         }
     }
 
@@ -1693,12 +1703,16 @@ actor SessionStore {
         lastEndings[id] = LastTurnEnding(
             ending: .interrupted, title: title, toolCount: tools, duration: duration,
             lastMessageID: nil, endedAt: now)
+        let notice = NoticePush.additions(
+            sessionID: id, messages: [], settled: .interrupted, duration: duration,
+            toolCount: tools, prompt: interruption.prompt,
+            server: NoticePush.serverName)
         Task {
             await pusher.endTurn(
                 sessionID: id, toolCount: tools, ending: .interrupted, title: title, now: now)
             await devicePusher.pushTurnEnd(
                 sessionID: id, title: title, toolCount: tools, failed: true,
-                duration: duration, goal: nil)
+                duration: duration, goal: nil, notice: notice)
         }
         guard session.autoResume ?? autoResumeDefault else { return }
         resumeInterrupted(id)
