@@ -42,6 +42,26 @@ struct UsageSnapshot: Codable, Sendable {
     var gauges: [UsageGauge]
     var details: [UsageDetail]
     var error: String?
+    var errorCode: String?
+    var accountID: String?
+    var schema: Int?
+
+    init(
+        providerName: String, subtitle: String, source: String, live: Bool,
+        gauges: [UsageGauge], details: [UsageDetail], error: String? = nil,
+        errorCode: String? = nil, accountID: String? = nil, schema: Int? = nil
+    ) {
+        self.providerName = providerName
+        self.subtitle = subtitle
+        self.source = source
+        self.live = live
+        self.gauges = gauges
+        self.details = details
+        self.error = error
+        self.errorCode = errorCode
+        self.accountID = accountID
+        self.schema = schema
+    }
 }
 
 private struct ClaudeCredentials {

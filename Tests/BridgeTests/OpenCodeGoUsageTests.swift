@@ -12,6 +12,8 @@ import Testing
         #expect(snapshot.subtitle == "Go")
         #expect(snapshot.source.contains("console"))
         #expect(snapshot.error == nil)
+        #expect(snapshot.schema == 2)
+        #expect(snapshot.accountID == "acc_test")
         #expect(snapshot.details.contains { $0.key == "Extra usage" && $0.value == "Off" })
         #expect(snapshot.details.contains { $0.key == "Renews" && $0.value == "Yes" })
         #expect(snapshot.gauges.count == 3)
@@ -168,6 +170,7 @@ import Testing
             """#.utf8)
         let failure = OpenCodeGoUsage.failure(status: 401, body: body)
 
+        #expect(failure.code == "key_expired")
         #expect(failure.description.contains("401"))
         #expect(failure.description.contains("This API key has expired."))
     }
@@ -204,6 +207,7 @@ import Testing
         return Data(
             #"""
             {
+              "subscriberUserId": "acc_test",
               "product": "\#(product)",
               "renewalProduct": "\#(product)",
               "useBalance": false,

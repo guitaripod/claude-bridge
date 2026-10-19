@@ -19,7 +19,7 @@ enum OpenCodeGoUsage {
 
     static func snapshot() async -> UsageSnapshot {
         guard let key = goKey() else {
-            return unavailable("no opencode Go account on this machine")
+            return unavailable("no opencode Go account on this machine", code: "no_account")
         }
         if let fresh = await cache.fresh(within: 60) { return fresh }
         do {
@@ -27,16 +27,19 @@ enum OpenCodeGoUsage {
             await cache.store(snapshot)
             return snapshot
         } catch {
+            let code = (error as? Failure)?.code
             if var stale = await cache.fresh(within: staleWindow),
                 !stale.gauges.isEmpty,
+                stale.schema == 2,
                 !stale.source.lowercased().contains("estimated")
             {
                 stale.live = false
                 stale.source = stale.source.replacingOccurrences(of: " · live", with: " · cached")
                 stale.error = "\(error)"
+                stale.errorCode = code
                 return stale
             }
-            return unavailable("\(error)")
+            return unavailable("\(error)", code: code)
         }
     }
 
@@ -69,8 +72,12 @@ enum OpenCodeGoUsage {
         request.setValue(
             "claude-bridge (+https://github.com/guitaripod/claude-bridge)",
             forHTTPHeaderField: "user-agent")
-        let (data, response) = try await URLSession.shared.data(for: request)
-        return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
+        } catch {
+            throw Failure.coded(code: "unreachable", message: "\(error.localizedDescription)")
+        }
     }
 
     /// The console's status: one meter per published window, dollars against the plan's own
@@ -82,7 +89,10 @@ enum OpenCodeGoUsage {
         }
         guard let access = json["access"] as? [String: Any],
             let meters = access["meters"] as? [String: Any]
-        else { throw Failure.message("opencode.ai reports no Go subscription") }
+        else {
+            throw Failure.coded(
+                code: "no_subscription", message: "opencode.ai reports no Go subscription")
+        }
 
         let product = json["product"] as? String
         let plan = planName(product)
@@ -137,7 +147,10 @@ enum OpenCodeGoUsage {
             live: true,
             gauges: gauges,
             details: details,
-            error: nil)
+            error: nil,
+            errorCode: nil,
+            accountID: json["subscriberUserId"] as? String,
+            schema: 2)
     }
 
     /// The older Go usage route, which answers in percentages and does not name the plan. It is
@@ -187,7 +200,10 @@ enum OpenCodeGoUsage {
             details: [
                 UsageDetail(key: "Counted by", value: "opencode.ai · account-wide")
             ],
-            error: nil)
+            error: nil,
+            errorCode: nil,
+            accountID: json["subscriberUserId"] as? String,
+            schema: 2)
     }
 
     /// The sentence a failed request carries, without the key and without a body a log or a card
@@ -196,7 +212,25 @@ enum OpenCodeGoUsage {
         let message =
             serverMessage(body)
             ?? HTTPURLResponse.localizedString(forStatusCode: status)
-        return .message("opencode.ai returned \(status): \(message)")
+        let detail = "\(message) \(String(decoding: body.prefix(512), as: UTF8.self))".lowercased()
+        let code: String
+        switch status {
+        case 401 where detail.contains("expired"):
+            code = "key_expired"
+        case 401:
+            code = "unauthorized"
+        case 403:
+            code = "forbidden"
+        case 404:
+            code = "not_found"
+        case 429:
+            code = "rate_limited"
+        case 500...599:
+            code = "server_error"
+        default:
+            code = "http_\(status)"
+        }
+        return .coded(code: code, message: "opencode.ai returned \(status): \(message)")
     }
 
     static func serverMessage(_ body: Data) -> String? {
@@ -269,7 +303,7 @@ enum OpenCodeGoUsage {
             .appendingPathComponent(".local/share")
     }
 
-    private static func unavailable(_ reason: String) -> UsageSnapshot {
+    private static func unavailable(_ reason: String, code: String? = nil) -> UsageSnapshot {
         UsageSnapshot(
             providerName: "opencode go",
             subtitle: "Go",
@@ -277,13 +311,28 @@ enum OpenCodeGoUsage {
             live: false,
             gauges: [],
             details: [],
-            error: reason)
+            error: reason,
+            errorCode: code,
+            accountID: nil,
+            schema: 2)
     }
 
     enum Failure: Error, CustomStringConvertible {
         case message(String)
+        case coded(code: String, message: String)
+
+        var code: String? {
+            switch self {
+            case .message: return nil
+            case .coded(let code, _): return code
+            }
+        }
+
         var description: String {
-            switch self { case .message(let text): return text }
+            switch self {
+            case .message(let text): return text
+            case .coded(_, let message): return message
+            }
         }
     }
 }
