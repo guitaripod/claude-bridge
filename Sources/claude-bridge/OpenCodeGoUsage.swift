@@ -51,12 +51,9 @@ enum OpenCodeGoUsage {
     private static func fetchLive(key: String) async throws -> UsageSnapshot {
         let (data, status) = try await send(statusURL, key: key)
         if status == 200 { return try parseStatus(data) }
-        if status == 404 || status == 405 {
+        if status != 401 {
             let (fallbackData, fallbackStatus) = try await send(fallbackURL, key: key)
-            guard fallbackStatus == 200 else {
-                throw failure(status: fallbackStatus, body: fallbackData)
-            }
-            return try parseZen(fallbackData)
+            if fallbackStatus == 200 { return try parseZen(fallbackData) }
         }
         throw failure(status: status, body: data)
     }
