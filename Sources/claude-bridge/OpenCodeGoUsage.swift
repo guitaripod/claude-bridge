@@ -27,7 +27,10 @@ enum OpenCodeGoUsage {
             await cache.store(snapshot)
             return snapshot
         } catch {
-            if var stale = await cache.fresh(within: staleWindow), !stale.gauges.isEmpty {
+            if var stale = await cache.fresh(within: staleWindow),
+                !stale.gauges.isEmpty,
+                !stale.source.lowercased().contains("estimated")
+            {
                 stale.live = false
                 stale.source = stale.source.replacingOccurrences(of: " · live", with: " · cached")
                 stale.error = "\(error)"

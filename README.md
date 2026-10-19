@@ -31,7 +31,7 @@ Known consumers:
 ## Requirements
 
 - Linux (x86_64 or aarch64, glibc 2.35 or newer, which is every mainstream distribution since 2022)
-  or macOS 14+ on Apple silicon, and `curl`. **No Swift toolchain and no `git`**: the installer
+  or macOS 15+ on Apple silicon, and `curl`. **No Swift toolchain and no `git`**: the installer
   downloads a prebuilt program. A Swift 6 toolchain and `git` are needed only on a machine the
   prebuilt program does not fit, or with `--from-source`.
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and logged in
