@@ -81,7 +81,8 @@ enum OpenCodeGoUsage {
             let meters = access["meters"] as? [String: Any]
         else { throw Failure.message("opencode.ai reports no Go subscription") }
 
-        let plan = planName(json["product"] as? String)
+        let product = json["product"] as? String
+        let plan = planName(product)
         let windows: [(key: String, label: String, meter: String)] = [
             ("five_hour", "5-hour session", "fiveHour"),
             ("weekly", "Weekly", "week"),
@@ -94,6 +95,8 @@ enum OpenCodeGoUsage {
                 let used = microCents(block["usedMicroCents"])
             else { continue }
             let reset = normalizedReset(block["resetsAt"])
+            let start = normalizedReset(
+                block["startsAt"] ?? (window.meter == "month" ? access["startsAt"] : nil))
             gauges.append(
                 UsageGauge(
                     key: window.key,
@@ -102,7 +105,8 @@ enum OpenCodeGoUsage {
                     resetsAt: reset,
                     trustedReset: reset != nil,
                     usedUSD: rounded(used / microCentsPerDollar),
-                    limitUSD: rounded(limit / microCentsPerDollar)))
+                    limitUSD: rounded(limit / microCentsPerDollar),
+                    startsAt: start))
         }
         guard !gauges.isEmpty else {
             throw Failure.message("opencode.ai reports no Go usage windows")
@@ -112,10 +116,16 @@ enum OpenCodeGoUsage {
             UsageDetail(key: "Plan", value: plan),
             UsageDetail(key: "Counted by", value: "opencode.ai · account-wide"),
         ]
-        if access["cancelAtPeriodEnd"] as? Bool == true,
-            let ends = normalizedReset(access["endsAt"])
+        if let useBalance = json["useBalance"] as? Bool {
+            details.append(UsageDetail(key: "Extra usage", value: useBalance ? "On" : "Off"))
+        }
+        if let cancels = access["cancelAtPeriodEnd"] as? Bool {
+            details.append(UsageDetail(key: "Renews", value: cancels ? "No" : "Yes"))
+        }
+        if let renewal = json["renewalProduct"] as? String,
+            renewal.caseInsensitiveCompare(product ?? "") != .orderedSame
         {
-            details.append(UsageDetail(key: "Ends", value: ends))
+            details.append(UsageDetail(key: "Renews as", value: planName(renewal)))
         }
         return UsageSnapshot(
             providerName: "opencode go",
@@ -159,7 +169,8 @@ enum OpenCodeGoUsage {
                     resetsAt: reset,
                     trustedReset: reset != nil,
                     usedUSD: money.map { rounded($0.0 / microCentsPerDollar) },
-                    limitUSD: money.map { rounded($0.1 / microCentsPerDollar) }))
+                    limitUSD: money.map { rounded($0.1 / microCentsPerDollar) },
+                    startsAt: normalizedReset(block["startsAt"])))
         }
         guard !gauges.isEmpty else {
             throw Failure.message("opencode.ai returned no windows")

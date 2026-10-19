@@ -12,6 +12,21 @@ struct UsageGauge: Codable, Sendable {
     var trustedReset: Bool
     var usedUSD: Double?
     var limitUSD: Double?
+    var startsAt: String?
+
+    init(
+        key: String, label: String, fraction: Double, resetsAt: String?, trustedReset: Bool,
+        usedUSD: Double? = nil, limitUSD: Double? = nil, startsAt: String? = nil
+    ) {
+        self.key = key
+        self.label = label
+        self.fraction = fraction
+        self.resetsAt = resetsAt
+        self.trustedReset = trustedReset
+        self.usedUSD = usedUSD
+        self.limitUSD = limitUSD
+        self.startsAt = startsAt
+    }
 }
 
 struct UsageDetail: Codable, Sendable {

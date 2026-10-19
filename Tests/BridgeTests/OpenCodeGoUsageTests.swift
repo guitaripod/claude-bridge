@@ -12,6 +12,8 @@ import Testing
         #expect(snapshot.subtitle == "Go")
         #expect(snapshot.source.contains("console"))
         #expect(snapshot.error == nil)
+        #expect(snapshot.details.contains { $0.key == "Extra usage" && $0.value == "Off" })
+        #expect(snapshot.details.contains { $0.key == "Renews" && $0.value == "Yes" })
         #expect(snapshot.gauges.count == 3)
 
         let session = snapshot.gauges[0]
@@ -21,6 +23,7 @@ import Testing
         #expect(session.usedUSD == 2.4)
         #expect(session.limitUSD == 12)
         #expect(session.trustedReset)
+        #expect(session.startsAt == "2026-10-19T16:35:31Z")
         #expect(session.resetsAt == "2026-10-19T21:35:31Z")
 
         let weekly = snapshot.gauges[1]
@@ -34,6 +37,7 @@ import Testing
         #expect(monthly.fraction == 0.47)
         #expect(monthly.usedUSD == 28.2)
         #expect(monthly.limitUSD == 60)
+        #expect(monthly.startsAt == "2026-10-07T21:43:55Z")
     }
 
     @Test func statusNamesGoPlusAndUsesItsOwnCeilings() throws {
@@ -201,6 +205,8 @@ import Testing
             #"""
             {
               "product": "\#(product)",
+              "renewalProduct": "\#(product)",
+              "useBalance": false,
               "access": {
                 "startsAt": "2026-10-07T21:43:55.405Z",
                 "endsAt": "2026-11-07T21:43:55.405Z",
