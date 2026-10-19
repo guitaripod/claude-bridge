@@ -36,7 +36,6 @@ Known consumers:
   prebuilt program does not fit, or with `--from-source`.
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and logged in
   (`claude` must work interactively for the user running the bridge).
-- `sqlite3` only if you want the opencode Go quota gauge.
 
 ## Install
 
@@ -272,7 +271,7 @@ identity when the gate is on — see Security.
 | GET | `/commands` | `?directory=` | `[AgentCommand]` — slash commands a headless turn will resolve |
 | GET | `/usage` | — | Claude plan rate-limit gauges (session / week / Opus) read from the CLI's own accounting |
 | GET | `/usage/grok` | — | Grok quota gauges, when a Grok key is configured |
-| GET | `/usage/opencode` | — | opencode Go subscription estimate, summed from opencode's local database over the plan's windows |
+| GET | `/usage/opencode` | — | opencode Go subscription usage, read live from opencode's account status with the Go key; the last good reading is marked cached and an unreadable account says why |
 | GET | `/files` | `?path=` | `[FileNode]` — directory listing for the project picker |
 | GET | `/files/content` | `?path=` | `{path, content}` |
 | GET | `/files/raw` | `?path=`, `?tool=`, `?session=` | the file's bytes with its MIME type — what an image part points at; a deleted file falls back to the copy that session's transcript kept for that tool call |
@@ -513,8 +512,6 @@ Everything is environment variables. Empty values fall back to the default.
 | `BRIDGE_RELEASE_BASE` | the project's `releases/latest/download` | Installer only: where `latest.txt`, the archives and `CHANGELOG-<version>.md` are served from. A prebuilt install records the one it used in `install.json` and the bridge reads it from there |
 | `BRIDGE_SRC` | `~/.claude-bridge/src` | The checkout self-update operates on (set by the installer's generated runner) |
 | `BRIDGE_STATE_DIR` | `~/.claude-bridge` | Where the running binary's build stamp (`build.json`) is read from; update state always lives in `BRIDGE_STORE`'s directory |
-| `BRIDGE_OPENCODE_DB` | auto | Path to opencode's local database, for `/usage/opencode` |
-| `BRIDGE_OPENCODE_GO_LIMITS` | `12,30,60` | opencode Go plan limits in dollars: 5-hour, week, month |
 | `BRIDGE_APNS_KEY` | empty | Path to an APNs `.p8` auth key. Set all four `BRIDGE_APNS_*` values to enable Live Activity and turn-end pushes; leave them empty and the bridge simply never pushes |
 | `BRIDGE_APNS_KEY_ID` | empty | Key id of that `.p8` |
 | `BRIDGE_APNS_TEAM_ID` | empty | Apple developer team id |
