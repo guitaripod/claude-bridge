@@ -150,8 +150,9 @@ enum OpenCodeGoUsage {
             else { continue }
             let status = (block["status"] as? String)?.lowercased()
             let reset = normalizedReset(block["resetsAt"])
-            let used = microCents(block["usedMicroCents"]).map { $0 / microCentsPerDollar }
-            let limit = microCents(block["limitMicroCents"]).map { $0 / microCentsPerDollar }
+            let money = microCents(block["usedMicroCents"]).flatMap { used in
+                microCents(block["limitMicroCents"]).map { (used, $0) }
+            }
             gauges.append(
                 UsageGauge(
                     key: window.key,
@@ -160,8 +161,8 @@ enum OpenCodeGoUsage {
                         ? 1 : min(1, max(0, percent / 100)),
                     resetsAt: reset,
                     trustedReset: reset != nil,
-                    usedUSD: used.map(rounded),
-                    limitUSD: limit.map(rounded)))
+                    usedUSD: money.map { rounded($0.0 / microCentsPerDollar) },
+                    limitUSD: money.map { rounded($0.1 / microCentsPerDollar) }))
         }
         guard !gauges.isEmpty else {
             throw Failure.message("opencode.ai returned no windows")
@@ -225,19 +226,17 @@ enum OpenCodeGoUsage {
         (value * 100).rounded() / 100
     }
 
-    /// Re-emits opencode's timestamp as plain `.withInternetDateTime` ISO8601, which the client's
+    /// Re-emits opencode's timestamp as plain ISO8601 to the second, which the client's
     /// `.iso8601` `JSONDecoder` can parse. Opencode writes fractional seconds; the console route
     /// may also write epoch milliseconds.
     static func normalizedReset(_ value: Any?) -> String? {
         guard let date = timestamp(value) else { return nil }
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime]
-        return iso.string(from: date)
+        return BridgeTimestamps.string(date)
     }
 
     private static func timestamp(_ value: Any?) -> Date? {
         if let raw = value as? String {
-            if let date = parseISO(raw) { return date }
+            if let date = BridgeTimestamps.date(raw) { return date }
             if let number = Double(raw) { return date(fromEpoch: number) }
             return nil
         }
@@ -248,14 +247,6 @@ enum OpenCodeGoUsage {
     private static func date(fromEpoch value: Double) -> Date? {
         guard value.isFinite, value > 0 else { return nil }
         return Date(timeIntervalSince1970: value > 10_000_000_000 ? value / 1000 : value)
-    }
-
-    private static func parseISO(_ raw: String) -> Date? {
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = iso.date(from: raw) { return date }
-        iso.formatOptions = [.withInternetDateTime]
-        return iso.date(from: raw)
     }
 
     private static func dataHome() -> URL {

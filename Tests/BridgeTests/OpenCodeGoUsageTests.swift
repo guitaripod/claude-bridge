@@ -107,6 +107,18 @@ import Testing
         #expect(snapshot.gauges[2].fraction == 0.47)
     }
 
+    @Test func zenDoesNotTurnAHalfMoneyPairIntoABalance() throws {
+        let data = Data(
+            #"""
+            {"usage":{"rolling":{"status":"ok","percent":10,"usedMicroCents":"240000000"}}}
+            """#.utf8)
+        let snapshot = try OpenCodeGoUsage.parseZen(data)
+
+        #expect(snapshot.gauges.count == 1)
+        #expect(snapshot.gauges[0].usedUSD == nil)
+        #expect(snapshot.gauges[0].limitUSD == nil)
+    }
+
     @Test func aWalledWindowReadsAsExhausted() throws {
         let data = Data(
             #"""
