@@ -200,7 +200,8 @@ enum OpenCodeGoUsage {
         }
         let text = String(decoding: body.prefix(240), as: UTF8.self)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return text.isEmpty ? nil : text
+        guard !text.isEmpty, !text.hasPrefix("<") else { return nil }
+        return text
     }
 
     private static func planName(_ product: String?) -> String {
