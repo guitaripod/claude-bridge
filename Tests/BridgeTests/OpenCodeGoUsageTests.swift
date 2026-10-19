@@ -137,6 +137,14 @@ import Testing
         }
     }
 
+    @Test func bridgeTimestampsRoundTripWithoutAFormatter() {
+        let date = Date(timeIntervalSince1970: 1_792_445_731.733)
+        #expect(BridgeTimestamps.string(date) == "2026-10-19T21:35:31Z")
+        #expect(BridgeTimestamps.date("2026-10-19T21:35:31.733Z") != nil)
+        #expect(BridgeTimestamps.date("2026-10-19T21:35:31Z") != nil)
+        #expect(BridgeTimestamps.date("not a date") == nil)
+    }
+
     @Test func anExpiredKeyIsReportedWithoutTheBody() {
         let body = Data(
             #"""

@@ -302,17 +302,11 @@ enum ClaudeUsage {
     /// which the client's `.iso8601` `JSONDecoder` can parse.
     private static func normalizeTS(_ value: Any?) -> String? {
         guard let raw = value as? String, let date = parseTimestamp(raw) else { return nil }
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime]
-        return iso.string(from: date)
+        return BridgeTimestamps.string(date)
     }
 
     private static func parseTimestamp(_ raw: String) -> Date? {
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = iso.date(from: raw) { return date }
-        iso.formatOptions = [.withInternetDateTime]
-        return iso.date(from: raw)
+        BridgeTimestamps.date(raw)
     }
 
     private static func loadClaude() throws -> ClaudeCredentials {

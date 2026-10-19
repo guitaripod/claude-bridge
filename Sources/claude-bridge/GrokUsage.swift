@@ -204,17 +204,11 @@ enum GrokUsage {
 
     private static func normalizeTS(_ value: Any?) -> String? {
         guard let raw = value as? String, let date = parseTimestamp(raw) else { return nil }
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime]
-        return iso.string(from: date)
+        return BridgeTimestamps.string(date)
     }
 
     private static func parseTimestamp(_ raw: String) -> Date? {
-        let iso = ISO8601DateFormatter()
-        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = iso.date(from: raw) { return date }
-        iso.formatOptions = [.withInternetDateTime]
-        return iso.date(from: raw)
+        BridgeTimestamps.date(raw)
     }
 
     private static func authPath() -> URL {
@@ -300,8 +294,8 @@ enum GrokUsage {
         }
         let newRefresh = json["refresh_token"] as? String ?? creds.refreshToken
         let expiresIn = (json["expires_in"] as? NSNumber)?.intValue ?? 21_600
-        let expiresAt = ISO8601DateFormatter().string(
-            from: Date().addingTimeInterval(TimeInterval(expiresIn)))
+        let expiresAt = BridgeTimestamps.string(
+            Date().addingTimeInterval(TimeInterval(expiresIn)))
         try writeBackGrok(
             entryKey: creds.entryKey,
             accessToken: access,
