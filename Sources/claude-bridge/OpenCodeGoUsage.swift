@@ -265,7 +265,7 @@ enum OpenCodeGoUsage {
             source: "opencode.ai console",
             live: false,
             gauges: [],
-            details: [UsageDetail(key: "Error", value: reason)],
+            details: [],
             error: reason)
     }
 
