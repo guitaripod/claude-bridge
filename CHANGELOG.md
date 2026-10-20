@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.15.1 — 2026-10-20
+
+- Installing over a bridge that a launchd job already starts no longer leaves the machine without one. `bootout` answers before the job is actually gone, so the `bootstrap` straight behind it was refused with "Input/output error" and the installer stopped there — job unloaded, program no longer running; it now keeps asking for a few seconds instead of taking the first refusal as the answer.
+
 ## 1.15.0 — 2026-10-20
 
 - A turn's push now says what happened, not only that it did. Beside the English alert it carries a `notice`: how long the turn took, how many tools it ran, how many lines it added and removed, the first of what it answered, the question it stopped on with its options, or the error and the prompt that failed. The phone writes the sentences in its own language from those facts and draws the buttons, a reply field and a long look from them. The alert also names its `category`, `relevance-score` and `target-content-id`, and a question is marked time sensitive. A phone that does not read the notice shows the same alert as before. The whole body stays under 3,800 bytes: the answer is shortened first, then the prompt, then the options' reasons.

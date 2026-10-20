@@ -502,8 +502,21 @@ install_service_macos() {
 EOF
   fi
   launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$LABEL.plist" >/dev/null 2>&1 ||
-    fail "could not load $LABEL"
+  load_service_macos "$HOME/Library/LaunchAgents/$LABEL.plist" || fail "could not load $LABEL"
+}
+
+# bootout answers before the job is actually gone, so a bootstrap straight after it is refused for
+# a second or two with "Input/output error". Taking that as the answer left a machine that had just
+# finished installing with no job loaded and no bridge running, so this keeps asking, and accepts a
+# job that is already there rather than calling it a failure.
+load_service_macos() {
+  local plist="$1" attempt=0
+  while ! launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1; do
+    launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && return 0
+    attempt=$(( attempt + 1 ))
+    [ "$attempt" -lt 15 ] || return 1
+    sleep 1
+  done
 }
 
 restart_service() {
