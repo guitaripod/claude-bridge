@@ -11,6 +11,15 @@
       }
     },
     {
+      "identity" : "codingagentkit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/guitaripod/CodingAgentKit.git",
+      "state" : {
+        "revision" : "e93dc797b036a1302ca0e8f51ab4c504626e26a2",
+        "version" : "0.42.0"
+      }
+    },
+    {
       "identity" : "hummingbird",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/hummingbird-project/hummingbird.git",
