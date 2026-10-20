@@ -477,7 +477,11 @@ EOF
     systemctl --user daemon-reload
   fi
   loginctl enable-linger "$USER" >/dev/null 2>&1 || true
-  systemctl --user enable --now "$UNIT" >/dev/null 2>&1 || fail "could not start $UNIT"
+  systemctl --user enable "$UNIT" >/dev/null 2>&1 || fail "could not enable $UNIT"
+  # enable --now is a no-op on a unit that is already running, which is what an install over an
+  # existing bridge finds: the new program lands and the old one keeps serving until the box
+  # reboots. restart starts a stopped unit just as well, so it is the whole answer here.
+  systemctl --user restart "$UNIT" >/dev/null 2>&1 || fail "could not start $UNIT"
 }
 
 install_service_macos() {

@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.15.2 — 2026-10-21
+
+- Installing a release over a bridge that systemd already runs now restarts it into the new program. `systemctl enable --now` does nothing to a unit that is already active, so the archive landed in `~/.claude-bridge/bin` while the old program went on serving and `--version` still answered with the one it replaced; the installer enables the unit and then restarts it, which starts a stopped one just as well.
+
 ## 1.15.1 — 2026-10-20
 
 - Installing over a bridge that a launchd job already starts no longer leaves the machine without one. `bootout` answers before the job is actually gone, so the `bootstrap` straight behind it was refused with "Input/output error" and the installer stopped there — job unloaded, program no longer running; it now keeps asking for a few seconds instead of taking the first refusal as the answer.
