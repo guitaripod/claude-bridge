@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.15.3 — 2026-10-21
+
+- Installing over a bridge that launchd already starts now leaves one running. Waiting for the job to come back after `bootout` also matched the job that was still on its way out, so the installer returned as though it had loaded the new one and the job then disappeared, leaving the machine with no bridge at all. It now waits for the old job to be gone before loading the plist, and asks again until launchd takes it.
+
 ## 1.15.2 — 2026-10-21
 
 - Installing a release over a bridge that systemd already runs now restarts it into the new program. `systemctl enable --now` does nothing to a unit that is already active, so the archive landed in `~/.claude-bridge/bin` while the old program went on serving and `--version` still answered with the one it replaced; the installer enables the unit and then restarts it, which starts a stopped one just as well.
