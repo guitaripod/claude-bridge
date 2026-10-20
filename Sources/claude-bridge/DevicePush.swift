@@ -172,7 +172,9 @@ actor DevicePusher {
             ],
             "sessionID": sessionID,
         ]
-        if let usage = await Self.usageObject() { payload["usage"] = usage }
+        if let data = await Self.usageJSON(), let usage = Self.usageObject(data) {
+            payload["usage"] = usage
+        }
         if let notice { payload = NoticePush.fitted(NoticePush.merged(payload, with: notice)) }
         await fanOut(
             payload: payload, topic: client.bundleTopic, pushType: "alert", priority: "10",
@@ -184,7 +186,7 @@ actor DevicePusher {
         guard Date().timeIntervalSince(lastSilentPushAt) >= Self.silentInterval else { return }
         let previous = lastSilentPushAt
         lastSilentPushAt = Date()
-        guard let usage = await Self.usageObject() else {
+        guard let data = await Self.usageJSON(), let usage = Self.usageObject(data) else {
             lastSilentPushAt = previous
             return
         }
@@ -226,16 +228,20 @@ actor DevicePusher {
     /// {"claude": snapshot?, "grok": snapshot?} with each key present only if
     /// that snapshot is live with gauges, sourced from the cached snapshot
     /// machinery — nil when neither qualifies.
-    private static func usageObject() async -> [String: Any]? {
+    /// The usage payload as JSON rather than as the dictionary APNs takes. `Data` is `Sendable`, so
+    /// an actor can carry it out of this nonisolated call; the dictionary is not, and a compiler
+    /// before Swift 6.4 refuses to send it across.
+    private static func usageJSON() async -> Data? {
         async let claudeSnapshot = ClaudeUsage.snapshot()
         async let grokSnapshot = GrokUsage.snapshot()
         let usage = PushUsage(
             claude: qualifying(await claudeSnapshot), grok: qualifying(await grokSnapshot))
         guard usage.claude != nil || usage.grok != nil else { return nil }
-        guard let data = try? JSONCoding.encoder.encode(usage),
-            let object = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        else { return nil }
-        return object
+        return try? JSONCoding.encoder.encode(usage)
+    }
+
+    private static func usageObject(_ data: Data) -> [String: Any]? {
+        (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
 
     private static func qualifying(_ snapshot: UsageSnapshot) -> UsageSnapshot? {
