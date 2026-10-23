@@ -4,6 +4,11 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.15.4 — 2026-10-23
+
+- A compaction is announced once and always closed, so a chat no longer shows it compacting until the app is restarted. The CLI repeats its compacting status while an automatic compaction writes its summary, and only the first of them now starts one. The result and the boundary record are one seam in either order, a failed result is a failure rather than a seam, and a turn that ends on a compaction the CLI never finished (a process that died, a stop) now says so.
+- opencode Go's usage card reads the account's own status: the plan, the real dollar ceilings and both ends of every window, with the reason in one place when it cannot answer. A cache from the estimate era is never served as current data, and two machines on one account fold into one card.
+
 ## 1.15.3 — 2026-10-21
 
 - Installing over a bridge that launchd already starts now leaves one running. Waiting for the job to come back after `bootout` also matched the job that was still on its way out, so the installer returned as though it had loaded the new one and the job then disappeared, leaving the machine with no bridge at all. It now waits for the old job to be gone before loading the plist, and asks again until launchd takes it.
