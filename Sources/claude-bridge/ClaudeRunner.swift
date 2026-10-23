@@ -100,6 +100,18 @@ struct Assembler {
     var costUSD: Double?
     var tokens: Int?
     private(set) var didCompact = false
+    /// Whether a compaction has been announced to the clients and not yet closed. The CLI repeats
+    /// its `compacting` status while an automatic compaction streams its summary, and only the
+    /// first of them is the compaction starting; the rest are progress, and a progress report
+    /// that outlived the finish would reopen a card nothing is left to close.
+    private var compactionOpen = false
+    /// The CLI records a finished compaction twice, as a status carrying its result and as a
+    /// boundary carrying its numbers, in either order, and the two are one seam between them. The
+    /// first record to arrive opens the seam and names here the record still owed to it; the second
+    /// finds that name and only fills the seam in. A record arriving with nothing owed it is a
+    /// compaction of its own.
+    private enum Owed { case result, boundary }
+    private var owed: Owed?
     /// The numbers the CLI reports for a compaction it just did, from its own boundary record.
     /// The transcript's copy carries the summary as well and replaces this once it lands.
     private var compactionMetadata: Compaction?
@@ -152,6 +164,10 @@ struct Assembler {
         case "user":
             ingestUser(object, emit: emit, report: report)
         case "result":
+            closeOpenCompaction(
+                stopped: false,
+                reason: (object["is_error"] as? Bool == true) ? object["result"] as? String : nil,
+                emit: emit)
             if let cost = object["total_cost_usd"] as? Double { costUSD = cost }
             if let usage = object["usage"] as? [String: Any] {
                 let input = usage["input_tokens"] as? Int ?? 0
@@ -192,19 +208,59 @@ struct Assembler {
     /// Compaction is a turn that spends minutes reading instead of answering, and the CLI is the
     /// only thing that knows it started. Forwarding those markers is what lets a client say
     /// "compacting" instead of showing a stalled response.
+    ///
+    /// The marker is forwarded once per attempt. An automatic compaction reports the characters
+    /// of its summary written so far on every `compacting` status it repeats, and a status with a
+    /// count above zero can only be the progress of an attempt that is already under way: one
+    /// arriving after the result would otherwise tell a client a second compaction had begun.
     private mutating func ingestCompactionStatus(
         _ object: [String: Any], emit: (BridgeEvent) -> Void
     ) {
         if let error = object["compact_error"] as? String {
+            compactionOpen = false
             emit(.compaction(phase: "failed", error: error))
-        } else if object["compact_result"] as? String != nil {
+        } else if let result = object["compact_result"] as? String {
+            guard result != "failed" else {
+                compactionOpen = false
+                emit(.compaction(phase: "failed", error: nil))
+                return
+            }
             didCompact = true
-            openSeam(emit: emit)
+            if owed == .result {
+                owed = nil
+            } else {
+                openSeam(emit: emit)
+                owed = .boundary
+            }
+            compactionOpen = false
             emit(.compaction(phase: "finished", error: nil))
         } else if object["status"] as? String == "compacting" {
+            let progress = (object["compact_output_chars"] as? NSNumber)?.intValue ?? 0
+            guard !compactionOpen, progress == 0 else { return }
+            compactionOpen = true
+            owed = nil
+            compactionMetadata = nil
             emit(.compaction(phase: "started", error: nil))
         }
     }
+
+    /// Closes a compaction the turn ended on without hearing the CLI finish it: a process that
+    /// died, a stop, a request that failed. Nothing else will ever tell the clients, which hold a
+    /// compaction as running until told otherwise and queue every prompt behind it meanwhile.
+    /// A stop is a clean end, so it only closes the card; anything else is a failure and says so.
+    mutating func closeOpenCompaction(
+        stopped: Bool, reason: String? = nil, emit: (BridgeEvent) -> Void
+    ) {
+        guard compactionOpen else { return }
+        compactionOpen = false
+        if stopped {
+            emit(.compaction(phase: "finished", error: nil))
+        } else {
+            emit(.compaction(phase: "failed", error: reason ?? Self.unfinishedCompaction))
+        }
+    }
+
+    static let unfinishedCompaction = "The compaction did not finish."
 
     /// The CLI's own record of a compaction it just did — trigger, tokens before and after, how
     /// long it took. The seam is opened here if the status markers did not already put it in
@@ -220,11 +276,13 @@ struct Assembler {
         compaction.tokensAfter = (meta["post_tokens"] as? NSNumber)?.intValue
         compaction.durationMs = (meta["duration_ms"] as? NSNumber)?.doubleValue
         compactionMetadata = compaction
-        if !didCompact {
+        if owed != .boundary {
             didCompact = true
             openSeam(emit: emit)
+            owed = .result
             return
         }
+        owed = nil
         for segment in segments.reversed() {
             guard case .compaction(let seamID) = segment else { continue }
             emit(.messageUpserted(seamMessage(seamID)))

@@ -739,7 +739,9 @@ actor SessionStore {
     /// The turn is over — the CLI closed it, or the process went. What was assembled is the
     /// answer, whole or cut short, and the store settles it the way it always has.
     private func closeTurn(_ id: String, fallback: String?) {
-        guard let turn = openTurns.removeValue(forKey: id) else { return }
+        guard var turn = openTurns.removeValue(forKey: id) else { return }
+        turn.assembler.closeOpenCompaction(
+            stopped: stoppedTurns.contains(id), emit: { self.publish(id, $0) })
         var messages = turn.assembler.finalMessages()
         if let fallback, messages.count == 1, Self.isBlank(messages[0]) {
             messages[0] = Message(
