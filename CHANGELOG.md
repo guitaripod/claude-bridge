@@ -4,6 +4,13 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.16.0 — 2026-10-23
+
+- A message queued behind a running turn now lives on the bridge, so every device on the conversation shows the same queue and can edit or cancel it, instead of the phone that queued it being the only one to know. `GET /sessions/:id/queue` reads it; `POST /sessions/:id/queue` adds an item under the client's own id (idempotent, and started at once when nothing is running), `PATCH` and `DELETE /sessions/:id/queue/:qid` change or cancel one that has not started (`409 already_started` once it has), and `POST /sessions/:id/queue/resume` lets a paused queue run. Every change is a `queue` event carrying the whole queue, `GET /sessions/:id` carries `queue` and `queuePaused`, and `/status` reports `"queue": 1` so an app can tell a bridge that holds one.
+- A queued message is not in the conversation until it starts: its user message is written when its turn begins, not when it was queued. The bridge starts the next one when a turn closes, a compaction included.
+- Stop pauses the queue instead of throwing it away, and a new message, an enqueue or Resume lets it run again. A queue survives a restart, attachments included, and comes back paused so nothing runs unattended after a crash.
+- An older app sending while a turn runs still works: its message joins the queue like any other, so a newer app sees it.
+
 ## 1.15.4 — 2026-10-23
 
 - A compaction is announced once and always closed, so a chat no longer shows it compacting until the app is restarted. The CLI repeats its compacting status while an automatic compaction writes its summary, and only the first of them now starts one. The result and the boundary record are one seam in either order, a failed result is a failure rather than a seam, and a turn that ends on a compaction the CLI never finished (a process that died, a stop) now says so.

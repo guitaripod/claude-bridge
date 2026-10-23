@@ -116,8 +116,8 @@ struct TurnSerializationTests {
         }
     }
 
-    @Test("Stopping a turn discards what queued behind it")
-    func abortDrainsTheQueue() async throws {
+    @Test("Stopping a turn holds what queued behind it instead of running it")
+    func abortHoldsTheQueue() async throws {
         let fake = try FakeClaude(holdSeconds: 1.5)
         defer { fake.cleanUp() }
         let (store, _) = makeStore(fake)
@@ -129,11 +129,13 @@ struct TurnSerializationTests {
 
         let result = await store.abortTurn(session.id)
         #expect(result.stopped)
-        #expect(result.discarded == 1)
+        #expect(result.discarded == 0)
+        #expect(result.paused)
 
         try await Task.sleep(for: .seconds(2))
         #expect(fake.starts == 1)
         #expect(await store.hasQueuedOrRunningTurn(session.id) == false)
+        #expect(await store.queueSnapshot(session.id).queue.count == 1)
     }
 
     @Test("A fork's first turn is not mistaken for its parent's")

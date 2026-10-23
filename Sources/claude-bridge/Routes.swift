@@ -98,6 +98,7 @@ private struct AbortResult: Encodable {
     let ok = true
     let stopped: Bool
     let discarded: Int
+    let paused: Bool
 }
 
 private func rawResponse(
@@ -164,6 +165,10 @@ struct BridgeStatus: Encodable {
     /// Protocol version of the per-conversation marks — saved, pinned, archived, last look — so a
     /// client can tell a bridge that holds them from one that cannot without a listing.
     let marks: Int
+    /// Protocol version of the shared queue (messages queued behind a running turn are held here,
+    /// not on the device that queued them), so a client can tell a bridge that holds one from an
+    /// older bridge, whose queue only the sending device knows.
+    let queue: Int
 }
 
 struct AuthCodeRequest: Decodable {
@@ -195,7 +200,7 @@ func registerRoutes(
                 version: BridgeVersion.describe(source: BridgeVersion.sourceDirectory()),
                 authenticated: await auth.status().loggedIn,
                 access: context.access,
-                proto: 2, epoch: await hub.epoch, turnWait: 1, marks: 1))
+                proto: 2, epoch: await hub.epoch, turnWait: 1, marks: 1, queue: 1))
     }
 
     /// One sequenced stream of everything: session deltas, list rows, agents, statuses. Every
@@ -550,6 +555,9 @@ func registerRoutes(
             let live = await liveness(of: session)
             session.active = live.active
             session.turnOpen = live.turnOpen
+            let held = await store.queueSnapshot(id)
+            session.queue = held.queue
+            session.queuePaused = held.paused
             if !live.turnOpen, let work = await store.backgroundWork(for: id) {
                 session.backgroundTasks = work.tasks
                 session.backgroundTask = work.task
@@ -828,9 +836,10 @@ func registerRoutes(
     router.post("sessions/:id/abort") { _, context in
         let id = context.parameters.get("id") ?? ""
         let result = await store.abortTurn(id)
-        if result.stopped || result.discarded > 0 {
+        if result.stopped || result.discarded > 0 || result.paused {
             return jsonResponse(
-                AbortResult(stopped: result.stopped, discarded: result.discarded))
+                AbortResult(
+                    stopped: result.stopped, discarded: result.discarded, paused: result.paused))
         }
         return jsonResponse(
             [
@@ -975,6 +984,66 @@ func registerRoutes(
         }
     }
 
+    /// The shared queue: what people queued behind a running turn, held where every client of the
+    /// conversation can see, change and cancel it. A refusal is `409 already_started`: the item
+    /// left the queue for a turn, which is what the client's stale copy was wrong about.
+    @Sendable func queueResponse(_ outcome: QueueChangeOutcome) -> Response {
+        switch outcome {
+        case .changed(let snapshot):
+            return jsonResponse(snapshot)
+        case .alreadyStarted:
+            return jsonResponse(["error": QueueRefusal.alreadyStarted], status: .conflict)
+        case .unknownSession:
+            return jsonResponse(["error": "not found"], status: .notFound)
+        }
+    }
+
+    router.get("sessions/:id/queue") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        await adoptIfNeeded(id)
+        guard await store.get(id) != nil else {
+            return jsonResponse(["error": "not found"], status: .notFound)
+        }
+        return jsonResponse(await store.queueSnapshot(id))
+    }
+
+    router.post("sessions/:id/queue") { request, context in
+        let id = context.parameters.get("id") ?? ""
+        guard let body = try? await decodeBody(EnqueueRequest.self, request, limit: 32 << 20) else {
+            return jsonResponse(["error": "bad request"], status: .badRequest)
+        }
+        await adoptIfNeeded(id)
+        switch await store.enqueue(id, request: body) {
+        case .unknownSession:
+            return jsonResponse(["error": "not found"], status: .notFound)
+        case .invalid(let reason):
+            return jsonResponse(["error": reason], status: .badRequest)
+        case .accepted(let started, let snapshot):
+            return jsonResponse(
+                EnqueueAccepted(started: started, queue: snapshot.queue, paused: snapshot.paused))
+        }
+    }
+
+    router.post("sessions/:id/queue/resume") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        return queueResponse(await store.resumeQueue(id))
+    }
+
+    router.patch("sessions/:id/queue/:qid") { request, context in
+        let id = context.parameters.get("id") ?? ""
+        let itemID = context.parameters.get("qid") ?? ""
+        guard let body = try? await decodeBody(EditQueuedRequest.self, request) else {
+            return jsonResponse(["error": "bad request"], status: .badRequest)
+        }
+        return queueResponse(await store.editQueued(id, itemID: itemID, request: body))
+    }
+
+    router.delete("sessions/:id/queue/:qid") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        let itemID = context.parameters.get("qid") ?? ""
+        return queueResponse(await store.cancelQueued(id, itemID: itemID))
+    }
+
     router.get("sessions/:id/agents") { _, context in
         let id = context.parameters.get("id") ?? ""
         let claudeID = (await store.get(id))?.claudeSessionID ?? id
@@ -1010,6 +1079,7 @@ func registerRoutes(
         } else {
             running = await index.isWriting(claudeID, within: 30)
         }
+        let greeting = await store.queueGreeting(id)
         let body = ResponseBody { writer in
             func write(_ event: BridgeEvent) async throws {
                 let data = (try? JSONCoding.encoder.encode(event)) ?? Data()
@@ -1021,6 +1091,7 @@ func registerRoutes(
             }
             do {
                 try await write(.status(running ? "running" : "idle"))
+                if let greeting { try await write(.queue(greeting)) }
                 try await withGracefulShutdownHandler {
                     for await event in stream {
                         try await write(event)

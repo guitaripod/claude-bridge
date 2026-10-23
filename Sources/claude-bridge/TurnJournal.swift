@@ -53,6 +53,17 @@ struct QueuedRecord: Codable, Sendable {
 /// and end on a human timescale, so the cost is irrelevant and the simplicity is not.
 struct TurnJournal: Codable, Sendable {
     var turns: [String: TurnRecord] = [:]
+    /// The shared queue of every session that has messages waiting. Unlike a turn's record it
+    /// outlives the turn: a queue is promised to the person who wrote it until they cancel it.
+    var queues: [String: PersistedQueue] = [:]
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        turns = try container.decodeIfPresent([String: TurnRecord].self, forKey: .turns) ?? [:]
+        queues = try container.decodeIfPresent([String: PersistedQueue].self, forKey: .queues) ?? [:]
+    }
 
     static func url(besides storeURL: URL) -> URL {
         storeURL.deletingLastPathComponent().appendingPathComponent("turns.json")

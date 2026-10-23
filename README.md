@@ -230,7 +230,7 @@ identity when the gate is on — see Security.
 | Method | Path | Body | Response |
 |---|---|---|---|
 | GET | `/health` | — | `ok` |
-| GET | `/status` | — | `{"agent": "claude", "model": …, "version": …, "authenticated": bool, "proto": 2, "epoch": …, "turnWait": 1, "marks": 1}` — `proto`/`epoch` announce the sequenced `/stream` protocol, `turnWait` the protocol version of `/sessions/:id/wait`, `marks` that conversations carry `saved`/`pinned`/`archived`/`readAt` |
+| GET | `/status` | — | `{"agent": "claude", "model": …, "version": …, "authenticated": bool, "proto": 2, "epoch": …, "turnWait": 1, "marks": 1, "queue": 1}` — `proto`/`epoch` announce the sequenced `/stream` protocol, `turnWait` the protocol version of `/sessions/:id/wait`, `marks` that conversations carry `saved`/`pinned`/`archived`/`readAt`, `queue` that this bridge holds the shared queue (see Shared queue) |
 | GET | `/stream` | `Last-Event-ID` header or `?since=epoch:seq` | one sequenced SSE stream of everything this bridge knows is happening (below) |
 | GET | `/auth` | — | whether the CLI is signed in, as whom, and the sign-in in progress if there is one |
 | POST | `/auth/login` | — | starts `claude auth login` on a pseudo-terminal and answers with the URL it printed |
@@ -248,8 +248,13 @@ identity when the gate is on — see Security.
 | GET | `/sessions/:id/revision` | — | `{updatedAt, active, turnOpen, background*}` — the session's state in one small answer, for a client polling while its stream is quiet |
 | PATCH | `/sessions/:id` | `{title?, saved?, pinned?, archived?, read?: "seen"\|"unread", at?}` | `{"ok": true}` (404 if a title names an unknown session; marks are accepted for any id). `at` is when the person decided: each mark keeps the later decision, not the later arrival |
 | DELETE | `/sessions/:id` | — | `{"ok": true}` |
-| POST | `/sessions/:id/message` | `{text, model?, effort?, attachments?}` | `202 {"ok": true, "queued": false}`; the turn runs async, watch `/events`. A prompt sent while this bridge is already running a turn on the session is accepted and **queued** behind it — `202 {"ok": true, "queued": true, "position": n}` — so two clients on one session cannot start two `claude` processes against one transcript. `409` when the session is being written by a turn started outside this bridge (a terminal), which it cannot serialize against |
-| POST | `/sessions/:id/abort` | — | `{"ok": true, "stopped": bool, "discarded": n}`; stops the turn in flight and discards anything queued behind it. `409` when there is nothing to stop from here |
+| POST | `/sessions/:id/message` | `{text, model?, effort?, attachments?}` | `202 {"ok": true, "queued": false}`; the turn runs async, watch `/events`. A prompt sent while this bridge is already running a turn on the session is accepted and **queued** behind it as an item of the shared queue (no transcript echo until it starts) — `202 {"ok": true, "queued": true, "position": n}` — so two clients on one session cannot start two `claude` processes against one transcript. `409` when the session is being written by a turn started outside this bridge (a terminal), which it cannot serialize against |
+| POST | `/sessions/:id/abort` | — | `{"ok": true, "stopped": bool, "discarded": n, "paused": bool}`; stops the turn in flight and pauses the shared queue behind it, keeping its items (`discarded` is only ever internal continuations now). `409` when there is nothing to stop from here |
+| GET | `/sessions/:id/queue` | — | the shared queue: `{"queue": [Item], "paused": bool}` |
+| POST | `/sessions/:id/queue` | `{id, text, kind?: "prompt"\|"command", model?, effort?, attachments?}` | `{"started": bool, "queue": [Item], "paused": bool}`. `id` is the client's own UUID and makes the call idempotent. Nothing running: the item starts at once (`started: true`) and never appears in the queue. Otherwise it is appended. Either way the queue stops being paused. `400` for an empty id, an unknown `kind` or an item with neither text nor attachment |
+| PATCH | `/sessions/:id/queue/:qid` | `{text?, model?, effort?}` | the snapshot; `409 {"error": "already_started"}` when the item started or is gone |
+| DELETE | `/sessions/:id/queue/:qid` | — | the snapshot (also when the id is already gone, so a retry is safe); `409 {"error": "already_started"}` when it has started |
+| POST | `/sessions/:id/queue/resume` | — | the snapshot; clears `paused` and starts the head when the session is idle |
 | POST | `/sessions/:id/background/stop` | — | `{ended}` — ends the background shells the conversation's process is carrying; `409 {error}` names why it would not |
 | POST | `/sessions/:id/clear` | — | `{"ok": true}`; drops history and the resumable Claude session id. `409` while a turn is running or queued — fork instead |
 | POST | `/sessions/:id/fork` | — | new `Session` (404 if unknown) seeded with the source's history; its first turn runs `--fork-session` so it diverges instead of mutating the parent |
@@ -318,16 +323,44 @@ on it.
 
 ## One turn at a time
 
-A session runs one turn. A prompt that arrives while a turn is in flight is appended to the
-transcript and broadcast like any other, then queued behind it and started when that turn ends —
-so a phone and a desktop can both drive one session without two `claude` processes
-running against one transcript in one working directory, each blind to the other's edits.
+A session runs one turn. A prompt that arrives while a turn is in flight is queued behind it and
+started when that turn ends, so a phone and a desktop can both drive one session without two
+`claude` processes running against one transcript in one working directory, each blind to the
+other's edits.
 
 The session goes `idle` only when nothing is left waiting, which is what stops a client's own
-send queue from draining into turns nobody asked for. Stopping a turn discards what queued behind
-it. `/clear` refuses while a turn is held, because pulling the transcript out from under a running
+send queue from draining into turns nobody asked for. Stopping a turn pauses the queue behind it.
+`/clear` refuses while a turn is held, because pulling the transcript out from under a running
 turn loses it; fork instead. A turn started outside this bridge — an interactive `claude` in a
 terminal — cannot be serialized against, so `/message` still answers `409` for that case alone.
+
+## Shared queue
+
+A message queued behind a running turn lives on the bridge, not on the device that queued it, so
+every client of the conversation shows the same queue and can edit or cancel it. The bridge drains
+it: when a turn closes (a compaction is a turn, so it is respected) the head starts, unless the
+queue is paused.
+
+An item is `{id, text, kind, model?, effort?, attachments, createdAt}`. `kind` is `prompt` or
+`command` (a slash command such as `/compact`). `attachments` is metadata only, `{mime, filename,
+size}`; the bytes arrive once, with the enqueue, as `dataBase64` exactly as `POST
+/sessions/:id/message` takes them, and are kept under the session's attachments directory until the
+item starts or is cancelled.
+
+- **Not in the transcript until it starts.** A queued item has no user message. The message is
+  written and broadcast when the item starts, as a normal send does.
+- **Stop pauses.** `POST /sessions/:id/abort` ends the running turn and sets `paused`; the items
+  stay. A new message, an enqueue or `POST /sessions/:id/queue/resume` clears it.
+- **Restarts.** The queue (items, attachment files, `paused`) is kept in the turn journal
+  (`turns.json`). A queue restored after a restart comes back `paused: true`, so nothing runs
+  unattended after a crash.
+- **Old clients.** `POST /sessions/:id/message` stays. Sent while a turn runs, it becomes an item
+  with a bridge-made id, so a message from an old client shows in new clients' queues.
+- **Events.** Every change (enqueue, edit, cancel, the start of an item, pause, resume, restore)
+  is an SSE frame `{"type": "queue", "queue": [Item], "paused": bool}` carrying the whole
+  snapshot, also on `/stream`. The hello of `/sessions/:id/events` includes the snapshot when the
+  queue is non-empty or paused. `GET /sessions/:id` carries `queue` and `queuePaused`.
+- **Order** is arrival order at the bridge; there is no reordering.
 
 ## A turn the machine cut off
 

@@ -70,6 +70,19 @@ actor SessionStore {
     /// a second `claude -p --resume` against the same transcript in the same working directory.
     private var inFlight: Set<String> = []
     private var pendingPrompts: [String: [QueuedPrompt]] = [:]
+    /// The messages people queued behind a running turn, per session, in arrival order. Held here
+    /// rather than on each device so every client of the conversation sees and can change the
+    /// same queue; the journal keeps it across a restart.
+    private var sharedQueues: [String: [HeldQueueItem]] = [:]
+    /// Sessions whose queue is not draining: a Stop ended the running turn, or a restart brought
+    /// the queue back and nobody has said to carry on. Cleared by a new message, an enqueue or a
+    /// resume.
+    private var pausedQueues: Set<String> = []
+    /// The newest ids of queue items that left the queue for a turn, so a retried enqueue does not
+    /// run twice and a cancel can tell "already started" from "already gone".
+    private var startedQueueIDs: [String: [String]] = [:]
+    /// Sessions whose queue came back from the journal at boot, announced once the hub is wired.
+    private var restoredQueueIDs: [String] = []
     /// How many turns in a row this bridge has started on its own to finish background work the
     /// previous turn left running. Reset by any prompt a person sends, so the cap only ever counts
     /// unattended continuations.
@@ -209,6 +222,33 @@ actor SessionStore {
             sessions[session.id] = session
             order.append(session.id)
         }
+        let restored = Self.restoredQueues(journal: &journal, sessions: sessions)
+        sharedQueues = restored.items
+        pausedQueues = Set(restored.ids)
+        restoredQueueIDs = restored.ids
+        if restored.rewritten { journal.write(to: journalURL) }
+    }
+
+    /// Brings the journaled queues back, all of them paused: after a restart or a crash nothing
+    /// runs unattended, and the clients offer Resume. A queue whose session is gone is dropped.
+    private static func restoredQueues(
+        journal: inout TurnJournal, sessions: [String: Session]
+    ) -> (items: [String: [HeldQueueItem]], ids: [String], rewritten: Bool) {
+        var items: [String: [HeldQueueItem]] = [:]
+        var changed = false
+        for (id, queue) in journal.queues.sorted(by: { $0.key < $1.key }) {
+            guard sessions[id] != nil, !queue.items.isEmpty else {
+                journal.queues[id] = nil
+                changed = true
+                continue
+            }
+            items[id] = queue.items
+            if !queue.paused {
+                journal.queues[id]?.paused = true
+                changed = true
+            }
+        }
+        return (items, items.keys.sorted(), changed)
     }
 
     func list(
@@ -380,6 +420,16 @@ actor SessionStore {
         dropProcess(id)
         persistNow()
         forgetMarks(id)
+        discardQueue(id)
+    }
+
+    /// A deleted conversation takes its queue, and the files kept for it, with it.
+    private func discardQueue(_ id: String) {
+        for held in sharedQueues.removeValue(forKey: id) ?? [] { removeFiles(of: held) }
+        pausedQueues.remove(id)
+        startedQueueIDs[id] = nil
+        guard journal.queues.removeValue(forKey: id) != nil else { return }
+        journal.write(to: journalURL)
     }
 
     /// A deleted conversation takes its marks with it, the bookmark file included.
@@ -459,18 +509,31 @@ actor SessionStore {
         return created
     }
 
-    /// Records the user's prompt, then either runs a Claude turn or queues the prompt behind the
-    /// one already running. The message is appended and broadcast either way: a client drops its
-    /// optimistic echo by user-message count, so a prompt the server accepted but has not started
-    /// still has to exist in the transcript.
+    /// Runs a Claude turn for a prompt typed now, or, when a turn is already running, queues it
+    /// for every client to see. A message that starts a turn is recorded and broadcast at once; a
+    /// queued one is not part of the conversation until it starts, so a client shows it in the
+    /// queue and nowhere else. Both outcomes are accepted (202): a client treats any non-2xx as
+    /// message-lost and hands the text back to the composer.
     @discardableResult
     func send(_ id: String, request: SendRequest) -> SendOutcome {
         autoContinues[id] = 0
         cooldowns[id] = nil
-        let upload = storeAttachments(for: request, sessionID: id)
-        return accept(
-            id, display: request.text, runnerPrompt: upload.prompt, files: upload.files,
-            model: request.model, effort: request.effort)
+        guard sessions[id] != nil else { return .unknownSession }
+        if pausedQueues.remove(id) != nil { publishQueue(id) }
+        guard inFlight.contains(id) else {
+            let upload = storeAttachments(for: request, sessionID: id)
+            return accept(
+                id, display: request.text, runnerPrompt: upload.prompt, files: upload.files,
+                model: request.model, effort: request.effort)
+        }
+        let stored = keepAttachments(request.attachments ?? [], sessionID: id)
+        sharedQueues[id, default: []].append(
+            Self.held(
+                id: UUID().uuidString, text: request.text,
+                kind: request.text.hasPrefix("/") ? QueuedItem.commandKind : QueuedItem.promptKind,
+                model: request.model, effort: request.effort, stored: stored))
+        publishQueue(id)
+        return .queued(position: (pendingPrompts[id]?.count ?? 0) + (sharedQueues[id]?.count ?? 0))
     }
 
     /// One prompt, in the two forms a turn needs it: what the person sees in their own transcript,
@@ -483,8 +546,27 @@ actor SessionStore {
         _ id: String, display: String, runnerPrompt: String, files: [FileRef],
         model: String?, effort: String?
     ) -> SendOutcome {
-        guard var session = sessions[id] else { return .unknownSession }
+        guard recordUserMessage(id, display: display, files: files) else {
+            return .unknownSession
+        }
+        let queued = QueuedPrompt(
+            prompt: runnerPrompt, displayPrompt: display, model: model, effort: effort)
+        guard !inFlight.contains(id) else {
+            pendingPrompts[id, default: []].append(queued)
+            journal.turns[id]?.queued.append(queued.record)
+            journal.write(to: journalURL)
+            return .queued(position: pendingPrompts[id]?.count ?? 1)
+        }
+        inFlight.insert(id)
+        startTurn(id, queued)
+        return .started
+    }
 
+    /// Puts the user's words in the conversation and on the wire. A client drops its optimistic
+    /// echo by user-message count, so the message exists the moment its turn is accepted or, for
+    /// a queued one, the moment it starts.
+    private func recordUserMessage(_ id: String, display: String, files: [FileRef]) -> Bool {
+        guard var session = sessions[id] else { return false }
         let userMessage = Message(
             id: UUID().uuidString, role: .user,
             parts: files.map { Part.file($0) } + [.text(display)], createdAt: Date())
@@ -499,18 +581,7 @@ actor SessionStore {
         moveToFront(id)
         persist()
         broadcaster(for: id).send(.messageUpserted(userMessage))
-
-        let queued = QueuedPrompt(
-            prompt: runnerPrompt, displayPrompt: display, model: model, effort: effort)
-        guard !inFlight.contains(id) else {
-            pendingPrompts[id, default: []].append(queued)
-            journal.turns[id]?.queued.append(queued.record)
-            journal.write(to: journalURL)
-            return .queued(position: pendingPrompts[id]?.count ?? 1)
-        }
-        inFlight.insert(id)
-        startTurn(id, queued)
-        return .started
+        return true
     }
 
     /// Launches one `claude -p` for a prompt whose turn slot this session already holds.
@@ -1011,15 +1082,28 @@ actor SessionStore {
     private func storeAttachments(
         for request: SendRequest, sessionID: String
     ) -> (prompt: String, files: [FileRef]) {
-        let attachments = request.attachments ?? []
-        guard !attachments.isEmpty else { return (request.text, []) }
+        let files = keepAttachments(request.attachments ?? [], sessionID: sessionID).map(\.file)
+        return (Self.prompt(request.text, files: files), files)
+    }
+
+    /// An attachment the bridge wrote to disk, and how many bytes it holds.
+    private struct StoredAttachment {
+        let file: FileRef
+        let size: Int
+    }
+
+    /// Writes uploaded attachments under the session's attachments directory. A file somebody
+    /// queued is protected from pruning for as long as its item waits.
+    private func keepAttachments(
+        _ attachments: [SendAttachment], sessionID: String
+    ) -> [StoredAttachment] {
+        guard !attachments.isEmpty else { return [] }
         let session = Self.safeFileComponent(sessionID)
         let dir = storeURL.deletingLastPathComponent()
             .appendingPathComponent("attachments", isDirectory: true)
             .appendingPathComponent(session, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        var references: [String] = []
-        var files: [FileRef] = []
+        var stored: [StoredAttachment] = []
         for attachment in attachments {
             guard let data = Data(base64Encoded: attachment.dataBase64), !data.isEmpty else {
                 continue
@@ -1027,17 +1111,28 @@ actor SessionStore {
             let name = "\(UUID().uuidString.prefix(8))-\(Self.attachmentName(attachment))"
             let url = dir.appendingPathComponent(name)
             guard (try? data.write(to: url)) != nil else { continue }
-            let kind = attachment.mime.hasPrefix("image/") ? "image" : "file"
-            references.append("Attached \(kind) (use the Read tool to view it): \(url.path)")
-            files.append(
-                FileRef(
-                    path: url.path, mime: attachment.mime,
-                    filename: attachment.filename ?? name,
-                    url: "/attachments/\(session)/\(name)"))
+            stored.append(
+                StoredAttachment(
+                    file: FileRef(
+                        path: url.path, mime: attachment.mime,
+                        filename: attachment.filename ?? name,
+                        url: "/attachments/\(session)/\(name)"),
+                    size: data.count))
         }
-        Self.pruneAttachments(in: dir)
-        guard !references.isEmpty else { return (request.text, files) }
-        return (request.text + "\n\n" + references.joined(separator: "\n"), files)
+        let waiting = Set((sharedQueues[sessionID] ?? []).flatMap { $0.files.map(\.path) })
+        Self.pruneAttachments(in: dir, keeping: waiting.union(stored.map(\.file.path)))
+        return stored
+    }
+
+    /// The prompt the CLI is handed: the words, then where each attached file is so the Read tool
+    /// can open it.
+    private static func prompt(_ text: String, files: [FileRef]) -> String {
+        guard !files.isEmpty else { return text }
+        let references = files.map { file -> String in
+            let kind = file.mime.hasPrefix("image/") ? "image" : "file"
+            return "Attached \(kind) (use the Read tool to view it): \(file.path)"
+        }
+        return text + "\n\n" + references.joined(separator: "\n")
     }
 
     /// Absolute path of a stored attachment, or nil if the name escapes the
@@ -1077,7 +1172,7 @@ actor SessionStore {
 
     /// Keeps a session's attachment directory bounded: oldest files beyond the
     /// cap are deleted (they were only needed for the turn that referenced them).
-    private static func pruneAttachments(in dir: URL, cap: Int = 32) {
+    private static func pruneAttachments(in dir: URL, cap: Int = 32, keeping: Set<String> = []) {
         guard
             let files = try? FileManager.default.contentsOfDirectory(
                 at: dir, includingPropertiesForKeys: [.contentModificationDateKey])
@@ -1087,7 +1182,8 @@ actor SessionStore {
             (url, (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
                 .contentModificationDate ?? .distantPast)
         }
-        for (url, _) in dated.sorted(by: { $0.1 < $1.1 }).prefix(files.count - cap) {
+        let expendable = dated.filter { !keeping.contains($0.0.path) }
+        for (url, _) in expendable.sorted(by: { $0.1 < $1.1 }).prefix(files.count - cap) {
             try? FileManager.default.removeItem(at: url)
         }
     }
@@ -1207,30 +1303,32 @@ actor SessionStore {
         session.claudeSessionID = new
     }
 
-    /// Stops a turn this bridge is running by terminating its claude process and discards anything
-    /// queued behind it; the runner's stream ends and the partial turn is persisted normally. Stop
-    /// means stop — leaving the queue to drain would start a fresh turn the moment the one the user
-    /// just killed ended.
+    /// Stops a turn this bridge is running by terminating its claude process and pauses the queue
+    /// behind it; the runner's stream ends and the partial turn is persisted normally. Stop means
+    /// stop: leaving the queue to drain would start a fresh turn the moment the one the user just
+    /// killed ended, but what people queued is theirs to cancel, so the items stay until a new
+    /// message, an enqueue or a resume lets the queue run again.
     ///
     /// The turn is interrupted the way the TUI's Escape does it, which keeps the process and the
     /// background work it carries; a process that does not answer the interrupt is terminated.
-    func abortTurn(_ id: String) -> (stopped: Bool, discarded: Int) {
+    func abortTurn(_ id: String) -> (stopped: Bool, discarded: Int, paused: Bool) {
         let discarded = pendingPrompts.removeValue(forKey: id)?.count ?? 0
         let stopping = openTurns[id] != nil
+        let paused = (stopping || !(sharedQueues[id] ?? []).isEmpty) && pauseQueue(id)
         if journal.turns[id] != nil {
             journal.turns[id]?.queued = []
             if stopping { journal.turns[id]?.stopped = true }
             journal.write(to: journalURL)
         }
-        guard stopping else { return (false, discarded) }
+        guard stopping else { return (false, discarded, paused) }
         stoppedTurns.insert(id)
         let pusher = self.pusher
         let now = Date()
         Task { await pusher.noteStopped(sessionID: id, now: now) }
         guard let process = processes[id] else {
-            guard let pid = turnProcessIDs[id] else { return (false, discarded) }
+            guard let pid = turnProcessIDs[id] else { return (false, discarded, paused) }
             kill(pid, SIGTERM)
-            return (true, discarded)
+            return (true, discarded, paused)
         }
         let grace = abortGrace
         Task { [weak self] in
@@ -1241,7 +1339,7 @@ actor SessionStore {
             try? await Task.sleep(for: .seconds(grace))
             await self?.endIfStillStopping(id, process)
         }
-        return (true, discarded)
+        return (true, discarded, paused)
     }
 
     /// An interrupt the CLI accepted and then never closed the turn for — a tool it could not
@@ -1249,6 +1347,179 @@ actor SessionStore {
     private func endIfStillStopping(_ id: String, _ process: ClaudeProcess) async {
         guard openTurns[id] != nil, processes[id] === process else { return }
         await process.terminate()
+    }
+
+    /// What a client draws: the items waiting, in arrival order, and whether draining is held back.
+    func queueSnapshot(_ id: String) -> QueueSnapshot {
+        QueueSnapshot(queue: (sharedQueues[id] ?? []).map(\.item), paused: pausedQueues.contains(id))
+    }
+
+    /// The snapshot a new subscriber is greeted with, or `nil` when there is nothing to say.
+    func queueGreeting(_ id: String) -> QueueSnapshot? {
+        let snapshot = queueSnapshot(id)
+        return snapshot.queue.isEmpty && !snapshot.paused ? nil : snapshot
+    }
+
+    /// Tells the subscribers of every queue that came back from the journal that it is there, and
+    /// paused. Run once the hub is wired, so the bridge-wide stream hears it too.
+    private func announceRestoredQueues() {
+        let restored = restoredQueueIDs
+        restoredQueueIDs = []
+        for id in restored { broadcaster(for: id).send(.queue(queueSnapshot(id))) }
+    }
+
+    /// Writes the session's queue to the journal and tells every client what it now holds.
+    private func publishQueue(_ id: String) {
+        if let items = sharedQueues[id], !items.isEmpty {
+            journal.queues[id] = PersistedQueue(items: items, paused: pausedQueues.contains(id))
+        } else {
+            journal.queues[id] = nil
+        }
+        journal.write(to: journalURL)
+        broadcaster(for: id).send(.queue(queueSnapshot(id)))
+    }
+
+    /// Holds the queue back. True when this call is what paused it.
+    private func pauseQueue(_ id: String) -> Bool {
+        guard pausedQueues.insert(id).inserted else { return false }
+        publishQueue(id)
+        return true
+    }
+
+    private static let startedMemory = 64
+
+    private func rememberStarted(_ id: String, _ itemID: String) {
+        var recent = startedQueueIDs[id] ?? []
+        recent.append(itemID)
+        startedQueueIDs[id] = Array(recent.suffix(Self.startedMemory))
+    }
+
+    private static func held(
+        id: String, text: String, kind: String, model: String?, effort: String?,
+        stored: [StoredAttachment]
+    ) -> HeldQueueItem {
+        HeldQueueItem(
+            item: QueuedItem(
+                id: id, text: text, kind: kind, model: model, effort: effort,
+                attachments: stored.map {
+                    QueueAttachment(
+                        mime: $0.file.mime, filename: $0.file.filename ?? "", size: $0.size)
+                },
+                createdAt: Date()),
+            files: stored.map(\.file))
+    }
+
+    private func removeFiles(of held: HeldQueueItem) {
+        for file in held.files { try? FileManager.default.removeItem(atPath: file.path) }
+    }
+
+    /// Takes the first item off the queue, if the queue has one.
+    private func popQueueHead(_ id: String) -> HeldQueueItem? {
+        guard var queue = sharedQueues[id], !queue.isEmpty else { return nil }
+        let head = queue.removeFirst()
+        sharedQueues[id] = queue.isEmpty ? nil : queue
+        publishQueue(id)
+        return head
+    }
+
+    /// Starts a turn for an item that has left the queue. This is the moment its user message
+    /// exists: the transcript only ever holds what has been sent to the model.
+    private func startQueued(_ id: String, _ held: HeldQueueItem) {
+        rememberStarted(id, held.item.id)
+        guard recordUserMessage(id, display: held.item.text, files: held.files) else {
+            inFlight.remove(id)
+            return
+        }
+        inFlight.insert(id)
+        startTurn(
+            id,
+            QueuedPrompt(
+                prompt: Self.prompt(held.item.text, files: held.files).trimmingCharacters(
+                    in: .whitespacesAndNewlines),
+                displayPrompt: held.item.text, model: held.item.model, effort: held.item.effort))
+    }
+
+    /// Starts the head of the queue when nothing is running and nothing holds the queue back.
+    private func drainQueueIfIdle(_ id: String) {
+        guard !inFlight.contains(id), !pausedQueues.contains(id), sessions[id] != nil,
+            let head = popQueueHead(id)
+        else { return }
+        startQueued(id, head)
+    }
+
+    /// Queues a message behind the running turn, or starts it at once when nothing is running.
+    /// Idempotent on the client's id: an item already queued, or one that already started, is
+    /// answered with the current snapshot and changes nothing.
+    func enqueue(_ id: String, request: EnqueueRequest) -> EnqueueOutcome {
+        guard sessions[id] != nil else { return .unknownSession }
+        let itemID = request.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !itemID.isEmpty else { return .invalid("An item needs an id.") }
+        let kind = request.kind ?? QueuedItem.promptKind
+        guard kind == QueuedItem.promptKind || kind == QueuedItem.commandKind else {
+            return .invalid("kind is prompt or command.")
+        }
+        if (sharedQueues[id] ?? []).contains(where: { $0.item.id == itemID }) {
+            return .accepted(started: false, snapshot: queueSnapshot(id))
+        }
+        if startedQueueIDs[id]?.contains(itemID) == true {
+            return .accepted(started: true, snapshot: queueSnapshot(id))
+        }
+        let attachments = request.attachments ?? []
+        guard !request.text.isEmpty || !attachments.isEmpty else {
+            return .invalid("An item needs text or an attachment.")
+        }
+        autoContinues[id] = 0
+        cooldowns[id] = nil
+        let held = Self.held(
+            id: itemID, text: request.text, kind: kind, model: request.model,
+            effort: request.effort, stored: keepAttachments(attachments, sessionID: id))
+        let wasPaused = pausedQueues.remove(id) != nil
+        if !inFlight.contains(id), (sharedQueues[id] ?? []).isEmpty {
+            if wasPaused { publishQueue(id) }
+            startQueued(id, held)
+            return .accepted(started: true, snapshot: queueSnapshot(id))
+        }
+        sharedQueues[id, default: []].append(held)
+        publishQueue(id)
+        drainQueueIfIdle(id)
+        return .accepted(started: false, snapshot: queueSnapshot(id))
+    }
+
+    /// Changes a queued item's words, model or effort. An item that has started, or is gone, can
+    /// no longer be changed.
+    func editQueued(_ id: String, itemID: String, request: EditQueuedRequest) -> QueueChangeOutcome {
+        guard sessions[id] != nil else { return .unknownSession }
+        guard var queue = sharedQueues[id], let index = queue.firstIndex(where: { $0.item.id == itemID })
+        else { return .alreadyStarted }
+        if let text = request.text { queue[index].item.text = text }
+        if let model = request.model { queue[index].item.model = model.isEmpty ? nil : model }
+        if let effort = request.effort { queue[index].item.effort = effort.isEmpty ? nil : effort }
+        sharedQueues[id] = queue
+        publishQueue(id)
+        return .changed(queueSnapshot(id))
+    }
+
+    /// Takes an item out of the queue. Cancelling what is already gone is fine, so a retry is
+    /// safe; cancelling what has started is not.
+    func cancelQueued(_ id: String, itemID: String) -> QueueChangeOutcome {
+        guard sessions[id] != nil else { return .unknownSession }
+        guard var queue = sharedQueues[id], let index = queue.firstIndex(where: { $0.item.id == itemID })
+        else {
+            return startedQueueIDs[id]?.contains(itemID) == true
+                ? .alreadyStarted : .changed(queueSnapshot(id))
+        }
+        removeFiles(of: queue.remove(at: index))
+        sharedQueues[id] = queue.isEmpty ? nil : queue
+        publishQueue(id)
+        return .changed(queueSnapshot(id))
+    }
+
+    /// Lets a held queue run again, starting its head when the session is idle.
+    func resumeQueue(_ id: String) -> QueueChangeOutcome {
+        guard sessions[id] != nil else { return .unknownSession }
+        if pausedQueues.remove(id) != nil { publishQueue(id) }
+        drainQueueIfIdle(id)
+        return .changed(queueSnapshot(id))
     }
 
     /// True while this bridge holds a turn slot for the session — including a prompt still waiting
@@ -1410,6 +1681,7 @@ actor SessionStore {
     /// slot is still held at this point and ``advanceQueue`` runs immediately after.
     private func queueBackgroundContinuation(_ id: String, answer: String = "") {
         guard pendingPrompts[id]?.isEmpty ?? true else { return }
+        guard pausedQueues.contains(id) || (sharedQueues[id] ?? []).isEmpty else { return }
         guard let session = sessions[id] else { return }
         guard session.interruption == nil else { return }
         let attempts = autoContinues[id] ?? 0
@@ -1494,6 +1766,10 @@ actor SessionStore {
             return
         }
         pendingPrompts[id] = nil
+        if !pausedQueues.contains(id), let head = popQueueHead(id) {
+            startQueued(id, head)
+            return
+        }
         inFlight.remove(id)
         clearJournal(id)
         broadcaster(for: id).send(.status("idle"))
@@ -1536,6 +1812,7 @@ actor SessionStore {
     /// to continue. What there is no longer is a fourth outcome where a conversation simply sits
     /// there looking finished.
     func recoverJournaledTurns() async {
+        announceRestoredQueues()
         guard !journal.turns.isEmpty else { return }
         let bootedAt = MachineUptime.bootedAt()
         let records = journal.turns.values.sorted { $0.startedAt < $1.startedAt }

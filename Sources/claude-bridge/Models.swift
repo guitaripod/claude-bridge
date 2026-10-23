@@ -205,6 +205,11 @@ struct Session: Codable, Sendable {
     var backgroundTask: String?
     var backgroundSince: Date?
     var backgroundStalled: Bool?
+    /// Stamped when a session is served, never stored: the messages waiting behind the running
+    /// turn, in arrival order, and whether draining is held back after a Stop or a restart. The
+    /// queue itself lives in the journal, so every client reads the same one.
+    var queue: [QueuedItem]?
+    var queuePaused: Bool?
 
     var summary: SessionSummary {
         SessionSummary(
@@ -422,10 +427,14 @@ enum BridgeEvent: Codable, Sendable {
     /// still working for the chat, which a client that can only say running or idle has to call
     /// idle.
     case background(BackgroundWork?)
+    /// The shared queue changed. Always the whole snapshot, so a client that missed an earlier
+    /// frame is right again after any later one.
+    case queue(QueueSnapshot)
 
     private enum CodingKeys: String, CodingKey {
         case type, message, messageID, delta, tool, status, error, goal, phase, interruption
         case tasks, task, since, stalled
+        case queue, paused
     }
 
     func encode(to encoder: Encoder) throws {
@@ -464,6 +473,10 @@ enum BridgeEvent: Codable, Sendable {
             try c.encodeIfPresent(work?.task, forKey: .task)
             try c.encodeIfPresent(work?.since, forKey: .since)
             try c.encodeIfPresent(work?.stalled, forKey: .stalled)
+        case .queue(let snapshot):
+            try c.encode("queue", forKey: .type)
+            try c.encode(snapshot.queue, forKey: .queue)
+            try c.encode(snapshot.paused, forKey: .paused)
         }
     }
 
@@ -496,6 +509,11 @@ enum BridgeEvent: Codable, Sendable {
                         since: try c.decodeIfPresent(Date.self, forKey: .since),
                         stalled: try c.decodeIfPresent(Bool.self, forKey: .stalled))
                     : nil)
+        case "queue":
+            self = .queue(
+                QueueSnapshot(
+                    queue: try c.decodeIfPresent([QueuedItem].self, forKey: .queue) ?? [],
+                    paused: try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false))
         default: self = .error(try c.decode(String.self, forKey: .error))
         }
     }
