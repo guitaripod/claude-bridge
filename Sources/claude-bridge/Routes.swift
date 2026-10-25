@@ -359,6 +359,14 @@ func registerRoutes(
         return jsonResponse(status, status: accepted ? .accepted : .conflict)
     }
 
+    /// Starts over with or without a newer build waiting, because a bridge reads its config, models
+    /// and plugins once and a restart is the only way back to a change made since. It waits for the
+    /// machine to go quiet exactly as a restart onto a new build does, so no turn is taken with it.
+    router.post("restart") { _, _ in
+        let (accepted, status) = await updater.restart(anyway: true)
+        return jsonResponse(status, status: accepted ? .accepted : .conflict)
+    }
+
     /// Whether this machine keeps itself current on its own. The setting belongs to the machine
     /// rather than to whichever device last asked, so every client reads back the same answer.
     router.post("update/auto") { request, _ in

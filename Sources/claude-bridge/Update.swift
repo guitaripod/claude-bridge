@@ -950,7 +950,10 @@ actor UpdateService {
     /// bridge there" — a terminal instruction for the one thing the bridge can do to itself. It
     /// refuses without a supervisor, because a bridge that exits with nothing to start it again is a
     /// machine no phone can reach.
-    func restart() async -> (accepted: Bool, status: UpdateStatus) {
+    ///
+    /// - Parameter anyway: start over although no newer build is waiting. The job is marked
+    ///   `reloadOnly`, so a restart that installed nothing is not remembered as an update taken.
+    func restart(anyway: Bool = false) async -> (accepted: Bool, status: UpdateStatus) {
         var current = await status(refreshing: false)
         guard hooks.manager() != "manual" else {
             current.reason =
@@ -958,13 +961,18 @@ actor UpdateService {
                 + "machine instead."
             return (false, current)
         }
-        guard current.restartRequired || current.phase == "restarting" else {
+        let owed = current.restartRequired || current.phase == "restarting"
+        guard anyway || owed else {
             current.reason = "This bridge is already running the build in its checkout."
             return (false, current)
         }
         guard barrier == nil else { return (true, current) }
-        guard job?.isFinished != false else { return (false, current) }
-        begin(.restart, automatic: false, target: BridgeVersion.onDisk()?.version)
+        guard job?.isFinished != false else {
+            current.reason = "An update is already under way on that machine."
+            return (false, current)
+        }
+        begin(
+            .restart, automatic: false, target: BridgeVersion.onDisk()?.version, reloadOnly: !owed)
         beginRestart()
         return (true, await status(refreshing: false))
     }
@@ -1004,8 +1012,10 @@ actor UpdateService {
         let state = readState()
         switch state?.phase {
         case "restarting", "waiting":
-            policy.noteSuccess(target: landedTarget(running: true))
-            writePolicy()
+            if !restartsOnly {
+                policy.noteSuccess(target: landedTarget(running: true))
+                writePolicy()
+            }
             write(
                 UpdateState(
                     phase: "succeeded", startedAt: state?.startedAt, finishedAt: Date(), pid: nil))
@@ -1099,8 +1109,12 @@ actor UpdateService {
     }
 
     /// Starts a job, replacing whatever finished one was on record.
-    private func begin(_ kind: UpdateJob.Kind, automatic: Bool, target: String?) {
-        job = UpdateJob.begin(kind, automatic: automatic, from: runningVersion(), target: target)
+    private func begin(
+        _ kind: UpdateJob.Kind, automatic: Bool, target: String?, reloadOnly: Bool = false
+    ) {
+        job = UpdateJob.begin(
+            kind, automatic: automatic, from: runningVersion(), target: target,
+            reloadOnly: reloadOnly)
         writeJob()
     }
 
@@ -1148,6 +1162,10 @@ actor UpdateService {
     }
 
     private func restartOwed() -> Bool { restartRequired(source: source) }
+
+    /// A restart taken with no build waiting is not an update: it neither counts as one taken nor
+    /// forgives the build that last refused to land.
+    private var restartsOnly: Bool { job?.reloadOnly == true }
 
     private func markFailed() {
         write(
@@ -1222,6 +1240,10 @@ actor UpdateService {
         write(
             UpdateState(
                 phase: "succeeded", startedAt: readState()?.startedAt, finishedAt: Date(), pid: nil))
+        guard !restartsOnly else {
+            failJob("That machine was never idle long enough to restart, so nothing changed.")
+            return
+        }
         deferJob(
             "Built, but the machine was never idle long enough to restart. The new build loads the "
                 + "next time the bridge restarts.")
@@ -1233,8 +1255,10 @@ actor UpdateService {
             UpdateState(
                 phase: "restarting", startedAt: readState()?.startedAt, finishedAt: Date(),
                 pid: nil))
-        policy.noteSuccess(target: landedTarget(running: false))
-        writePolicy()
+        if !restartsOnly {
+            policy.noteSuccess(target: landedTarget(running: false))
+            writePolicy()
+        }
         await settle?()
         try? await Task.sleep(for: .milliseconds(300))
         hooks.terminate()
