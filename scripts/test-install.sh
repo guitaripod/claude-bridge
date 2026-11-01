@@ -286,8 +286,8 @@ if [ "$(uname -s)" = Linux ]; then
   check "service: succeeds" test "$RC" -eq 0
   check "service: writes the unit with the runner as its command" \
     grep -Fxq "ExecStart=$STATE/run.sh" "$HOME_DIR/.config/systemd/user/test-bridge.service"
-  check "service: enables and starts it as a user service" \
-    bash -c "grep -Fxq 'systemctl --user daemon-reload' '$SERVICE_LOG' && grep -Fxq 'systemctl --user enable --now test-bridge.service' '$SERVICE_LOG'"
+  check "service: enables it and restarts it as a user service" \
+    bash -c "grep -Fxq 'systemctl --user daemon-reload' '$SERVICE_LOG' && grep -Fxq 'systemctl --user enable test-bridge.service' '$SERVICE_LOG' && grep -Fxq 'systemctl --user restart test-bridge.service' '$SERVICE_LOG'"
   expect_has "$OUT" "claude-bridge is running." "ending: says running once the bridge answers"
 fi
 
