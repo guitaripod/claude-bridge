@@ -18,7 +18,12 @@ import Testing
         #expect(children.contains(child.processIdentifier))
         #expect(ProcessProbe.descendants(of: me).contains(child.processIdentifier))
         #expect(ProcessProbe.cpuSeconds(of: child.processIdentifier) >= 0)
-        let line = ProcessProbe.commandLine(child.processIdentifier)
+        var line = ProcessProbe.commandLine(child.processIdentifier)
+        let deadline = Date().addingTimeInterval(3)
+        while line?.contains("sleep 30") != true, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+            line = ProcessProbe.commandLine(child.processIdentifier)
+        }
         #expect(line?.contains("sleep 30") == true, "command line read as \(String(describing: line))")
     }
 

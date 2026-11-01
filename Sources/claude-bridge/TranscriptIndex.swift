@@ -1157,10 +1157,6 @@ enum TranscriptParser {
 
         var directory: String?
         var model: String?
-        /// The reasoning effort the last answer actually ran at, read from the transcript — the
-        /// CLI records it per line, and a `/effort` typed into a terminal never reaches any
-        /// stored session record.
-        var effort: String?
         var createdAt: Date?
         var title: String?
         var commandTitle: String?
