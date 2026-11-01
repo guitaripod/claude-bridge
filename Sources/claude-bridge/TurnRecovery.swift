@@ -18,7 +18,7 @@ enum MachineUptime {
             guard sysctl(&mib, 2, &boot, &size, nil, 0) == 0, boot.tv_sec != 0 else { return nil }
             return Date(timeIntervalSince1970: TimeInterval(boot.tv_sec))
         #else
-            guard let stat = try? String(contentsOfFile: "/proc/stat", encoding: .utf8) else {
+            guard let stat = ProcessProbe.readProcText("/proc/stat") else {
                 return nil
             }
             for line in stat.split(separator: "\n") where line.hasPrefix("btime ") {
@@ -73,7 +73,7 @@ enum ProcessProbe {
                 return true
             }
             for entry in entries where Int32(entry) != nil {
-                guard let stat = try? String(contentsOfFile: "/proc/\(entry)/stat", encoding: .utf8),
+                guard let stat = readProcText("/proc/\(entry)/stat"),
                     let close = stat.lastIndex(of: ")")
                 else { continue }
                 let fields = stat[stat.index(close, offsetBy: 1)...]
@@ -200,11 +200,19 @@ enum ProcessProbe {
         }
     }
 
+    /// A `/proc` file as text, read the way `readProcFile` reads it. `String(contentsOfFile:)` is
+    /// not an option for more than the leak: on Swift 6.4 it throws "not in the correct format" for
+    /// `/proc/stat`, which is longer than the 4 KB it reads first, and traps on an overlapping copy
+    /// when several reads race.
+    static func readProcText(_ path: String) -> String? {
+        readProcFile(path).map { String(decoding: $0, as: UTF8.self) }
+    }
+
     #if !canImport(Darwin)
         /// The fields of `/proc/<pid>/stat` after the bracketed command name, so a name with
         /// spaces or parentheses in it cannot shift every column that follows.
         private static func statFields(_ pid: Int32) -> [Substring]? {
-            guard let stat = try? String(contentsOfFile: "/proc/\(pid)/stat", encoding: .utf8),
+            guard let stat = readProcText("/proc/\(pid)/stat"),
                 let close = stat.lastIndex(of: ")")
             else { return nil }
             return stat[stat.index(close, offsetBy: 1)...]
@@ -265,7 +273,7 @@ enum ProcessProbe {
     /// a package install runs under node with the package on its command line. The bridge itself
     /// is `claude-bridge` and never matches.
     private static func isClaudeCLI(_ pid: Int32) -> Bool {
-        if let comm = try? String(contentsOfFile: "/proc/\(pid)/comm", encoding: .utf8),
+        if let comm = readProcText("/proc/\(pid)/comm"),
             comm.trimmingCharacters(in: .whitespacesAndNewlines) == "claude"
         {
             return true

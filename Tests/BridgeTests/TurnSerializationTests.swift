@@ -140,13 +140,16 @@ struct TurnSerializationTests {
 
     @Test("A fork's first turn is not mistaken for its parent's")
     func forkDoesNotStealTheParentsTurnSlot() async throws {
-        let fake = try FakeClaude(holdSeconds: 1.0)
+        let fake = try FakeClaude(holdSeconds: 3.0)
         defer { fake.cleanUp() }
         let (store, _) = makeStore(fake)
         let parent = await store.create(CreateRequest(directory: fake.root.path))
 
         _ = await store.send(parent.id, request: SendRequest(text: "parent turn"))
-        try await Task.sleep(for: .milliseconds(800))
+        let started = ContinuousClock.now + .seconds(5)
+        while await store.get(parent.id)?.claudeSessionID != "fake-session", ContinuousClock.now < started {
+            try await Task.sleep(for: .milliseconds(20))
+        }
 
         let forked = try #require(await store.fork(parent.id))
         #expect(forked.claudeSessionID == "fake-session")
@@ -156,14 +159,17 @@ struct TurnSerializationTests {
         #expect(await store.hasQueuedOrRunningTurn(forked.id))
         #expect(await store.hasRunnerTurnInFlight(claudeSessionID: "fake-session"))
 
-        let deadline = ContinuousClock.now + .seconds(2)
+        let deadline = ContinuousClock.now + .seconds(6)
         while await store.hasQueuedOrRunningTurn(parent.id), ContinuousClock.now < deadline {
             try await Task.sleep(for: .milliseconds(50))
         }
         #expect(await store.hasQueuedOrRunningTurn(parent.id) == false)
         #expect(await store.hasRunnerTurnInFlight(claudeSessionID: "fake-session"))
 
-        try await Task.sleep(for: .seconds(2))
+        let settled = ContinuousClock.now + .seconds(8)
+        while await store.hasRunnerTurnInFlight(claudeSessionID: "fake-session"), ContinuousClock.now < settled {
+            try await Task.sleep(for: .milliseconds(50))
+        }
         #expect(await store.hasRunnerTurnInFlight(claudeSessionID: "fake-session") == false)
     }
 }

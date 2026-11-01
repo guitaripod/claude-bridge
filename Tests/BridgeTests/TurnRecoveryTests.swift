@@ -492,3 +492,22 @@ struct ResumeTests {
         })
     }
 }
+
+@Suite("Reading the machine")
+struct MachineReadingTests {
+    @Test("A machine that has been up knows when it came up")
+    func bootTimeIsKnown() throws {
+        let booted = try #require(MachineUptime.bootedAt())
+        #expect(booted < Date())
+        #expect(booted > Date(timeIntervalSince1970: 1_500_000_000))
+    }
+
+    @Test("A proc file longer than one read comes back whole")
+    func longProcFileIsWhole() throws {
+        #if !canImport(Darwin)
+            let text = try #require(ProcessProbe.readProcText("/proc/stat"))
+            #expect(text.contains("\nbtime "))
+            #expect(text.hasSuffix("\n"))
+        #endif
+    }
+}

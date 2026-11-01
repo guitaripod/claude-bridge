@@ -1569,7 +1569,7 @@ actor UpdateService {
     /// The systemd unit this process belongs to, read off its own cgroup: the last path component
     /// that names a service, since the user manager itself (`user@1000.service`) is one too.
     private static func systemdUnit() -> String? {
-        guard let cgroup = try? String(contentsOfFile: "/proc/self/cgroup", encoding: .utf8) else {
+        guard let cgroup = ProcessProbe.readProcText("/proc/self/cgroup") else {
             return nil
         }
         for line in cgroup.split(separator: "\n") {

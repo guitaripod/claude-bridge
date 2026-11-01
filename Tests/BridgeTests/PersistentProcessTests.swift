@@ -32,7 +32,7 @@ private struct StdinClaude {
                   if [ -f "\(root.appendingPathComponent("nostop").path)" ]; then
                     $P '%s\\n' "{\\"type\\":\\"control_response\\",\\"response\\":{\\"subtype\\":\\"error\\",\\"request_id\\":\\"$rid\\",\\"error\\":\\"stop_task is not supported in this context\\"}}"
                   else
-                    pkill -f "sleep 900; echo \(root.lastPathComponent)" >/dev/null 2>&1
+                    pkill -KILL -f "sleep 900; echo \(root.lastPathComponent)" >/dev/null 2>&1
                     $P '%s\\n' "{\\"type\\":\\"control_response\\",\\"response\\":{\\"subtype\\":\\"success\\",\\"request_id\\":\\"$rid\\",\\"response\\":{}}}"
                     $P '%s\\n' '{"type":"system","subtype":"background_tasks_changed","tasks":[]}'
                   fi
