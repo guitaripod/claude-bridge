@@ -179,6 +179,9 @@ struct Session: Codable, Sendable {
     var pendingFork: Bool?
     var customTitle: Bool?
     var autoTitled: Bool?
+    /// How many of the person's messages the conversation had when its title was last written or
+    /// confirmed, so the next look at whether the topic has moved waits for a few more.
+    var titledAtTurn: Int?
     /// A turn that was running when this bridge stopped and was not running when it came back.
     /// Kept on the session until it is picked up or dismissed, so a client that was not connected
     /// when the machine died still finds out that work was cut off rather than finding silence.

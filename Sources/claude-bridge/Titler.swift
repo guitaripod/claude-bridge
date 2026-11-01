@@ -29,6 +29,44 @@ enum Titler {
         return title
     }
 
+    /// Whether a conversation that has been going a while still wears the right name. The model
+    /// is shown the title and the newest exchange and answers `KEEP` or a replacement, so a topic
+    /// that has moved on is renamed and one that merely continued is left alone.
+    static func revised(
+        binary: String, projectsDir: String, current: String, user: String, assistant: String
+    ) async -> String? {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let cwd = "\(home)/.claude-bridge/titler"
+        try? FileManager.default.createDirectory(
+            atPath: cwd, withIntermediateDirectories: true)
+        defer { cleanupTranscripts(projectsDir: projectsDir, cwd: cwd) }
+
+        let prompt = """
+            A coding-agent conversation is titled "\(current)". Here is its latest exchange. \
+            If the title still describes what the conversation is about now, reply KEEP. \
+            If the topic has moved on, reply with a new title instead: 3 to 6 words, plain \
+            text, no quotes, no trailing period. Reply with KEEP or the title only.
+
+            User: \(condense(user, cap: 600))
+            Assistant: \(condense(assistant, cap: 400))
+            """
+        guard let raw = await run(binary: binary, cwd: cwd, prompt: prompt) else { return nil }
+        return replacement(from: raw, current: current)
+    }
+
+    /// The new title a revision reply asks for, or nil when it says to keep the current one, says
+    /// nothing, or only restates it.
+    static func replacement(from raw: String, current: String) -> String? {
+        let title = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\"'“”."))
+        guard !title.isEmpty, title.count <= 70, !title.contains("\n"),
+            title.caseInsensitiveCompare("KEEP") != .orderedSame,
+            title.caseInsensitiveCompare(current) != .orderedSame
+        else { return nil }
+        return title
+    }
+
     private static func condense(_ text: String, cap: Int) -> String {
         let flattened = text
             .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)

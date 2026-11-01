@@ -460,6 +460,7 @@ actor SessionStore {
         session.claudeSessionID = nil
         session.priorClaudeSessionIDs = nil
         session.autoTitled = nil
+        session.titledAtTurn = nil
         session.updatedAt = Date()
         sessions[id] = session
         persistNow()
@@ -2052,33 +2053,60 @@ actor SessionStore {
     }
 
     /// After the first completed turn (and after /clear), replace the
-    /// prompt-derived title with a short LLM-written one. A user rename
-    /// (customTitle) always wins, including against a title call already in
-    /// flight.
+    /// prompt-derived title with a short LLM-written one, then every few
+    /// messages look again at whether the topic has moved and rename the chat
+    /// if it has. A user rename (customTitle) always wins, including against a
+    /// title call already in flight.
     private func maybeAutoTitle(_ id: String) {
-        guard let session = sessions[id],
-            session.customTitle != true, session.autoTitled != true,
-            let user = session.messages.first(where: { $0.role == .user })
+        guard let session = sessions[id], session.customTitle != true,
+            let user = session.messages.last(where: { $0.role == .user })
                 .map(Self.plainText), !user.isEmpty,
-            let assistant = session.messages.first(where: { $0.role == .assistant })
+            let assistant = session.messages.last(where: { $0.role == .assistant })
                 .map(Self.plainText), !assistant.isEmpty
         else { return }
+        let turn = session.messages.filter { $0.role == .user }.count
         let binary = runner.claudePath
         let projects = projectsDir
-        Task.detached { [weak self] in
-            guard let title = await Titler.title(
-                binary: binary, projectsDir: projects, user: user, assistant: assistant)
-            else { return }
-            await self?.applyAutoTitle(id, title: title)
+        if session.autoTitled != true {
+            let first = session.messages.first(where: { $0.role == .user })
+                .map(Self.plainText) ?? user
+            let firstAnswer = session.messages.first(where: { $0.role == .assistant })
+                .map(Self.plainText) ?? assistant
+            Task.detached { [weak self] in
+                guard let title = await Titler.title(
+                    binary: binary, projectsDir: projects, user: first, assistant: firstAnswer)
+                else { return }
+                await self?.applyAutoTitle(id, title: title, turn: turn)
+            }
+        } else if Self.retitleDue(turn: turn, titledAt: session.titledAtTurn) {
+            let current = session.title
+            Task.detached { [weak self] in
+                let title = await Titler.revised(
+                    binary: binary, projectsDir: projects, current: current,
+                    user: user, assistant: assistant)
+                await self?.applyAutoTitle(id, title: title ?? current, turn: turn)
+            }
         }
     }
 
-    private func applyAutoTitle(_ id: String, title: String) {
+    static let retitleEvery = 3
+
+    /// Whether enough of the person's messages have gone by since the title was last written or
+    /// confirmed to ask again. A title the bridge wrote before it counted turns is asked about at
+    /// the next turn that makes it due.
+    static func retitleDue(turn: Int, titledAt: Int?) -> Bool {
+        turn - (titledAt ?? 0) >= retitleEvery
+    }
+
+    private func applyAutoTitle(_ id: String, title: String, turn: Int) {
         guard var session = sessions[id], session.customTitle != true else { return }
+        let changed = session.title != title
         session.title = title
         session.autoTitled = true
+        session.titledAtTurn = turn
         sessions[id] = session
         persist()
+        guard changed else { return }
         let pusher = self.pusher
         Task { await pusher.retitle(sessionID: id, title: title) }
     }
