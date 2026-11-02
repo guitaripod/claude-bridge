@@ -20,7 +20,7 @@ private func mimeType(forExtension ext: String) -> String {
     }
 }
 
-private func jsonResponse<T: Encodable>(_ value: T, status: HTTPResponse.Status = .ok) -> Response {
+func jsonResponse<T: Encodable>(_ value: T, status: HTTPResponse.Status = .ok) -> Response {
     let data = (try? JSONCoding.encoder.encode(value)) ?? Data("{}".utf8)
     var buffer = ByteBuffer()
     buffer.writeBytes(data)
@@ -138,7 +138,7 @@ private func fileResponse(
     return Response(status: .ok, headers: headers, body: stream)
 }
 
-private func decodeBody<T: Decodable>(
+func decodeBody<T: Decodable>(
     _ type: T.Type, _ request: Request, limit: Int = 1 << 20
 ) async throws -> T {
     let buffer = try await request.body.collect(upTo: limit)
@@ -169,6 +169,10 @@ struct BridgeStatus: Encodable {
     /// not on the device that queued them), so a client can tell a bridge that holds one from an
     /// older bridge, whose queue only the sending device knows.
     let queue: Int
+    /// Protocol version of the ACP agents this bridge hosts besides Claude (`/agents`).
+    var agents = 1
+    /// Protocol version of the schedules this machine keeps and asks (`/schedules`).
+    var schedules = 1
 }
 
 struct AuthCodeRequest: Decodable {
@@ -250,6 +254,8 @@ func registerRoutes(
                 case .agents(let sessionID, let agents):
                     let payload = AgentsFramePayload(session: sessionID, agents: agents)
                     try await writeFrame(seq: frame.seq, event: "agents", json: encode(payload))
+                case .machine(let topic):
+                    try await writeFrame(seq: frame.seq, event: "machine", json: encode(["topic": topic]))
                 case .heartbeat(let seq):
                     try await writeFrame(
                         seq: nil, event: "heartbeat", json: encode(Heartbeat(seq: seq, t: Date())))
@@ -959,6 +965,11 @@ func registerRoutes(
     router.post("sessions/:id/fork") { _, context in
         let id = context.parameters.get("id") ?? ""
         await adoptIfNeeded(id)
+        if let agent = await store.get(id)?.agentName {
+            return jsonResponse(
+                ["error": "A conversation with \(agent) cannot be forked. Carry it instead."],
+                status: .conflict)
+        }
         guard let session = await store.fork(id) else {
             return jsonResponse(["error": "not found"], status: .notFound)
         }

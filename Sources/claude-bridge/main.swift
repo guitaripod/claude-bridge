@@ -186,6 +186,16 @@ await updater.attach(
     settle: { await store.flush() })
 await updater.resume()
 await updater.startAutomation()
+let stateDirectory = storeURL.deletingLastPathComponent()
+let agentService = AgentService(home: home, stateDirectory: stateDirectory)
+await agentService.observe { Task { await hub.publish(.machine(topic: "agents")) } }
+await store.attach(agents: agentService)
+let scheduler = Scheduler(
+    url: stateDirectory.appendingPathComponent("schedules.json"), store: store)
+await scheduler.observe { Task { await hub.publish(.machine(topic: "schedules")) } }
+await store.observeTurnEnds { id, note in await scheduler.turnEnded(id, note) }
+await scheduler.start()
+registerMachineRoutes(router, agents: agentService, scheduler: scheduler)
 registerRoutes(
     router, store: store, index: index, watcher: watcher, updater: updater, auth: auth,
     permissions: permissions, hub: hub, observer: observer, defaults: machineDefaults, hasAuth: !password.isEmpty || tailnetGate != nil,

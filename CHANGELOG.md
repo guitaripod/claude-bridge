@@ -4,6 +4,13 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.17.0 — unreleased
+
+- Hosts any agent that speaks the Agent Client Protocol beside Claude Code — Hermes, Gemini CLI, Codex, goose, Kimi CLI, Qwen Code, GitHub Copilot and the rest of the ACP registry — on the same port and in the same session list, with nothing else to install or pair. An agent is found on PATH, run through npx or uvx, or downloaded from the registry and checked against its sha256; it is ready only once it has answered a real session. `GET /agents`, `/agents/registry`, `/agents/models`, and presses to add, prove, install, give a brain, keep a key and sign in.
+- Gives Hermes a brain with one press: any model server already on the machine (llama-swap, ollama, LM Studio, vLLM), named the way the server names its models, or a provider key kept on the machine in a 0600 file.
+- Keeps schedules on the machine, so a question asked every morning is asked whether or not any app is open: `GET/POST /schedules`, `PATCH/DELETE /schedules/:id`, `POST /schedules/:id/run`. Runs go into one conversation that remembers by default, a run with nothing new stays quiet (no push, not unread) while a failure always speaks, and a machine that was off asks once for what it owed and records how many times it missed.
+- `/status` reports `agents` and `schedules`, and `/stream` carries a `machine` frame when either changes.
+
 ## 1.16.0 — 2026-10-23
 
 - A message queued behind a running turn now lives on the bridge, so every device on the conversation shows the same queue and can edit or cancel it, instead of the phone that queued it being the only one to know. `GET /sessions/:id/queue` reads it; `POST /sessions/:id/queue` adds an item under the client's own id (idempotent, and started at once when nothing is running), `PATCH` and `DELETE /sessions/:id/queue/:qid` change or cancel one that has not started (`409 already_started` once it has), and `POST /sessions/:id/queue/resume` lets a paused queue run. Every change is a `queue` event carrying the whole queue, `GET /sessions/:id` carries `queue` and `queuePaused`, and `/status` reports `"queue": 1` so an app can tell a bridge that holds one.

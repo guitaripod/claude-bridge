@@ -9,6 +9,9 @@ enum HubEvent: Sendable {
     case listUpsert(SessionSummary)
     case listRemove(id: String)
     case agents(sessionID: String, agents: [SubagentSummary])
+    /// Something about the machine rather than one conversation changed — its agents or its
+    /// schedules — and a client showing that list should read it again.
+    case machine(topic: String)
     /// Liveness only: not sequenced, not replayed — a subscriber that hears nothing else hears
     /// this every ten seconds, so silence is distinguishable from death.
     case heartbeat(seq: UInt64)

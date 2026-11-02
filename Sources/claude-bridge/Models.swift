@@ -213,11 +213,21 @@ struct Session: Codable, Sendable {
     /// queue itself lives in the journal, so every client reads the same one.
     var queue: [QueuedItem]?
     var queuePaused: Bool?
+    /// The ACP agent this conversation is with, by id, when it is not Claude Code. Bound by the
+    /// first turn that names one of the agent's models and kept: one agent cannot take over
+    /// another's session.
+    var agent: String? = nil
+    var agentName: String? = nil
+    /// The agent's own id for the conversation, so a later process can pick it back up.
+    var agentSessionID: String? = nil
+    /// The schedule this conversation runs for, when a schedule made it.
+    var scheduleID: String? = nil
 
     var summary: SessionSummary {
         SessionSummary(
             id: id, title: title, directory: directory, model: model, effort: effort,
-            createdAt: createdAt, updatedAt: updatedAt)
+            createdAt: createdAt, updatedAt: updatedAt, agent: agent, agentName: agentName,
+            scheduled: scheduleID == nil ? nil : true)
     }
 }
 
@@ -312,6 +322,11 @@ struct SessionSummary: Codable, Sendable, Equatable {
     var backgroundTask: String?
     var backgroundSince: Date?
     var backgroundStalled: Bool?
+    /// The ACP agent the conversation is with, by id and by name; absent for Claude Code.
+    var agent: String? = nil
+    var agentName: String? = nil
+    /// A schedule made this conversation and runs into it.
+    var scheduled: Bool? = nil
 }
 
 /// The agents working for one session, as a list row can describe them.

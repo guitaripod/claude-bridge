@@ -230,7 +230,7 @@ identity when the gate is on — see Security.
 | Method | Path | Body | Response |
 |---|---|---|---|
 | GET | `/health` | — | `ok` |
-| GET | `/status` | — | `{"agent": "claude", "model": …, "version": …, "authenticated": bool, "proto": 2, "epoch": …, "turnWait": 1, "marks": 1, "queue": 1}` — `proto`/`epoch` announce the sequenced `/stream` protocol, `turnWait` the protocol version of `/sessions/:id/wait`, `marks` that conversations carry `saved`/`pinned`/`archived`/`readAt`, `queue` that this bridge holds the shared queue (see Shared queue) |
+| GET | `/status` | — | `{"agent": "claude", "model": …, "version": …, "authenticated": bool, "proto": 2, "epoch": …, "turnWait": 1, "marks": 1, "queue": 1, "agents": 1, "schedules": 1}` — `proto`/`epoch` announce the sequenced `/stream` protocol, `turnWait` the protocol version of `/sessions/:id/wait`, `marks` that conversations carry `saved`/`pinned`/`archived`/`readAt`, `queue` that this bridge holds the shared queue (see Shared queue), `agents` that it hosts ACP agents (see Other agents), `schedules` that it keeps schedules (see Schedules) |
 | GET | `/stream` | `Last-Event-ID` header or `?since=epoch:seq` | one sequenced SSE stream of everything this bridge knows is happening (below) |
 | GET | `/auth` | — | whether the CLI is signed in, as whom, and the sign-in in progress if there is one |
 | POST | `/auth/login` | — | starts `claude auth login` on a pseudo-terminal and answers with the URL it printed |
@@ -310,6 +310,43 @@ one, docked at the tool call that read it, with `url` pointing at `/files/raw` s
 the same picture without the base64 the transcript keeps. The picture outlives the file: agents
 write screenshots to `/tmp` and clean them up, so `/files/raw` falls back to the transcript's own
 copy when the path is gone.
+
+## Other agents
+
+Besides Claude Code the bridge hosts any agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com) — Hermes, Gemini CLI, Codex, goose, Kimi CLI, Qwen Code, GitHub Copilot and the rest of the [ACP registry](https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json) — on the same port, behind the same door, in the same session list. Nothing else is installed or paired.
+
+- An agent is **found** when its own command is on the machine's PATH (the person's copy, signed in the way they signed it in), **available** when npx or uvx can run it without installing (Hermes through `uvx --from 'hermes-agent[acp]' hermes acp`), **installed** when this bridge downloaded it from the registry (archives are checked against the registry's sha256 and unpacked under `~/.claude-bridge/agents/<id>/`), or **custom**. A found agent is listed, never started, until someone adds it.
+- **Ready means it answered.** Adding an agent, and every change to its brain, key or sign-in, opens a real session in it and closes it again (`~/.claude-bridge/agents/probe`); what that proof found is the agent's state until the next one, and an added agent is proved again once a day. A failure is classified from the agent's own words into `needsBrain`, `needsKey` or `needsSignIn`, and kept as `failure` otherwise.
+- **A brain.** Hermes with no model of its own is given one the way its own wizard would (`hermes config set model.provider custom`, `model.base_url`, `model.default`): any OpenAI-compatible server on the machine (ollama, llama-swap, LM Studio, vLLM, SGLang on their usual ports, more in `BRIDGE_BRAINS`), or a provider key. A llama-swap that marks agent models (`meta.llamaswap.agent`) offers those alone, by their own names.
+- **Keys** are kept one file per agent, `~/.claude-bridge/agents/<id>.env`, mode 0600, handed to the agent as environment variables when it starts and never sent back — a listing says only whether each is set.
+- **Sign-in** runs the agent's own terminal method (`authMethods` of type `terminal`) on a pseudo-terminal and relays what it prints — lines, links, one-time codes — to whoever asked, and what they type back; an agent-run method is `authenticate` over ACP with its stderr relayed. Exit 0 proves the agent again.
+- **A conversation with an agent** is bound by its first turn that names one of the agent's models (`<agent id>/<model id>`, the agent's default being `<agent id>/default`) and keeps that agent: a turn naming another answers in the conversation that it has to be carried. One agent process per conversation, kept between turns and reaped when idle like Claude's; a later process picks the agent's own session back up (`session/resume`, else `session/load` with the replay swallowed), and an agent that can do neither starts again with a brief of the conversation the bridge holds. The agent's updates are translated into the stream-json Claude Code writes, so the same assembler, journal, queue, live mirror, wait route, Live Activity and push carry them: `execute` becomes Bash, `read` Read, `edit` Edit or Write, `search` Grep or WebSearch, `fetch` WebFetch, the agent's plan a `TodoWrite`, `session_info_update` the title. A permission request is answered with its allow option (`allow_once` first), as Claude runs with full permissions here. Fork answers 409 for an agent conversation.
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| GET | `/agents` | `?refresh=1` re-asks the local model servers | `{agents: [{id, name, version, description, icon, website, source, added, state, runtime, failure, models, currentModel, efforts, keys: [{env, name, url, set}], signIn: [{id, name, description, kind}], brain, brainStyle, distribution, checkedAt}], brains: [{id, name, baseURL, models: [{id, name}]}]}` |
+| GET | `/agents/registry` | — | the ACP registry as this machine can run it: `[{id, name, version, description, icon, authors, website, distribution, installable, runtime, here}]` |
+| GET | `/agents/models` | — | every ready agent's models: `[{id, name, provider, providerName, agent: true, variants}]` |
+| POST | `/agents/install` | `{id}` | downloads, checks and unpacks a registry agent (or readies an npx/uvx one), adds and proves it; `422` with `error` when the runtime is missing or the checksum does not match |
+| POST | `/agents/:id/add` · `/remove` · `/check` | — | adds and proves · forgets · proves again |
+| POST | `/agents/:id/key` | `{env, value}` | keeps a key and proves the agent |
+| POST | `/agents/:id/brain` | `{kind: "local", brain, model}` or `{kind: "key", provider, key}` | gives the agent a model to think with and proves it |
+| POST | `/agents/:id/signin` | `{method}` | starts the agent's sign-in; `GET` reads `{state, lines, links, codes, exitCode}`, `/signin/input` `{text}` types into it, `/signin/cancel` ends it |
+
+`/stream` carries a `machine` frame (`{"topic": "agents"}` or `"schedules"`) whenever either changes.
+
+## Schedules
+
+The machine keeps the clock: a schedule lives here, in `~/.claude-bridge/schedules.json`, and asks whether or not any app is open. Rules are the ones people say — `{"kind": "once", "at"}`, `{"kind": "daily", "hour", "minute"}`, `"weekdays"`, `{"kind": "weekly", "weekday" (1 = Sunday), …}`, `{"kind": "hours", "every", "hour", "minute"}` — read in the `timeZone` of the device that made it. A due schedule is sent through the store's own road (so it queues behind a live turn rather than racing it) into its one conversation (`thread: "continue"`, the default) or a new one (`"fresh"`), with its model and level, an ACP agent's included. With `quiet` on (the default for a repeat) a run after the first is told, in what the agent is handed and never in the stored message, to answer exactly `NOTHING NEW` when nothing changed; such a run's answer becomes "Nothing new since the last check.", the conversation is marked read on this machine's clock and nothing is pushed. A failure always speaks. A machine that was off asks once for what it owed if the latest missed time is within 12 hours (`caughtUp`, with `missed` counting the times it slept through) and otherwise records `missed` with `failure: "off"`; a run still going when the next is due records that one `missed` with `failure: "busy"`. At most 50 schedules; a one-off that ran is kept three days.
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| GET | `/schedules` | — | `[{id, text, title, model, effort, directory, rule, timeZone, next, paused, thread, quiet, sessionID, createdAt, createdBy, runs: [{id, scheduledFor, startedAt, endedAt, sessionID, outcome, ending, missed, failure}]}]`, soonest first; `outcome` is `running`, `answered`, `quiet`, `failed`, `missed` or `caughtUp` (how a caught-up run ended is `ending`) |
+| POST | `/schedules` | `{text, rule, timeZone, model?, effort?, directory?, title?, thread?, quiet?, sessionID?, createdBy?}` | `201` with the schedule; `422` with `error` for a time already gone, an unreadable rule or a full machine |
+| GET · PATCH · DELETE | `/schedules/:id` | `PATCH`: any of `text, title, model, effort, rule, timeZone, paused, thread, quiet` | the schedule · the changed schedule · `{ok}` (its conversations stay) |
+| POST | `/schedules/:id/run` | — | asks now; a repeat keeps its hour |
+
+A conversation a schedule made carries `scheduleID` and is `scheduled: true` in a listing.
 
 ## Signing in
 

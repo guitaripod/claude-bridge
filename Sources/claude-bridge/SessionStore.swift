@@ -149,6 +149,12 @@ actor SessionStore {
     /// finished turn can report *why* it ended when a goal drove it.
     private weak var index: TranscriptIndex?
 
+    func attach(agents: AgentService) { agentService = agents }
+
+    func observeTurnEnds(_ observer: @escaping @Sendable (String, TurnEndNote) async -> Void) {
+        turnEndObserver = observer
+    }
+
     func attach(index: TranscriptIndex) {
         self.index = index
     }
@@ -162,6 +168,17 @@ actor SessionStore {
     /// process outlives its turns so the work a turn leaves running in the background outlives it
     /// too; it is let go once it has been idle for ``processTTL`` with nothing running.
     private var processes: [String: ClaudeProcess] = [:]
+    /// The ACP agents this machine runs besides Claude, attached after construction.
+    private var agentService: AgentService?
+    /// One agent process per conversation with an agent, kept between turns like Claude's.
+    private var agentConnections: [String: AcpConnection] = [:]
+    private var agentSessionFacts: [String: AcpSessionFacts] = [:]
+    private var agentTranslators: [String: AcpTranslator] = [:]
+    /// The model and level each agent connection was last set to, so a turn changes them only
+    /// when the person did.
+    private var agentChoices: [String: (model: String?, effort: String?)] = [:]
+    /// Told when a turn ends, with the session and how it ended: the scheduler's ear.
+    private var turnEndObserver: (@Sendable (String, TurnEndNote) async -> Void)?
     private var openTurns: [String: OpenTurn] = [:]
     private let processTTL: TimeInterval
     /// How many idle processes are kept at once. Each is a whole CLI in memory; past this the
@@ -418,6 +435,7 @@ actor SessionStore {
         order.removeAll { $0 == id }
         broadcasters[id] = nil
         dropProcess(id)
+        dropAgentConnection(id)
         persistNow()
         forgetMarks(id)
         discardQueue(id)
@@ -456,6 +474,8 @@ actor SessionStore {
     func clear(_ id: String) {
         guard var session = sessions[id] else { return }
         dropProcess(id)
+        dropAgentConnection(id)
+        session.agentSessionID = nil
         session.messages = []
         session.claudeSessionID = nil
         session.priorClaudeSessionIDs = nil
@@ -594,6 +614,11 @@ actor SessionStore {
         if let model = queued.model { session.model = model }
         if let effort = queued.effort { session.effort = effort }
         sessions[id] = session
+
+        if let agent = session.agent ?? Self.agentID(inModel: session.model) {
+            startAgentTurn(id, agent: agent, queued: queued)
+            return
+        }
 
         let resume = session.claudeSessionID
         let model = session.model.isEmpty ? defaults.model() : session.model
@@ -746,6 +771,12 @@ actor SessionStore {
             let data = line.data(using: .utf8),
             let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
+        fold(id, object)
+    }
+
+    /// One stream-json object folded into whatever turn is open — a Claude line, or an agent's
+    /// update already translated into one.
+    private func fold(_ id: String, _ object: [String: Any]) {
         if openTurns[id] == nil {
             guard Self.opensTurn(object) else { return }
             beginUnsolicitedTurn(id)
@@ -903,6 +934,7 @@ actor SessionStore {
     /// reading and the decision — so the decision is checked again on the same actor step it is
     /// carried out, and a process a turn has since claimed is left exactly where it is.
     func reapIdleProcesses(now: Date = Date()) async {
+        await reapIdleAgents(now: now)
         await endWedgedTurns(now: now)
         var idle: [(id: String, process: ClaudeProcess, lastActivityAt: Date)] = []
         for (id, process) in processes where openTurns[id] == nil {
@@ -1052,6 +1084,9 @@ actor SessionStore {
         let running = processes
         processes = [:]
         for (_, process) in running { await process.close() }
+        let agents = agentConnections
+        agentConnections = [:]
+        for (_, connection) in agents { await connection.close() }
     }
 
     private func dropProcess(_ id: String) {
@@ -1199,6 +1234,328 @@ actor SessionStore {
     /// message twice.
     private var settledTurnMessageIDs: [String: String] = [:]
 
+    /// Sessions whose open turn is a scheduled run allowed to stay quiet.
+    private var quietTurns: Set<String> = []
+
+    /// The words a quiet run is told to answer with when nothing changed, and the line the
+    /// conversation keeps in their place.
+    static let nothingNewWord = "NOTHING NEW"
+    static let nothingNewLine = "Nothing new since the last check."
+
+    static func saysNothingNew(_ answer: String) -> Bool {
+        let trimmed = answer.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".!*_`\"'"))
+        return trimmed.count <= nothingNewWord.count + 12
+            && trimmed.uppercased().hasPrefix(nothingNewWord)
+    }
+
+    /// A scheduled run that had nothing to say: its answer becomes one plain line, the
+    /// conversation is marked read on this machine's clock, and nothing is pushed.
+    private func settleQuietly(_ id: String, messages: [Message]) {
+        guard var session = sessions[id],
+            let last = messages.last(where: { $0.role == .assistant }),
+            let index = session.messages.firstIndex(where: { $0.id == last.id })
+        else { return }
+        let quietMessage = Message(
+            id: last.id, role: .assistant, parts: [.text(Self.nothingNewLine)],
+            createdAt: last.createdAt)
+        session.messages[index] = quietMessage
+        sessions[id] = session
+        persist()
+        publish(id, .messageUpserted(quietMessage))
+        let now = Date()
+        _ = applyMarks(id, MarkChange(read: .seen, at: now), updatedAt: session.updatedAt, now: now)
+    }
+
+    /// Sends a scheduled run's prompt. The words the person wrote are what the conversation
+    /// keeps; a note to the model — stay quiet when nothing changed — rides only in what the
+    /// agent is handed, the way attachment paths do.
+    func sendScheduled(_ id: String, text: String, model: String?, effort: String?, quiet: Bool)
+        -> SendOutcome
+    {
+        guard sessions[id] != nil else { return .unknownSession }
+        autoContinues[id] = 0
+        if pausedQueues.remove(id) != nil { publishQueue(id) }
+        let runner = quiet ? text + Self.quietNote : text
+        if quiet { quietTurns.insert(id) }
+        return accept(id, display: text, runnerPrompt: runner, files: [], model: model, effort: effort)
+    }
+
+    static let quietNote = """
+
+
+        (This message was sent by a schedule. If nothing worth telling has changed since your last \
+        answer in this conversation, reply with exactly NOTHING NEW and nothing else.)
+        """
+
+    /// Makes a conversation for a schedule, titled by it and marked as its own.
+    func createScheduled(title: String, directory: String?, model: String?, effort: String?, scheduleID: String)
+        -> Session
+    {
+        var session = create(
+            CreateRequest(title: title, directory: directory, model: model, effort: effort))
+        session.scheduleID = scheduleID
+        session.customTitle = true
+        sessions[session.id] = session
+        persistNow()
+        return session
+    }
+
+    // MARK: - Agent turns
+
+    /// The agent a model names: the part before the first slash. Claude's own model names never
+    /// carry one, so any model that does belongs to an ACP agent.
+    static func agentID(inModel model: String) -> String? {
+        guard let slash = model.firstIndex(of: "/"), slash != model.startIndex else { return nil }
+        return String(model[..<slash])
+    }
+
+    static func agentModel(inModel model: String) -> String? {
+        guard let slash = model.firstIndex(of: "/") else { return nil }
+        let rest = String(model[model.index(after: slash)...])
+        return rest.isEmpty || rest == AgentService.defaultModelID ? nil : rest
+    }
+
+    /// Opens a turn with an agent: the same slot, journal, live row and empty answer a Claude turn
+    /// gets, then the agent is reached in the background.
+    private func startAgentTurn(_ id: String, agent: String, queued: QueuedPrompt) {
+        guard var session = sessions[id] else {
+            inFlight.remove(id)
+            return
+        }
+        if session.agent == nil {
+            guard session.claudeSessionID == nil else {
+                refuseTurn(
+                    id,
+                    "This conversation is with Claude Code. Carry it to the agent to go on there.")
+                return
+            }
+            session.agent = agent
+            sessions[id] = session
+            persist()
+        } else if let named = Self.agentID(inModel: session.model), named != session.agent {
+            refuseTurn(
+                id,
+                "This conversation is with \(session.agentName ?? session.agent ?? "another agent"). Carry it to go on with another.")
+            return
+        }
+        retainRunnerTurn(id)
+        journal.turns[id] = TurnRecord(
+            turnID: UUID().uuidString, sessionID: id, claudeSessionID: nil,
+            prompt: queued.prompt, displayPrompt: queued.displayPrompt, model: session.model,
+            effort: session.effort, fork: false, directory: session.directory, startedAt: Date(),
+            pid: nil, queued: (pendingPrompts[id] ?? []).map(\.record))
+        journal.write(to: journalURL)
+        let messageID = UUID().uuidString
+        stoppedTurns.remove(id)
+        failedTurns.remove(id)
+        failedMessages[id] = nil
+        openTurns[id] = OpenTurn(
+            assembler: Assembler(messageID: messageID), startedAt: Date(),
+            turnClaudeID: id, resume: nil, reportedSessionID: nil)
+        agentTranslators[id] = AcpTranslator()
+        publish(id, .status("running"))
+        publish(
+            id,
+            .messageUpserted(
+                Message(id: messageID, role: .assistant, parts: [.text("")], createdAt: Date())))
+        let prompt = queued.prompt
+        let model = Self.agentModel(inModel: session.model)
+        let effort = session.effort.isEmpty ? nil : session.effort
+        Task { await self.runAgentTurn(id, agent: agent, prompt: prompt, model: model, effort: effort) }
+    }
+
+    /// A turn refused before it began: said in the conversation, and the slot handed on.
+    private func refuseTurn(_ id: String, _ reason: String) {
+        let messageID = UUID().uuidString
+        openTurns[id] = OpenTurn(
+            assembler: Assembler(messageID: messageID), startedAt: Date(), turnClaudeID: id,
+            resume: nil, reportedSessionID: nil)
+        retainRunnerTurn(id)
+        publish(id, .status("running"))
+        fold(id, ["type": "result", "is_error": true, "result": reason])
+    }
+
+    private func runAgentTurn(_ id: String, agent: String, prompt: String, model: String?, effort: String?)
+        async
+    {
+        guard openTurns[id] != nil else { return }
+        do {
+            let connection = try await agentConnection(for: id, agent: agent)
+            guard let facts = agentSessionFacts[id] else { throw AcpFailure.notRunning }
+            var choice = agentChoices[id] ?? (nil, nil)
+            if let model, model != (choice.model ?? facts.currentModel), !facts.models.isEmpty {
+                try? await connection.setModel(model, facts: facts)
+                choice.model = model
+            }
+            if let effort, effort != (choice.effort ?? facts.currentEffort),
+                facts.efforts.contains(where: { $0.id == effort })
+            {
+                try? await connection.setEffort(effort, facts: facts)
+                choice.effort = effort
+            }
+            agentChoices[id] = choice
+            let text = agentPrompt(id, prompt)
+            let stop = try await connection.prompt(text)
+            finishAgentTurn(id, connection, stopReason: stop, failure: nil)
+        } catch {
+            let connection = agentConnections[id]
+            let words = (error as? AcpFailure)?.description ?? String(describing: error)
+            finishAgentTurn(id, connection, stopReason: "end_turn", failure: words)
+        }
+    }
+
+    /// The conversation's agent process, started and greeted, with its session open: picked back
+    /// up when the agent can, otherwise begun again and handed a brief of what came before.
+    private func agentConnection(for id: String, agent: String) async throws -> AcpConnection {
+        if let existing = agentConnections[id], await existing.isRunning,
+            await existing.sessionID != nil
+        {
+            return existing
+        }
+        guard let service = agentService else {
+            throw AcpFailure.rpc(code: -32603, message: "This bridge runs no agents.", detail: nil)
+        }
+        guard let session = sessions[id] else { throw AcpFailure.notRunning }
+        let directory = session.directory ?? runner.workdir
+        guard let launch = await service.launch(for: agent, directory: directory) else {
+            throw AcpFailure.rpc(
+                code: -32603, message: "\(await service.displayName(agent)) is not on this machine any more.",
+                detail: nil)
+        }
+        let name = await service.displayName(agent)
+        if sessions[id]?.agentName != name {
+            sessions[id]?.agentName = name
+            persist()
+        }
+        let connection = AcpConnection(
+            launch: launch,
+            onUpdate: { [weak self] connection, data in
+                await self?.agentUpdate(id, connection, data)
+            },
+            onExit: { [weak self] connection in await self?.agentExited(id, connection) })
+        agentConnections[id] = connection
+        agentChoices[id] = nil
+        try await connection.start()
+        _ = try await connection.initialize()
+        var facts: AcpSessionFacts?
+        if let prior = sessions[id]?.agentSessionID {
+            facts = try? await connection.reopen(sessionID: prior, directory: directory)
+            if facts == nil { needsBrief.insert(id) }
+        }
+        if facts == nil {
+            facts = try await connection.newSession(directory: directory)
+            if let opened = facts?.sessionID {
+                sessions[id]?.agentSessionID = opened
+                persist()
+            }
+        }
+        agentSessionFacts[id] = facts
+        return connection
+    }
+
+    /// Conversations whose agent could not pick its session back up, owed a brief on their next
+    /// turn.
+    private var needsBrief: Set<String> = []
+
+    /// What the agent is handed for a turn: the prompt, preceded — once, when the agent lost the
+    /// conversation — by a plain account of it from the bridge's own transcript.
+    private func agentPrompt(_ id: String, _ prompt: String) -> String {
+        guard needsBrief.remove(id) != nil, let session = sessions[id] else { return prompt }
+        var lines: [String] = []
+        for message in session.messages.dropLast() {
+            let text = message.parts.compactMap { part -> String? in
+                if case .text(let value) = part { return value }
+                return nil
+            }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty, message.role != .system else { continue }
+            lines.append("\(message.role == .user ? "User" : "You"): \(text)")
+        }
+        guard !lines.isEmpty else { return prompt }
+        var brief = lines.joined(separator: "\n\n")
+        if brief.count > 24_000 { brief = "…" + String(brief.suffix(24_000)) }
+        return """
+            This conversation began before you were restarted. What was said so far:
+
+            \(brief)
+
+            Carry on from there. The new message:
+
+            \(prompt)
+            """
+    }
+
+    private func agentUpdate(_ id: String, _ connection: AcpConnection, _ data: Data) {
+        guard agentConnections[id] === connection, openTurns[id] != nil,
+            let params = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return }
+        var translator = agentTranslators[id] ?? AcpTranslator()
+        let outputs = translator.translate(params)
+        agentTranslators[id] = translator
+        for output in outputs {
+            switch output {
+            case .object(let object):
+                fold(id, object)
+            case .title(let title):
+                guard var session = sessions[id], session.customTitle != true, session.title != title
+                else { continue }
+                session.title = title
+                session.autoTitled = true
+                sessions[id] = session
+                persist()
+            case .context:
+                continue
+            }
+        }
+    }
+
+    private func finishAgentTurn(
+        _ id: String, _ connection: AcpConnection?, stopReason: String, failure: String?
+    ) {
+        guard openTurns[id] != nil else { return }
+        if let connection, agentConnections[id] !== connection, failure == nil { return }
+        var translator = agentTranslators.removeValue(forKey: id) ?? AcpTranslator()
+        for case .object(let object) in translator.closeOpenCalls() { fold(id, object) }
+        fold(id, translator.result(stopReason: stopReason, failure: failure))
+        if openTurns[id] != nil { closeTurn(id, fallback: nil) }
+    }
+
+    private func endAgentTurnIfStillStopping(_ id: String, _ connection: AcpConnection) async {
+        guard openTurns[id] != nil, agentConnections[id] === connection else { return }
+        agentConnections[id] = nil
+        await connection.terminate()
+        finishAgentTurn(id, nil, stopReason: "cancelled", failure: nil)
+    }
+
+    private func agentExited(_ id: String, _ connection: AcpConnection) async {
+        guard agentConnections[id] === connection else { return }
+        agentConnections[id] = nil
+        agentSessionFacts[id] = nil
+        guard openTurns[id] != nil else { return }
+        let tail = await connection.stderrTail()
+        finishAgentTurn(
+            id, nil, stopReason: "end_turn",
+            failure: tail.isEmpty ? "The agent exited in the middle of the turn." : tail)
+    }
+
+    private func dropAgentConnection(_ id: String) {
+        agentSessionFacts[id] = nil
+        agentTranslators[id] = nil
+        agentChoices[id] = nil
+        guard let connection = agentConnections.removeValue(forKey: id) else { return }
+        Task { await connection.close() }
+    }
+
+    private func reapIdleAgents(now: Date) async {
+        for (id, connection) in agentConnections where openTurns[id] == nil {
+            let idle = now.timeIntervalSince(await connection.lastActivityAt)
+            let running = await connection.isRunning
+            guard idle > processTTL || !running else { continue }
+            guard openTurns[id] == nil, agentConnections[id] === connection else { continue }
+            dropAgentConnection(id)
+        }
+    }
+
     func liveTurnMessage(_ id: String) -> Message? { liveTurns[id] }
 
     private func mirrorLiveTurn(_ id: String, _ event: BridgeEvent) {
@@ -1326,6 +1683,15 @@ actor SessionStore {
         let pusher = self.pusher
         let now = Date()
         Task { await pusher.noteStopped(sessionID: id, now: now) }
+        if let connection = agentConnections[id] {
+            let grace = abortGrace
+            Task { [weak self] in
+                await connection.cancel()
+                try? await Task.sleep(for: .seconds(grace))
+                await self?.endAgentTurnIfStillStopping(id, connection)
+            }
+            return (true, discarded, paused)
+        }
         guard let process = processes[id] else {
             guard let pid = turnProcessIDs[id] else { return (false, discarded, paused) }
             kill(pid, SIGTERM)
@@ -1650,9 +2016,23 @@ actor SessionStore {
         let ending = Self.ending(of: outcome.messages)
         let now = Date()
         let failureText = failedMessages.removeValue(forKey: id)
+        let wasStopped = stoppedTurns.contains(id)
+        let wasFailed = failedTurns.contains(id)
         let settled = CardDetail.settled(
             ending: ending, stopped: stoppedTurns.remove(id) != nil,
             failed: failedTurns.remove(id) != nil)
+        let quiet = quietTurns.remove(id) != nil && !wasFailed && !wasStopped
+            && Self.saysNothingNew(answer)
+        if let observer = turnEndObserver {
+            let note = TurnEndNote(
+                answer: answer, failure: wasFailed ? (failureText ?? "") : nil, stopped: wasStopped,
+                quiet: quiet)
+            Task { await observer(id, note) }
+        }
+        if quiet {
+            settleQuietly(id, messages: outcome.messages)
+            return
+        }
         let waitEnding = TurnWaitEnding(settled: settled)
         lastEndings[id] = LastTurnEnding(
             ending: waitEnding, title: title, toolCount: toolCount, duration: turnDuration,
@@ -2475,4 +2855,14 @@ enum JSONCoding {
         encoder.outputFormatting = [.sortedKeys]
         return encoder
     }()
+}
+
+/// How a turn ended, as the scheduler reads it.
+struct TurnEndNote: Sendable, Equatable {
+    var answer: String
+    /// The error the turn reported, when it failed.
+    var failure: String?
+    var stopped: Bool
+    /// A scheduled run that answered it had nothing new.
+    var quiet: Bool
 }

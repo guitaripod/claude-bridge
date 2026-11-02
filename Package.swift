@@ -21,7 +21,8 @@ let package = Package(
         ),
         .testTarget(
             name: "BridgeTests",
-            dependencies: ["claude-bridge"]
+            dependencies: ["claude-bridge"],
+            exclude: ["Fixtures"]
         ),
     ]
 )

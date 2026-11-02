@@ -285,7 +285,12 @@ private final class LoginSession: @unchecked Sendable {
     private static let terminators = CharacterSet(charactersIn: " \n\r\t\"'")
         .union(.controlCharacters)
 
-    private static func plain(_ text: String) -> String {
+    private static func plain(_ text: String) -> String { TerminalText.plain(text) }
+}
+
+/// What a terminal program printed, without the escape sequences it painted with.
+enum TerminalText {
+    static func plain(_ text: String) -> String {
         var output = ""
         var escaping = false
         var operatingSystemCommand = false
