@@ -159,6 +159,25 @@ struct AgentTurnTests {
         await machine.cleanUp()
     }
 
+    @Test("An older client naming a Claude model in an agent's chat keeps talking to the agent")
+    func olderClient() async throws {
+        let machine = try await AgentMachine()
+        let session = await machine.store.create(CreateRequest(directory: machine.root.path))
+        _ = await machine.store.send(session.id, request: SendRequest(text: "hi", model: "fake/deep"))
+        try await until(.seconds(20)) {
+            await !machine.store.hasQueuedOrRunningTurn(session.id)
+        }
+        _ = await machine.store.send(session.id, request: SendRequest(text: "again", model: "opus"))
+        try await until(.seconds(20)) {
+            await !machine.store.hasQueuedOrRunningTurn(session.id)
+        }
+        let stored = try #require(await machine.store.get(session.id))
+        #expect(stored.model == "fake/deep")
+        let answer = try #require(stored.messages.last { $0.role == .assistant })
+        #expect(text(of: answer).contains("you said: again"))
+        await machine.cleanUp()
+    }
+
     @Test("The models a ready agent offers are listed with the agent as their provider")
     func modelRows() async throws {
         let machine = try await AgentMachine()

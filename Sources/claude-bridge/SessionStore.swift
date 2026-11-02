@@ -614,7 +614,9 @@ actor SessionStore {
             inFlight.remove(id)
             return
         }
-        if let model = queued.model { session.model = model }
+        if let model = queued.model, session.agent == nil || Self.agentID(inModel: model) != nil {
+            session.model = model
+        }
         if let effort = queued.effort { session.effort = effort }
         sessions[id] = session
 
