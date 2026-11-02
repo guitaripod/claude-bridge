@@ -371,7 +371,7 @@ enum TranscriptSearch {
     /// The window is taken before the whitespace is flattened, never after: a passage can be a file
     /// a tool read, and rewriting megabytes of it to quote two lines is the one place this could
     /// spend real time for nothing.
-    private static func snippet(_ text: String, around query: Query) -> String {
+    static func snippet(_ text: String, around query: Query) -> String {
         guard let match = query.earliest(in: text) else {
             return flattened(String(text.prefix(snippetRadius * 2)))
         }
@@ -433,3 +433,40 @@ enum TranscriptSearch {
         byte >= 65 && byte <= 90 ? byte + 32 : byte
     }
 }
+
+extension TranscriptSearch {
+    /// The conversations whose only record is this bridge's own store — an ACP agent writes no
+    /// transcript the CLI search could read — searched the same way, prose, reasoning and tools.
+    static func search(conversations: [Session], query raw: String) -> [SearchHit] {
+        guard let query = Query(raw) else { return [] }
+        return conversations.compactMap { session in
+            var matches: [SearchMatch] = []
+            var total = 0
+            for message in session.messages {
+                for part in message.parts {
+                    let passages: [(String, String)]
+                    switch part {
+                    case .text(let text): passages = [("text", text)]
+                    case .reasoning(let text): passages = [("reasoning", text)]
+                    case .tool(let call): passages = [("toolInput", call.input), ("toolOutput", call.output ?? "")]
+                    case .file, .compaction: passages = []
+                    }
+                    for (kind, text) in passages where !text.isEmpty && query.matches(text.lowercased()) {
+                        total += 1
+                        guard matches.count < matchesPerSession else { continue }
+                        matches.append(
+                            SearchMatch(
+                                role: message.role, kind: kind, text: snippet(text, around: query),
+                                at: message.createdAt))
+                    }
+                }
+            }
+            let titled = query.matches(session.title.lowercased())
+            guard total > 0 || titled else { return nil }
+            return SearchHit(
+                sessionID: session.id, title: session.title, directory: session.directory,
+                updatedAt: session.updatedAt, matches: matches, total: max(total, 1))
+        }
+    }
+}
+

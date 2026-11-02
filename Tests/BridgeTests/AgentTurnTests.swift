@@ -110,6 +110,22 @@ struct AgentTurnTests {
         await machine.cleanUp()
     }
 
+    @Test("An agent's conversation is found by search, though it has no CLI transcript")
+    func searchable() async throws {
+        let machine = try await AgentMachine()
+        let session = await machine.store.create(CreateRequest(directory: machine.root.path))
+        _ = await machine.store.send(session.id, request: SendRequest(text: "find the lighthouse", model: "fake/fast"))
+        try await until(.seconds(20)) {
+            await !machine.store.hasQueuedOrRunningTurn(session.id)
+        }
+        let hits = TranscriptSearch.search(
+            conversations: await machine.store.agentConversations(), query: "lighthouse")
+        #expect(hits.map(\.sessionID) == [session.id])
+        #expect(hits.first?.matches.contains { $0.text.contains("lighthouse") } == true)
+        #expect(TranscriptSearch.search(conversations: await machine.store.agentConversations(), query: "zebra").isEmpty)
+        await machine.cleanUp()
+    }
+
     @Test("An agent's refusal is the turn's own words, not a silent end")
     func agentFailure() async throws {
         let machine = try await AgentMachine()

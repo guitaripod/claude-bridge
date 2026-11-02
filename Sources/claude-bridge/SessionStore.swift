@@ -315,6 +315,9 @@ actor SessionStore {
 
     func get(_ id: String) -> Session? { sessions[id] }
 
+    /// The conversations with ACP agents, whose only transcript is this store.
+    func agentConversations() -> [Session] { sessions.values.filter { $0.agent != nil } }
+
     /// The conversations bookmarked on this machine.
     func saved() -> Set<String> { marks.savedIDs }
 

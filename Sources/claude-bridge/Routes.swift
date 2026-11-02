@@ -425,8 +425,15 @@ func registerRoutes(
             request.uri.queryParameters.get("limit").flatMap { Int($0) }
             ?? TranscriptSearch.defaultLimit
         let root = URL(fileURLWithPath: projectsDir)
-        return jsonResponse(
-            await TranscriptSearch.run(root: root, query: query, limit: max(1, min(limit, 200))))
+        let bounded = max(1, min(limit, 200))
+        var response = await TranscriptSearch.run(root: root, query: query, limit: bounded)
+        let agents = TranscriptSearch.search(conversations: await store.agentConversations(), query: query)
+        if !agents.isEmpty {
+            response.hits = Array(
+                (response.hits + agents).sorted { $0.updatedAt > $1.updatedAt }.prefix(bounded))
+            response.scanned += agents.count
+        }
+        return jsonResponse(response)
     }
 
     router.get("commands") { request, _ in
