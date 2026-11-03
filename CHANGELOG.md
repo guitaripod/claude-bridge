@@ -4,7 +4,7 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
-## 1.17.0 — unreleased
+## 1.17.0 — 2026-11-03
 
 - Hosts any agent that speaks the Agent Client Protocol beside Claude Code — Hermes, Gemini CLI, Codex, goose, Kimi CLI, Qwen Code, GitHub Copilot and the rest of the ACP registry — on the same port and in the same session list, with nothing else to install or pair. An agent is found on PATH, run through npx or uvx, or downloaded from the registry and checked against its sha256; it is ready only once it has answered a real session. `GET /agents`, `/agents/registry`, `/agents/models`, and presses to add, prove, install, give a brain, keep a key and sign in.
 - Gives Hermes a brain with one press: any model server already on the machine (llama-swap, ollama, LM Studio, vLLM), named the way the server names its models, or a provider key kept on the machine in a 0600 file.
