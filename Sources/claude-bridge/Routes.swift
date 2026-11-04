@@ -547,6 +547,17 @@ func registerRoutes(
     /// The bridge's record of one session in one small answer, for a client asking on a clock
     /// while its stream is quiet. What the observer computed within the last second answers the
     /// wider reading and the stamp; the turn itself is read the way `GET /sessions/:id` reads it.
+    /// What fills the conversation's window, measured by its CLI. 404 is *cannot say*: an agent
+    /// conversation, one with no transcript yet, or a CLI that did not answer.
+    router.get("sessions/:id/context") { _, context in
+        let id = context.parameters.get("id") ?? ""
+        guard let report = await store.contextUsage(id) else {
+            return jsonResponse(
+                ["error": "This conversation's window cannot be measured here."], status: .notFound)
+        }
+        return jsonResponse(report)
+    }
+
     router.get("sessions/:id/revision") { _, context in
         let id = context.parameters.get("id") ?? ""
         if let session = await store.get(id) {

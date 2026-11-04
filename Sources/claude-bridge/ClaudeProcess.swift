@@ -496,7 +496,9 @@ actor ClaudeProcess {
     private let sink: @Sendable (ClaudeProcess, String) async -> Void
     private let onExit: @Sendable (ClaudeProcess) async -> Void
     private let onTasksChanged: @Sendable (ClaudeProcess, BackgroundWork?) async -> Void
-    private var pendingControls: [String: CheckedContinuation<Bool, Never>] = [:]
+    /// Each control request in flight, answered with the CLI's reply on success and `nil` on a
+    /// refusal, a timeout or the process going away.
+    private var pendingControls: [String: CheckedContinuation<Data?, Never>] = [:]
     private var swallowing: CheckedContinuation<Bool, Never>?
     private var requestCounter = 0
 
@@ -677,7 +679,14 @@ actor ClaudeProcess {
     private func control(
         _ subtype: String, fields: [String: Any], timeout: Duration = ClaudeProcess.controlTimeout
     ) async -> Bool {
-        guard isRunning else { return false }
+        await controlReply(subtype, fields: fields, timeout: timeout) != nil
+    }
+
+    /// A control request and the body of the CLI's answer to it, as JSON.
+    private func controlReply(
+        _ subtype: String, fields: [String: Any], timeout: Duration = ClaudeProcess.controlTimeout
+    ) async -> Data? {
+        guard isRunning else { return nil }
         requestCounter += 1
         let id = "bridge-\(requestCounter)"
         var request: [String: Any] = ["subtype": subtype]
@@ -688,7 +697,7 @@ actor ClaudeProcess {
                 try write(["type": "control_request", "request_id": id, "request": request])
             } catch {
                 pendingControls[id] = nil
-                continuation.resume(returning: false)
+                continuation.resume(returning: nil)
                 return
             }
             Task { [weak self] in
@@ -698,8 +707,18 @@ actor ClaudeProcess {
         }
     }
 
+    /// What fills this conversation's context window, measured by the CLI itself: each category
+    /// it counts (system prompt, tools, memory files, skills, messages, the autocompact buffer),
+    /// the window it is measured against and where auto-compaction starts. Answered without a turn
+    /// and without a request to the model.
+    func contextUsage() async -> Data? {
+        await controlReply("get_context_usage", fields: [:], timeout: Self.contextUsageTimeout)
+    }
+
+    static let contextUsageTimeout: Duration = .seconds(20)
+
     private func expireControl(_ id: String) {
-        pendingControls.removeValue(forKey: id)?.resume(returning: false)
+        pendingControls.removeValue(forKey: id)?.resume(returning: nil)
     }
 
     private func expireSwallow() {
@@ -726,7 +745,8 @@ actor ClaudeProcess {
             let response = object["response"] as? [String: Any]
             let id = response?["request_id"] as? String ?? ""
             let success = response?["subtype"] as? String == "success"
-            pendingControls.removeValue(forKey: id)?.resume(returning: success)
+            let body = response?["response"].flatMap { try? JSONSerialization.data(withJSONObject: $0) }
+            pendingControls.removeValue(forKey: id)?.resume(returning: success ? (body ?? Data("{}".utf8)) : nil)
             return
         }
         if type == "assistant" {
@@ -810,7 +830,7 @@ actor ClaudeProcess {
         let carried = backgroundWork
         liveTasks = [:]
         if carried != nil { await onTasksChanged(self, nil) }
-        for (_, continuation) in pendingControls { continuation.resume(returning: false) }
+        for (_, continuation) in pendingControls { continuation.resume(returning: nil) }
         pendingControls = [:]
         expireSwallow()
         try? stdinPipe.fileHandleForWriting.close()

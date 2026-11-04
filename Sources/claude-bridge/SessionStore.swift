@@ -905,6 +905,31 @@ actor SessionStore {
 
     func retryWait(for id: String) -> RetryWait? { retryWaits[id] }
 
+    /// What fills a conversation's window, asked of its CLI: the process already holding the
+    /// conversation, or one started on its transcript to answer, which stays for the next turn as
+    /// any process does until the reaper lets it go. A conversation with an agent other than Claude,
+    /// or with no transcript yet, has nothing a CLI could measure.
+    func contextUsage(_ id: String) async -> ContextUsageReport? {
+        guard let session = sessions[id], session.agent == nil else { return nil }
+        let process: ClaudeProcess
+        if let live = processes[id], await live.isRunning {
+            process = live
+        } else {
+            guard let resume = session.claudeSessionID else { return nil }
+            let model = session.model.isEmpty ? defaults.model() : session.model
+            let requested = session.effort.isEmpty ? defaults.effort() : session.effort
+            let effort = requested == Self.ultracodeEffort ? Self.ultracodeRunsAs : requested
+            let launch = ClaudeLaunch(
+                resume: resume, fork: false, directory: session.directory ?? runner.workdir,
+                ultracode: requested == Self.ultracodeEffort)
+            guard let started = try? await self.process(for: id, launch: launch, model: model, effort: effort)
+            else { return nil }
+            process = started
+        }
+        guard let data = await process.contextUsage() else { return nil }
+        return ContextUsageReport.read(data)
+    }
+
     private func noteBackgroundWork(_ id: String, from process: ClaudeProcess, _ work: BackgroundWork?) {
         guard processes[id] === process else { return }
         setBackgroundWork(id, work)
