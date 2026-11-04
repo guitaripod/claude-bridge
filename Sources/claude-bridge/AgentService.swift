@@ -645,13 +645,16 @@ actor AgentService {
     private func keySpecs(_ id: String) -> [AgentKeySpec] { AgentRecipes.recipe(id)?.keys ?? [] }
 
     /// Every agent the machine's list shows: what was added, what is on PATH, and the agents this
-    /// bridge can run without anything installed that are worth naming up front.
+    /// bridge can run without anything installed that are worth naming up front: Hermes, and any
+    /// recipe the registry does not carry, whose install press would otherwise be nowhere.
     private func listedIDs() -> [String] {
         var ids = ledger.added
         for recipe in AgentRecipes.all where !ids.contains(recipe.id) {
             if foundCommand(recipe.id) != nil {
                 ids.append(recipe.id)
-            } else if recipe.id == "hermes", hasRuntime("uv") {
+            } else if let runtime = recipe.fallback?.runtime, hasRuntime(runtime),
+                recipe.id == "hermes" || !registry.contains(where: { $0.id == recipe.id })
+            {
                 ids.append(recipe.id)
             }
         }

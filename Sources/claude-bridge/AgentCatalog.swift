@@ -208,6 +208,17 @@ enum AgentRecipes {
                     env: "OPENAI_API_KEY", name: "OpenAI API key",
                     url: "https://platform.openai.com/api-keys")
             ]),
+        AgentRecipe(
+            id: "deepseek-harness", name: "DeepSeek Harness",
+            description: "DeepSeek's open-source coding agent, on DeepSeek V4 or any provider it is set up with.",
+            commands: ["dsh"], args: ["--profile", "acp"],
+            fallback: .npx(package: "@deepseek-ai/dsh", args: ["--profile", "acp"], env: [:]),
+            keys: [
+                AgentKeySpec(
+                    env: "DEEPSEEK_API_KEY", name: "DeepSeek API key",
+                    url: "https://platform.deepseek.com/api_keys")
+            ],
+            website: "https://github.com/deepseek-ai/deepseek-harness"),
         AgentRecipe(id: "goose", name: "goose", commands: ["goose"], args: ["acp"]),
         AgentRecipe(id: "kimi", name: "Kimi CLI", commands: ["kimi"], args: ["acp"]),
         AgentRecipe(

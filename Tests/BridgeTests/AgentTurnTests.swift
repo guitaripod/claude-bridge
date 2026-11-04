@@ -296,4 +296,13 @@ struct AgentTurnTests {
         let skill = AcpTranslator.named(["kind": "other", "title": "skill_view", "rawInput": ["name": "x"]])
         #expect(skill.0 == "skill_view")
     }
+
+    @Test("DeepSeek Harness runs its own ACP profile, from PATH or through npx")
+    func deepSeekHarnessRecipe() throws {
+        let recipe = try #require(AgentRecipes.recipe("deepseek-harness"))
+        #expect(recipe.commands == ["dsh"])
+        #expect(recipe.args == ["--profile", "acp"])
+        #expect(recipe.fallback == .npx(package: "@deepseek-ai/dsh", args: ["--profile", "acp"], env: [:]))
+        #expect(recipe.keys.map(\.env) == ["DEEPSEEK_API_KEY"])
+    }
 }
