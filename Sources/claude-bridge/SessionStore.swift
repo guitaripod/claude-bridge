@@ -2814,6 +2814,8 @@ actor SessionStore {
 
     private static let settleSeconds = 2.0
     private var storeGeneration = 0
+    /// A write was handed off the actor since the last one made on it, and may not have landed.
+    private var writeInFlight = false
     private var pendingWrite = false
     private var persistTask: Task<Void, Never>?
 
@@ -2823,6 +2825,7 @@ actor SessionStore {
         pendingWrite = false
         let (snapshot, generation) = storeSnapshot()
         let writer = self.writer
+        writeInFlight = true
         Task.detached(priority: .utility) { writer.write(snapshot, generation: generation) }
     }
 
@@ -2833,12 +2836,15 @@ actor SessionStore {
         flush()
     }
 
-    /// Everything owed, written on the spot. Also the way out at shutdown.
+    /// Everything owed, written on the spot. Also the way out at shutdown, so a write still running
+    /// off the actor is waited for and superseded here: a process that exits under it keeps the
+    /// file it had, which would be the store from before the last settle.
     func flush() {
         persistTask?.cancel()
         persistTask = nil
-        guard pendingWrite else { return }
+        guard pendingWrite || writeInFlight else { return }
         pendingWrite = false
+        writeInFlight = false
         writeNow()
     }
 
