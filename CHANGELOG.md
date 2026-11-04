@@ -4,6 +4,12 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.20.0 — 2026-11-04
+
+- Hosts DeepSeek Harness, DeepSeek's open-source coding agent: its own `dsh` when it is on PATH, otherwise `npx @deepseek-ai/dsh --profile acp` with nothing installed, and a DeepSeek API key kept on the machine like any other agent's. Its models (DeepSeek V4 Flash and Pro, and any provider set up in dsh) and reasoning levels come from its own session. The ACP registry does not carry it, so an agent the bridge knows that the registry lacks is now listed wherever its runtime is, ready to add from the app.
+- An agent's tool call that has no ACP kind but is named for a Claude Code tool (`bash`, `write`, `edit`, `grep`, `todo_write`, …) is drawn as that tool: DeepSeek Harness's shell commands, file writes and edits, searches and task lists show as Bash, Write, Edit, Grep and the task board instead of bare names.
+- A message queued behind an agent's turn now reaches the agent when that turn ends. Until now ending the turn closed the queued one before it was sent, leaving an empty answer.
+
 ## 1.19.0 — 2026-11-04
 
 - `GET /sessions/:id/context` answers what fills a conversation's context window as Claude Code itself counts it: the system prompt, tools, memory files, skills, agents, the messages split by kind, the buffer held back for auto-compaction, the window and where auto-compaction starts. It asks the process holding the conversation, or one started on its transcript, so it costs no turn and no request to the model; the app's Range sheet shows it as measured rather than estimated.
