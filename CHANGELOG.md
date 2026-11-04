@@ -4,7 +4,7 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
-## Unreleased
+## 1.18.0 — 2026-11-04
 
 - Answers that are whole documents — a transcript, the session list, analytics — go out gzipped to any client that asks, which every app does on its own: a long conversation that was 6.2 MB on the wire is 1.5, the list 42 KB instead of 184. Event streams are never compressed.
 - `GET /sessions` is tagged like a transcript, so a client holding the list it last read is answered 304.
