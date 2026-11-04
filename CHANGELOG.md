@@ -4,6 +4,15 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## Unreleased
+
+- Answers that are whole documents — a transcript, the session list, analytics — go out gzipped to any client that asks, which every app does on its own: a long conversation that was 6.2 MB on the wire is 1.5, the list 42 KB instead of 184. Event streams are never compressed.
+- `GET /sessions` is tagged like a transcript, so a client holding the list it last read is answered 304.
+- A turn waiting on Anthropic between attempts says so: a `retry` frame with the attempt, the reason, the HTTP status and when it tries next, closed by the next answer or the end of the turn, and `GET /sessions/:id` carries the wait a turn is in. Until now a turn retrying an overloaded model for minutes looked like one thinking hard.
+- `/status` reports `"detail": 1`: the session read answers the goal, the cut-off turn and the provider wait as the whole word on each, so an app refreshing a conversation asks for none of them separately.
+- A failed turn's push no longer says "Done in …" on a phone whose notification extension leaves the alert as sent.
+- Live answers no longer stall for a second whenever a turn anywhere on the machine ends. The session store, every conversation with its messages, was re-encoded whole on the store's actor at each settle; it is now written off the actor, re-encoding only the conversations that changed, in the same format.
+
 ## 1.17.0 — 2026-11-03
 
 - Hosts any agent that speaks the Agent Client Protocol beside Claude Code — Hermes, Gemini CLI, Codex, goose, Kimi CLI, Qwen Code, GitHub Copilot and the rest of the ACP registry — on the same port and in the same session list, with nothing else to install or pair. An agent is found on PATH, run through npx or uvx, or downloaded from the registry and checked against its sha256; it is ready only once it has answered a real session. `GET /agents`, `/agents/registry`, `/agents/models`, and presses to add, prove, install, give a brain, keep a key and sign in.
