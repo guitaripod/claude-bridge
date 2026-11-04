@@ -1548,15 +1548,18 @@ actor SessionStore {
         }
     }
 
+    /// Settles the agent's turn. Folding its result closes it, and closing it starts the next
+    /// queued message at once, so only the turn this was called for is closed again here, never
+    /// the one that has just taken its place.
     private func finishAgentTurn(
         _ id: String, _ connection: AcpConnection?, stopReason: String, failure: String?
     ) {
-        guard openTurns[id] != nil else { return }
+        guard let started = openTurns[id]?.startedAt else { return }
         if let connection, agentConnections[id] !== connection, failure == nil { return }
         var translator = agentTranslators.removeValue(forKey: id) ?? AcpTranslator()
         for case .object(let object) in translator.closeOpenCalls() { fold(id, object) }
         fold(id, translator.result(stopReason: stopReason, failure: failure))
-        if openTurns[id] != nil { closeTurn(id, fallback: nil) }
+        if openTurns[id]?.startedAt == started { closeTurn(id, fallback: nil) }
     }
 
     private func endAgentTurnIfStillStopping(_ id: String, _ connection: AcpConnection) async {

@@ -239,4 +239,25 @@ struct AgentTurnTests {
         #expect(readAt >= stored.updatedAt.addingTimeInterval(-1))
         await machine.cleanUp()
     }
+
+    @Test("A message queued behind an agent's turn is sent to the agent when that turn ends")
+    func queuedAgentTurn() async throws {
+        let machine = try await AgentMachine()
+        let session = await machine.store.create(CreateRequest(directory: machine.root.path))
+        let first = await machine.store.send(
+            session.id, request: SendRequest(text: "first one", model: "fake/fast"))
+        #expect(first == .started)
+        _ = await machine.store.send(session.id, request: SendRequest(text: "second one", model: "fake/fast"))
+        try await until(.seconds(20)) {
+            let busy = await machine.store.hasQueuedOrRunningTurn(session.id)
+            let stored = await machine.store.get(session.id)
+            return !busy && stored?.messages.filter { $0.role == .assistant }.count == 2
+        }
+        let stored = try #require(await machine.store.get(session.id))
+        let answers = stored.messages.filter { $0.role == .assistant }.map(text(of:))
+        #expect(answers.count == 2)
+        #expect(answers.first?.contains("you said: first one") == true)
+        #expect(answers.last?.contains("you said: second one") == true)
+        await machine.cleanUp()
+    }
 }
