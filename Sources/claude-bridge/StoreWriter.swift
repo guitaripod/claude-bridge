@@ -11,7 +11,8 @@ import Foundation
 /// reusing the bytes of every conversation that has not changed since the last write.
 ///
 /// Writes are ordered by the generation the store stamps on each snapshot, so a write that lost a
-/// race to a newer one is dropped rather than putting an older store back on disk. The format is
+/// race to a newer one is dropped rather than putting an older store back on disk — a newer one
+/// that failed included, since the next change writes the store whole again. The format is
 /// the one it always was, a JSON array of sessions, so any bridge can read what this one wrote.
 final class StoreWriter: @unchecked Sendable {
     private let url: URL
@@ -48,9 +49,9 @@ final class StoreWriter: @unchecked Sendable {
         }
         body.append(UInt8(ascii: "]"))
         written = encoded
+        writtenGeneration = generation
         try? FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        guard (try? body.write(to: url, options: .atomic)) != nil else { return }
-        writtenGeneration = generation
+        try? body.write(to: url, options: .atomic)
     }
 }
