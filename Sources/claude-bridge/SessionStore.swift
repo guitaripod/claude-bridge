@@ -2645,9 +2645,7 @@ actor SessionStore {
     }
 
     private static func loadStored(from url: URL) -> [Session] {
-        guard let data = try? Data(contentsOf: url),
-            let stored = try? JSONCoding.decoder.decode([Session].self, from: data)
-        else { return [] }
+        guard let stored = StoreWriter.load(from: url) else { return [] }
         return stored.map { session in
             var healed = session
             healed.messages = dedupedByID(session.messages).map(seamAsSystem)
