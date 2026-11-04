@@ -173,7 +173,7 @@ actor ObserverLoop {
     /// What the last sweep computed, at most a second old — `GET /sessions` serves this instead
     /// of recomputing the world per request while a live turn keeps the index busy.
     func summariesSnapshot() -> [SessionSummary] {
-        lastSummaries.values.sorted { $0.updatedAt > $1.updatedAt }
+        lastSummaries.values.sorted { ($0.updatedAt, $0.id) > ($1.updatedAt, $1.id) }
     }
 
     /// One row of the same snapshot. Nil for a session the sweep has not seen — a chat created

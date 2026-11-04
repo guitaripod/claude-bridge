@@ -392,11 +392,11 @@ func registerRoutes(
         jsonResponse(await OpenCodeGoUsage.snapshot())
     }
 
-    router.get("sessions") { _, _ in
+    router.get("sessions") { request, _ in
         // The observer already computed this within the last second; recomputing per request
         // is what made the route take fifteen seconds under a live turn.
         let warm = await observer.summariesSnapshot()
-        if !warm.isEmpty { return jsonResponse(warm) }
+        if !warm.isEmpty { return validatedJSONResponse(warm, request: request) }
         let active = await index.activeIDs(within: TranscriptIndex.activityWindow)
         let dates = await index.transcriptDates()
         let agents = await index.agentActivity()
@@ -405,8 +405,11 @@ func registerRoutes(
             activeClaudeIDs: active, transcriptDates: dates, agents: agents, settings: settings)
         let (claimed, hidden) = await store.excludedTranscriptIDs()
         let discovered = await index.list(excluding: claimed, hidden: hidden)
-        return jsonResponse(
-            await store.stampingMarks(stored + discovered).sorted { $0.updatedAt > $1.updatedAt })
+        return validatedJSONResponse(
+            await store.stampingMarks(stored + discovered).sorted {
+                ($0.updatedAt, $0.id) > ($1.updatedAt, $1.id)
+            },
+            request: request)
     }
 
     router.post("sessions") { request, _ in
