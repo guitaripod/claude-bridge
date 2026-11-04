@@ -2059,7 +2059,7 @@ actor SessionStore {
                 sessionID: id, toolCount: toolCount, ending: ending, title: title, now: now)
             let goal = await index?.goal(for: claudeID)
             await devicePusher.pushTurnEnd(
-                sessionID: id, title: title, toolCount: toolCount, failed: false,
+                sessionID: id, title: title, toolCount: toolCount, failed: wasFailed,
                 duration: turnDuration, goal: goal, notice: notice)
         }
     }
