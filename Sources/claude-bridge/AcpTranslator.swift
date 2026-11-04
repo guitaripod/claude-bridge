@@ -240,12 +240,49 @@ struct AcpTranslator {
             if let query = raw["query"] as? String { return ("WebSearch", ["query": query]) }
             return ("WebFetch", ["url": title])
         default:
+            if let known = Self.claudeTool(title, raw: raw, path: path) { return known }
             var input = raw
             if input.isEmpty, !title.isEmpty { input["description"] = title }
             if let path, input["file_path"] == nil { input["file_path"] = path }
             let name = title.isEmpty ? kind.capitalized : Self.toolName(title)
             return (name, input)
         }
+    }
+
+    /// Claude Code's tool names, keyed the way agents spell them in a title (`bash`, `Read`,
+    /// `web_fetch`, `todo_write`). DeepSeek Harness reports every call as kind `other`, titled with
+    /// such a name and carrying Claude-shaped arguments.
+    private static let claudeTools: [String: String] = [
+        "bash": "Bash", "read": "Read", "write": "Write", "edit": "Edit", "glob": "Glob",
+        "grep": "Grep", "webfetch": "WebFetch", "websearch": "WebSearch", "todowrite": "TodoWrite",
+    ]
+
+    /// A call of no particular kind whose title is one of Claude Code's tool names is that tool,
+    /// its input kept as the agent sent it except where Claude's shape differs: a file tool's path
+    /// is its `file_path`, a search's first query its `query`, and each task its `activeForm`.
+    private static func claudeTool(
+        _ title: String, raw: [String: Any], path: String?
+    ) -> (String, [String: Any])? {
+        let key = toolName(title).lowercased().replacingOccurrences(of: "_", with: "")
+        guard let name = claudeTools[key] else { return nil }
+        var input = raw
+        switch name {
+        case "Read", "Write", "Edit":
+            if input["file_path"] == nil, let path { input["file_path"] = path }
+        case "WebSearch":
+            if input["query"] == nil, let first = (raw["queries"] as? [String])?.first {
+                input["query"] = first
+            }
+        case "TodoWrite":
+            if let todos = raw["todos"] as? [[String: Any]] {
+                input["todos"] = todos.map { todo in
+                    todo.merging(["activeForm": todo["content"] as? String ?? ""]) { old, _ in old }
+                }
+            }
+        default:
+            break
+        }
+        return (name, input)
     }
 
     /// "terminal: uname -s" → "uname -s"; a title with no such prefix is the command itself.

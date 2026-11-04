@@ -260,4 +260,40 @@ struct AgentTurnTests {
         #expect(answers.last?.contains("you said: second one") == true)
         await machine.cleanUp()
     }
+
+    @Test("A call of no kind titled with a Claude tool's name is drawn as that tool")
+    func claudeNamedCalls() throws {
+        let written = AcpTranslator.named([
+            "kind": "other", "title": "write",
+            "rawInput": ["file_path": "/repo/hello.txt", "content": "hi"],
+        ])
+        #expect(written.0 == "Write")
+        #expect(written.1["file_path"] as? String == "/repo/hello.txt")
+        #expect(written.1["content"] as? String == "hi")
+
+        let shell = AcpTranslator.named([
+            "kind": "other", "title": "bash",
+            "rawInput": ["command": "cat hello.txt", "description": "Show the file"],
+        ])
+        #expect(shell.0 == "Bash")
+        #expect(shell.1["command"] as? String == "cat hello.txt")
+
+        let search = AcpTranslator.named([
+            "kind": "other", "title": "web_search", "rawInput": ["queries": ["swift 6.3", "swift 7"]],
+        ])
+        #expect(search.0 == "WebSearch")
+        #expect(search.1["query"] as? String == "swift 6.3")
+
+        let todos = AcpTranslator.named([
+            "kind": "other", "title": "todo_write",
+            "rawInput": ["todos": [["content": "Read the spec", "status": "in_progress"]]],
+        ])
+        #expect(todos.0 == "TodoWrite")
+        let task = try #require((todos.1["todos"] as? [[String: Any]])?.first)
+        #expect(task["activeForm"] as? String == "Read the spec")
+        #expect(task["status"] as? String == "in_progress")
+
+        let skill = AcpTranslator.named(["kind": "other", "title": "skill_view", "rawInput": ["name": "x"]])
+        #expect(skill.0 == "skill_view")
+    }
 }
