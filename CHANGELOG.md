@@ -4,6 +4,11 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.19.0 — 2026-11-04
+
+- `GET /sessions/:id/context` answers what fills a conversation's context window as Claude Code itself counts it: the system prompt, tools, memory files, skills, agents, the messages split by kind, the buffer held back for auto-compaction, the window and where auto-compaction starts. It asks the process holding the conversation, or one started on its transcript, so it costs no turn and no request to the model; the app's Range sheet shows it as measured rather than estimated.
+- The session store is split: `sessions.json` is an index of every conversation without its messages, and each conversation's messages live in `conversations/<id>.json`, written only when they change. On a machine with 618 conversations the index is 216 KB instead of 243 MB and a turn's end writes in 17 ms instead of a second. The first start splits the old file on its own. A bridge older than 1.19.0 started on the split store shows conversations without their messages until it is updated again; nothing is lost.
+
 ## 1.18.0 — 2026-11-04
 
 - Answers that are whole documents — a transcript, the session list, analytics — go out gzipped to any client that asks, which every app does on its own: a long conversation that was 6.2 MB on the wire is 1.5, the list 42 KB instead of 184. Event streams are never compressed.
