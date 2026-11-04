@@ -55,6 +55,7 @@ actor SessionStore {
     private let runner: ClaudeRunner
     private let defaults: MachineDefaults
     private let storeURL: URL
+    private let writer: StoreWriter
     private let projectsDir: String
     let pusher: LiveActivityPusher
     let devicePusher: DevicePusher
@@ -232,6 +233,7 @@ actor SessionStore {
         self.runner = runner
         self.defaults = defaults
         self.storeURL = storeURL
+        writer = StoreWriter(url: storeURL)
         self.projectsDir = projectsDir
         journalURL = TurnJournal.url(besides: storeURL)
         journal = TurnJournal.load(from: journalURL)
@@ -2811,6 +2813,7 @@ actor SessionStore {
     }
 
     private static let settleSeconds = 2.0
+    private var storeGeneration = 0
     private var pendingWrite = false
     private var persistTask: Task<Void, Never>?
 
@@ -2818,7 +2821,9 @@ actor SessionStore {
         persistTask = nil
         guard pendingWrite else { return }
         pendingWrite = false
-        writeNow()
+        let (snapshot, generation) = storeSnapshot()
+        let writer = self.writer
+        Task.detached(priority: .utility) { writer.write(snapshot, generation: generation) }
     }
 
     /// The store on disk before this call returns: a session created, adopted, forked, renamed,
@@ -2838,12 +2843,15 @@ actor SessionStore {
     }
 
     private func writeNow() {
-        let snapshot = order.compactMap { sessions[$0] }
-        let url = storeURL
-        guard let data = try? JSONCoding.encoder.encode(snapshot) else { return }
-        try? FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? data.write(to: url, options: .atomic)
+        let (snapshot, generation) = storeSnapshot()
+        writer.write(snapshot, generation: generation)
+    }
+
+    /// The sessions as they stand, numbered so that a write of an older snapshot that finishes
+    /// late never replaces a newer one on disk.
+    private func storeSnapshot() -> ([Session], Int) {
+        storeGeneration += 1
+        return (order.compactMap { sessions[$0] }, storeGeneration)
     }
 }
 

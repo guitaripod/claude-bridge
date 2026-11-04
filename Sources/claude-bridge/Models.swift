@@ -15,7 +15,7 @@ enum ToolStatus: String, Codable, Sendable {
     case stopped
 }
 
-struct ToolCall: Codable, Sendable {
+struct ToolCall: Codable, Sendable, Equatable {
     var id: String
     var name: String
     var input: String
@@ -52,7 +52,7 @@ struct BackgroundOutcome: Codable, Sendable, Equatable {
 /// A file in a conversation: one that travelled with a prompt, or one the agent
 /// read and is therefore showing. `url` is relative to the bridge root so a
 /// client can fetch the bytes without knowing where on the host they landed.
-struct FileRef: Codable, Sendable {
+struct FileRef: Codable, Sendable, Equatable {
     var path: String
     var mime: String
     var filename: String?
@@ -63,7 +63,7 @@ struct FileRef: Codable, Sendable {
 /// come straight off the transcript's `compact_boundary` record; ``summary`` is the
 /// `isCompactSummary` message that follows it, which is a 16k-word artifact no client should ever
 /// render as a chat bubble.
-struct Compaction: Codable, Sendable {
+struct Compaction: Codable, Sendable, Equatable {
     var trigger: String?
     var tokensBefore: Int?
     var tokensAfter: Int?
@@ -72,7 +72,7 @@ struct Compaction: Codable, Sendable {
     var summary: String?
 }
 
-enum Part: Codable, Sendable {
+enum Part: Codable, Sendable, Equatable {
     case text(String)
     case reasoning(String)
     case tool(ToolCall)
@@ -115,7 +115,7 @@ enum Part: Codable, Sendable {
     }
 }
 
-struct Message: Codable, Sendable {
+struct Message: Codable, Sendable, Equatable {
     var id: String
     var role: Role
     var parts: [Part]
@@ -160,7 +160,7 @@ struct TaskNotification: Sendable, Equatable {
     }
 }
 
-struct Session: Codable, Sendable {
+struct Session: Codable, Sendable, Equatable {
     var id: String
     var title: String
     var directory: String?

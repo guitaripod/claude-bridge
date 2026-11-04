@@ -36,7 +36,7 @@ struct Rate: Sendable {
 /// The token tiers that price differently. `cacheWrite5m` / `cacheWrite1h` split the single
 /// `cache_creation_input_tokens` field when the finer `cache_creation.ephemeral_*` breakdown is
 /// present; without it every cache write falls into the cheaper five-minute tier.
-struct TokenCounts: Codable, Sendable {
+struct TokenCounts: Codable, Sendable, Equatable {
     var input = 0
     var output = 0
     var cacheRead = 0
