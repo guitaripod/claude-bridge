@@ -110,6 +110,9 @@ actor SessionStore {
     /// that settle a Live Activity card. Transient like the rest of this turn-scoped bookkeeping —
     /// a restart loses it, exactly as it loses ``autoContinues`` and everything else above.
     private var lastEndings: [String: LastTurnEnding] = [:]
+    /// The wait between attempts each open turn is in, if any — so a client that opens the chat in
+    /// the middle of one reads it off the fetch instead of waiting for the next attempt to fail.
+    private var retryWaits: [String: RetryWait] = [:]
 
     private struct QueuedPrompt {
         let prompt: String
@@ -760,6 +763,7 @@ actor SessionStore {
                 journal.write(to: journalURL)
             }
         }
+        if case .retry(let wait) = event { retryWaits[id] = wait }
         broadcaster(for: id).send(event)
         mirrorLiveTurn(id, event)
         let pusher = self.pusher
@@ -848,6 +852,7 @@ actor SessionStore {
     /// answer, whole or cut short, and the store settles it the way it always has.
     private func closeTurn(_ id: String, fallback: String?) {
         guard var turn = openTurns.removeValue(forKey: id) else { return }
+        if retryWaits[id] != nil { publish(id, .retry(nil)) }
         turn.assembler.closeOpenCompaction(
             stopped: stoppedTurns.contains(id), emit: { self.publish(id, $0) })
         var messages = turn.assembler.finalMessages()
@@ -895,6 +900,8 @@ actor SessionStore {
     func backgroundWork(for id: String) -> BackgroundWork? { carriedWork[id] }
 
     func lastEnding(_ id: String) -> LastTurnEnding? { lastEndings[id] }
+
+    func retryWait(for id: String) -> RetryWait? { retryWaits[id] }
 
     private func noteBackgroundWork(_ id: String, from process: ClaudeProcess, _ work: BackgroundWork?) {
         guard processes[id] === process else { return }

@@ -588,6 +588,7 @@ func registerRoutes(
                 session.backgroundSince = work.since
                 session.backgroundStalled = work.stalled
             }
+            if live.turnOpen { session.retry = await store.retryWait(for: id) }
             if let partial = await store.liveTurnMessage(id) {
                 session.messages.append(partial)
             } else if let claudeID = session.claudeSessionID,

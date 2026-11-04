@@ -222,6 +222,9 @@ struct Session: Codable, Sendable {
     var agentSessionID: String? = nil
     /// The schedule this conversation runs for, when a schedule made it.
     var scheduleID: String? = nil
+    /// Stamped when a session is served, never stored: the open turn is waiting on Anthropic
+    /// between attempts, and why.
+    var retry: RetryWait? = nil
 
     var summary: SessionSummary {
         SessionSummary(
@@ -422,6 +425,22 @@ struct CreateRequest: Codable, Sendable {
 }
 
 /// Events streamed to a subscribed client over SSE. Mirrors the Kit's BackendEvent shape.
+/// A turn waiting on Anthropic between attempts. The request failed in a way the CLI retries by
+/// itself — a rate limit, an overloaded model, a server error, an answer that never started — and
+/// it asks again at `nextAttemptAt`. From the outside that wait is a model thinking very hard: the
+/// turn is open and nothing streams, sometimes for minutes. Carried as a state with its reason, so
+/// a client can say what it is waiting for and when it next tries.
+struct RetryWait: Codable, Sendable, Equatable {
+    /// The attempt that just failed, counting from one.
+    var attempt: Int
+    var maxRetries: Int?
+    /// What went wrong, in a sentence a person can read.
+    var reason: String
+    /// The HTTP status the failed attempt was answered with, where there was one.
+    var status: Int?
+    var nextAttemptAt: Date?
+}
+
 enum BridgeEvent: Codable, Sendable {
     case messageUpserted(Message)
     case partTextDelta(messageID: String, delta: String)
@@ -448,11 +467,16 @@ enum BridgeEvent: Codable, Sendable {
     /// The shared queue changed. Always the whole snapshot, so a client that missed an earlier
     /// frame is right again after any later one.
     case queue(QueueSnapshot)
+    /// The open turn started waiting on Anthropic between attempts, or — `nil` — an attempt is
+    /// answering again or the turn ended. Separate from ``status``: the turn stays open throughout,
+    /// and what changes is only whether anybody can say why nothing is arriving.
+    case retry(RetryWait?)
 
     private enum CodingKeys: String, CodingKey {
         case type, message, messageID, delta, tool, status, error, goal, phase, interruption
         case tasks, task, since, stalled
         case queue, paused
+        case retry
     }
 
     func encode(to encoder: Encoder) throws {
@@ -495,6 +519,9 @@ enum BridgeEvent: Codable, Sendable {
             try c.encode("queue", forKey: .type)
             try c.encode(snapshot.queue, forKey: .queue)
             try c.encode(snapshot.paused, forKey: .paused)
+        case .retry(let wait):
+            try c.encode("retry", forKey: .type)
+            try c.encodeIfPresent(wait, forKey: .retry)
         }
     }
 
@@ -532,6 +559,7 @@ enum BridgeEvent: Codable, Sendable {
                 QueueSnapshot(
                     queue: try c.decodeIfPresent([QueuedItem].self, forKey: .queue) ?? [],
                     paused: try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false))
+        case "retry": self = .retry(try c.decodeIfPresent(RetryWait.self, forKey: .retry))
         default: self = .error(try c.decode(String.self, forKey: .error))
         }
     }

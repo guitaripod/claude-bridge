@@ -135,6 +135,9 @@ struct Assembler {
     private var taskLaunches: [String: String] = [:]
     private var currentBlock: (index: Int, toolID: String?)?
     private var blockBoundary = true
+    /// Whether a wait between attempts has been announced and not yet called off. The next attempt
+    /// speaking, or the turn closing, is what calls it off.
+    private var retrying = false
 
     init(messageID: String) {
         self.messageID = messageID
@@ -142,7 +145,7 @@ struct Assembler {
     }
 
     mutating func ingest(
-        _ object: [String: Any], emit: (BridgeEvent) -> Void,
+        _ object: [String: Any], now: Date = Date(), emit: (BridgeEvent) -> Void,
         report: (String, BackgroundOutcome) -> Void = { _, _ in }
     ) {
         switch object["type"] as? String {
@@ -156,14 +159,18 @@ struct Assembler {
                 ingestCompactionBoundary(object, emit: emit)
             case "task_notification":
                 ingestTaskNotificationEvent(object, emit: emit, report: report)
+            case "api_retry":
+                ingestRetry(object, now: now, emit: emit)
             default:
                 break
             }
         case "stream_event":
+            endRetry(emit: emit)
             ingestStreamEvent(object["event"] as? [String: Any] ?? [:], emit: emit)
         case "user":
             ingestUser(object, emit: emit, report: report)
         case "result":
+            endRetry(emit: emit)
             closeOpenCompaction(
                 stopped: false,
                 reason: (object["is_error"] as? Bool == true) ? object["result"] as? String : nil,
@@ -178,6 +185,51 @@ struct Assembler {
         default:
             break
         }
+    }
+
+    /// The CLI's own report that a request to Anthropic failed and will be tried again after a
+    /// delay. Every attempt is reported, so each one replaces the wait before it.
+    private mutating func ingestRetry(
+        _ object: [String: Any], now: Date, emit: (BridgeEvent) -> Void
+    ) {
+        let delay = (object["retry_delay_ms"] as? NSNumber)?.doubleValue
+        let waited = ((object["no_response"] as? [String: Any])?["waited_ms"] as? NSNumber)?.doubleValue
+        let status = (object["error_status"] as? NSNumber)?.intValue
+        let wait = RetryWait(
+            attempt: max(1, (object["attempt"] as? NSNumber)?.intValue ?? 1),
+            maxRetries: (object["max_retries"] as? NSNumber)?.intValue,
+            reason: Self.retryReason(
+                category: object["error"] as? String, status: status, waitedMs: waited),
+            status: status,
+            nextAttemptAt: delay.map { now.addingTimeInterval(max(0, $0) / 1000) })
+        retrying = true
+        emit(.retry(wait))
+    }
+
+    private mutating func endRetry(emit: (BridgeEvent) -> Void) {
+        guard retrying else { return }
+        retrying = false
+        emit(.retry(nil))
+    }
+
+    /// The failure in a person's words. The CLI names it by category, and a request that never
+    /// got an answer at all says how long it waited instead.
+    static func retryReason(category: String?, status: Int?, waitedMs: Double?) -> String {
+        if let waitedMs {
+            return "Anthropic's API did not answer for \(Int((waitedMs / 1000).rounded())) s"
+        }
+        let words: String
+        switch category {
+        case "rate_limit": words = "Anthropic is rate limiting requests"
+        case "overloaded": words = "Anthropic's API is overloaded"
+        case "server_error": words = "Anthropic's API had a server error"
+        case "authentication_failed": words = "Anthropic did not accept this machine's sign-in"
+        case "billing_error": words = "Anthropic refused the request over billing"
+        case "invalid_request": words = "Anthropic rejected the request"
+        default: words = "A request to Anthropic's API failed"
+        }
+        guard let status else { return words }
+        return "\(words) (\(status))"
     }
 
     /// A turn the CLI refused rather than answered.
