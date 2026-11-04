@@ -173,6 +173,10 @@ struct BridgeStatus: Encodable {
     var agents = 1
     /// Protocol version of the schedules this machine keeps and asks (`/schedules`).
     var schedules = 1
+    /// Protocol version of the session read's sidecar: `GET /sessions/:id` answers the goal, the
+    /// cut-off turn and the provider wait as the whole word on each, so a client refreshing a
+    /// conversation asks for none of them separately.
+    var detail = 1
 }
 
 struct AuthCodeRequest: Decodable {
