@@ -71,6 +71,17 @@ struct ProviderRetryTests {
         #expect(seen.last! == nil)
     }
 
+    @Test("An attempt that answers without streaming still ends the wait")
+    func unstreamedAnswerEndsTheWait() {
+        let answered: [String: Any] = [
+            "type": "assistant",
+            "message": ["role": "assistant", "content": [["type": "text", "text": "done"]]] as [String: Any],
+        ]
+        let seen = waits([Self.retry(attempt: 1), answered, Self.result])
+        #expect(seen.count == 2)
+        #expect(seen.last! == nil)
+    }
+
     @Test("A turn that never waited says nothing about waiting")
     func noRetryNoFrames() {
         #expect(waits([Self.textStart, Self.result]).isEmpty)

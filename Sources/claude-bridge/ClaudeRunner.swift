@@ -167,7 +167,10 @@ struct Assembler {
         case "stream_event":
             endRetry(emit: emit)
             ingestStreamEvent(object["event"] as? [String: Any] ?? [:], emit: emit)
+        case "assistant":
+            endRetry(emit: emit)
         case "user":
+            endRetry(emit: emit)
             ingestUser(object, emit: emit, report: report)
         case "result":
             endRetry(emit: emit)
