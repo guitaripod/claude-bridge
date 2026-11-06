@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.20.1 — 2026-11-06
+
+- The Mac build no longer crashes when a request's body (a message, a queued message, a rename) reaches it after its headers, as it often does from a phone on a cellular network: since 1.18.0 the Mac bridge died on them ("The network connection was lost" in the app) and launchd restarted it, over and over. The code was right; the Swift 6.3 compiler of Xcode 26 miscompiled the wait for the body (swiftlang/swift#84793). Releases for the Mac are now built with Xcode 27, and every release is started and sent a late body before it is published.
+
 ## 1.20.0 — 2026-11-04
 
 - Hosts DeepSeek Harness, DeepSeek's open-source coding agent: its own `dsh` when it is on PATH, otherwise `npx @deepseek-ai/dsh --profile acp` with nothing installed, and a DeepSeek API key kept on the machine like any other agent's. Its models (DeepSeek V4 Flash and Pro, and any provider set up in dsh) and reasoning levels come from its own session. The ACP registry does not carry it, so an agent the bridge knows that the registry lacks is now listed wherever its runtime is, ready to add from the app.
