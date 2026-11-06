@@ -4,6 +4,12 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.21.0 — 2026-11-06
+
+- A push says the work is done when the work is done, not when a turn is. A turn that leaves a background command, a subagent or a workflow running, that a queued message follows, or that Claude follows on its own once that work finishes is one stretch of work, and the phone hears about it once, ten seconds after nothing is running, carried or queued any more, with how long the whole stretch took and every tool it ran. A turn that stops to ask still pushes at once.
+- Each phone decides what it hears. A device registers its rules with its token (finished work when it is done, every turn, only failures or never; only for work longer than a minimum; approvals and questions on or off; muted chats), and the bridge applies them per device. A phone that registered before the rules existed gets the default, finished work when it is done.
+- `GET /sessions/:id/wait?until=settled` holds the phone's background wait until the work settles and answers `settled: true` for the whole stretch; `/status` says `turnWait: 2`.
+
 ## 1.20.1 — 2026-11-06
 
 - The Mac build no longer crashes when a request's body (a message, a queued message, a rename) reaches it after its headers, as it often does from a phone on a cellular network: since 1.18.0 the Mac bridge died on them ("The network connection was lost" in the app) and launchd restarted it, over and over. The code was right; the Swift 6.3 compiler of Xcode 26 miscompiled the wait for the body (swiftlang/swift#84793). Releases for the Mac are now built with Xcode 27, and every release is started and sent a late body before it is published.
