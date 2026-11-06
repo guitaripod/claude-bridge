@@ -99,11 +99,15 @@ struct DeviceRegistration: Codable, Sendable {
     var token: String
     var environment: String
     var lastSeenAt: Date
+    /// What the device asked to hear about; nil from a device that registered before it could
+    /// say, which is read as ``DeviceRules/standard``.
+    var rules: DeviceRules?
 }
 
 struct DeviceRegisterRequest: Codable, Sendable {
     var token: String
     var environment: String
+    var rules: DeviceRules?
 }
 
 struct PushUsage: Codable, Sendable {
@@ -137,11 +141,34 @@ actor DevicePusher {
     /// push from one that only ever answers `{"ok":true}` because there is nothing behind it.
     var delivers: Bool { client != nil }
 
-    func register(token: String, environment: String) {
+    func register(token: String, environment: String, rules: DeviceRules? = nil) {
         devices[token] = DeviceRegistration(
-            token: token, environment: environment, lastSeenAt: Date())
+            token: token, environment: environment, lastSeenAt: Date(), rules: rules)
         persist()
-        log("device registered (\(environment)) — \(devices.count) known")
+        let finish = (rules ?? .standard).finish.rawValue
+        log("device registered (\(environment), finished work: \(finish)) — \(devices.count) known")
+    }
+
+    /// When a push about a turn is sent: as the turn closes, or once the stretch of work it
+    /// belongs to is over.
+    enum Occasion: Sendable, Equatable {
+        case turnClosed
+        case workSettled
+    }
+
+    /// The devices a push is for, each by its own rules. A question goes to every device that
+    /// hears asks, as the turn closes. Finished work goes to the devices that hear every turn when
+    /// the turn closes, and to everyone else once the work settles — never both.
+    static func recipients(
+        _ devices: [DeviceRegistration], kind: NoticePush.Kind, occasion: Occasion,
+        failed: Bool, length: TimeInterval, sessionID: String
+    ) -> [DeviceRegistration] {
+        devices.filter { device in
+            let rules = device.rules ?? .standard
+            if kind == .question { return occasion == .turnClosed && rules.hearsAsks }
+            guard rules.hearsEveryTurn == (occasion == .turnClosed) else { return false }
+            return rules.admits(failed: failed, length: length, sessionID: sessionID)
+        }
     }
 
     func unregister(token: String) {
@@ -155,9 +182,14 @@ actor DevicePusher {
 
     func pushTurnEnd(
         sessionID: String, title: String, toolCount: Int, failed: Bool, duration: TimeInterval,
-        goal: GoalStatus? = nil, notice: NoticePush.Additions? = nil
+        goal: GoalStatus? = nil, notice: NoticePush.Additions? = nil, occasion: Occasion
     ) async {
         guard let client, !devices.isEmpty else { return }
+        let kind = notice?.kind ?? (failed ? .failed : .done)
+        let targets = Self.recipients(
+            Array(devices.values), kind: kind, occasion: occasion,
+            failed: failed || kind == .failed, length: duration, sessionID: sessionID)
+        guard !targets.isEmpty else { return }
         var payload: [String: Any] = [
             "aps": [
                 "alert": [
@@ -178,7 +210,8 @@ actor DevicePusher {
         if let notice { payload = NoticePush.fitted(NoticePush.merged(payload, with: notice)) }
         await fanOut(
             payload: payload, topic: client.bundleTopic, pushType: "alert", priority: "10",
-            collapseID: Self.truncated("done:\(sessionID)", toBytes: 64), label: "alert")
+            collapseID: Self.truncated("done:\(sessionID)", toBytes: 64), label: "alert",
+            to: targets)
     }
 
     func noteExternalIdle() async {
@@ -201,11 +234,11 @@ actor DevicePusher {
 
     private func fanOut(
         payload: [String: Any], topic: String, pushType: String, priority: String,
-        collapseID: String?, label: String
+        collapseID: String?, label: String, to chosen: [DeviceRegistration]? = nil
     ) async {
         guard let client, let body = try? JSONSerialization.data(withJSONObject: payload)
         else { return }
-        let targets = Array(devices.values)
+        let targets = chosen ?? Array(devices.values)
         var sent = 0
         for device in targets {
             let (status, reason) = await client.send(

@@ -160,7 +160,8 @@ struct BridgeStatus: Encodable {
     let proto: Int
     let epoch: String
     /// Protocol version of `GET /sessions/:id/wait`, so a client can tell "too old to have this
-    /// route" from "session not found" rather than guessing from a 404.
+    /// route" from "session not found" rather than guessing from a 404. 2 holds a wait asked for
+    /// `until=settled` until the work is over, not merely the turn.
     let turnWait: Int
     /// Protocol version of the per-conversation marks — saved, pinned, archived, last look — so a
     /// client can tell a bridge that holds them from one that cannot without a listing.
@@ -208,7 +209,7 @@ func registerRoutes(
                 version: BridgeVersion.describe(source: BridgeVersion.sourceDirectory()),
                 authenticated: await auth.status().loggedIn,
                 access: context.access,
-                proto: 2, epoch: await hub.epoch, turnWait: 1, marks: 1, queue: 1))
+                proto: 2, epoch: await hub.epoch, turnWait: 2, marks: 1, queue: 1))
     }
 
     /// One sequenced stream of everything: session deltas, list rows, agents, statuses. Every
@@ -479,8 +480,9 @@ func registerRoutes(
     /// exactly one ``TurnWait`` at the end. A client that goes away ends the hold: `Task.sleep` and
     /// the writer both throw the moment the connection is gone, the same signal `/events` reads a
     /// dead subscriber from, and there is nothing else here to leak.
-    router.get("sessions/:id/wait") { _, context in
+    router.get("sessions/:id/wait") { request, context in
         let id = context.parameters.get("id") ?? ""
+        let untilSettled = request.uri.queryParameters.get("until") == "settled"
         await adoptIfNeeded(id)
         guard await store.get(id) != nil else {
             return jsonResponse(["error": "not found"], status: .notFound)
@@ -494,8 +496,10 @@ func registerRoutes(
             let live = await liveness(of: session)
             let lastEnding = await store.lastEnding(id)
             let background = await store.backgroundWork(for: id)?.tasks
-            return TurnWaitResolution.reading(
+            let plain = TurnWaitResolution.reading(
                 turnOpen: live.turnOpen, lastEnding: lastEnding, background: background)
+            guard untilSettled else { return plain }
+            return TurnWaitResolution.settled(plain, await store.settleReading(id))
         }
 
         let deadline = Date().addingTimeInterval(waitMax)
@@ -781,7 +785,8 @@ func registerRoutes(
         else {
             return jsonResponse(["error": "bad request"], status: .badRequest)
         }
-        await store.devicePusher.register(token: body.token, environment: body.environment)
+        await store.devicePusher.register(
+            token: body.token, environment: body.environment, rules: body.rules)
         let delivers = await store.devicePusher.delivers
         return jsonResponse(["ok": true, "delivers": delivers])
     }

@@ -95,6 +95,10 @@ actor SessionStore {
     private var handledOrphans: [String: [String: Int]] = [:]
     /// Sessions asleep until the account has quota again, and when that is.
     private var cooldowns: [String: Date] = [:]
+    /// Every stretch of work the pushes wait to see the end of, and the generation of the settle
+    /// check each is owed, so a check overtaken by a newer one does nothing.
+    private var work = WorkSpans()
+    private var settleChecks: [String: Int] = [:]
     /// The same two facts — what is running, what is waiting — written where they survive the
     /// process. Everything above this line is lost the moment the machine stops, which is exactly
     /// when it matters most.
@@ -935,10 +939,77 @@ actor SessionStore {
         setBackgroundWork(id, work)
     }
 
-    private func setBackgroundWork(_ id: String, _ work: BackgroundWork?) {
-        guard carriedWork[id] != work else { return }
-        carriedWork[id] = work
-        publish(id, .background(work))
+    private func setBackgroundWork(_ id: String, _ carried: BackgroundWork?) {
+        guard carriedWork[id] != carried else { return }
+        carriedWork[id] = carried
+        publish(id, .background(carried))
+        guard carried == nil, work.spans[id]?.ending != nil else { return }
+        work.workStopped(id, at: Date())
+        scheduleSettleCheck(id)
+    }
+
+    /// Whether anything for the conversation is still going: a turn open or held, a prompt
+    /// waiting to start one, background work the process carries, or a wait for quota that ends
+    /// in another turn. A question or an approval is not work going on; it is waiting on someone.
+    func isWorking(_ id: String) -> Bool {
+        openTurns[id] != nil || inFlight.contains(id) || !(pendingPrompts[id]?.isEmpty ?? true)
+            || (!pausedQueues.contains(id) && !(sharedQueues[id]?.isEmpty ?? true))
+            || carriedWork[id] != nil || cooldowns[id].map { $0 > Date() } == true
+    }
+
+    /// What a wait held for settled work is told about this conversation right now. A turn closed
+    /// outside any stretch — a scheduled run that said nothing new, one adopted from a CLI that
+    /// outlived a restart — is not answered with an older stretch's ending: the wait then reads
+    /// that turn's own.
+    func settleReading(_ id: String, now: Date = Date()) -> SettleReading {
+        let reading = work.reading(id, working: isWorking(id), now: now)
+        guard case .settled(let done?) = reading, let last = lastEndings[id],
+            last.endedAt > done.endedAt
+        else { return reading }
+        return .settled(nil)
+    }
+
+    /// Looks again once the grace has run from the moment the work went quiet. A newer check
+    /// replaces an older one, and one that finds the work going again does nothing: whatever stops
+    /// that work schedules the next.
+    private func scheduleSettleCheck(_ id: String) {
+        guard let due = work.due(id) else { return }
+        let generation = (settleChecks[id] ?? 0) + 1
+        settleChecks[id] = generation
+        let delay = max(0, due.timeIntervalSinceNow) + 0.05
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            await self?.settleCheck(id, generation: generation)
+        }
+    }
+
+    private func settleCheck(_ id: String, generation: Int) {
+        guard settleChecks[id] == generation else { return }
+        settle(id, now: Date())
+    }
+
+    /// Closes a stretch of work that is over and pushes it to the devices that wait for that
+    /// rather than for every turn: how long the whole stretch took, every tool it ran, and the
+    /// last turn's own words.
+    private func settle(_ id: String, now: Date) {
+        guard let (done, ending) = work.settle(id, working: isWorking(id), now: now) else { return }
+        settleChecks[id] = nil
+        var notice = ending.notice
+        notice.notice["seconds"] = max(0, Int(done.length.rounded()))
+        notice.notice["tools"] = done.tools
+        let index = self.index
+        Task {
+            let goal = await index?.goal(for: ending.claudeID)
+            await devicePusher.pushTurnEnd(
+                sessionID: id, title: done.title, toolCount: done.tools, failed: done.failed,
+                duration: done.length, goal: goal, notice: notice, occasion: .workSettled)
+        }
+    }
+
+    /// Settles whatever went quiet without telling anything: a queue somebody emptied, a check
+    /// lost with a sleeping task. Run with the reaper.
+    private func settleQuietWork(now: Date) {
+        for id in work.waiting { settle(id, now: now) }
     }
 
     /// Ends turns whose process has stopped speaking, so a wedge cannot hold a row live forever.
@@ -973,6 +1044,7 @@ actor SessionStore {
     /// reading and the decision — so the decision is checked again on the same actor step it is
     /// carried out, and a process a turn has since claimed is left exactly where it is.
     func reapIdleProcesses(now: Date = Date()) async {
+        settleQuietWork(now: now)
         await reapIdleAgents(now: now)
         await endWedgedTurns(now: now)
         var idle: [(id: String, process: ClaudeProcess, lastActivityAt: Date)] = []
@@ -2073,6 +2145,8 @@ actor SessionStore {
         }
         if quiet {
             settleQuietly(id, messages: outcome.messages)
+            work.workStopped(id, at: now)
+            scheduleSettleCheck(id)
             return
         }
         let waitEnding = TurnWaitEnding(settled: settled)
@@ -2084,14 +2158,33 @@ actor SessionStore {
             duration: turnDuration, toolCount: toolCount,
             prompt: NoticePush.lastUserPrompt(in: session.messages),
             server: NoticePush.serverName, errorText: failureText)
+        noteEnding(
+            id, began: startedAt, tools: toolCount,
+            ending: PendingEnding(
+                title: title, claudeID: claudeID, failed: notice.kind == .failed,
+                ending: waitEnding, endedAt: now, lastMessageID: outcome.messages.last?.id,
+                notice: notice))
         Task {
             await pusher.endTurn(
                 sessionID: id, toolCount: toolCount, ending: ending, title: title, now: now)
             let goal = await index?.goal(for: claudeID)
             await devicePusher.pushTurnEnd(
                 sessionID: id, title: title, toolCount: toolCount, failed: wasFailed,
-                duration: turnDuration, goal: goal, notice: notice)
+                duration: turnDuration, goal: goal, notice: notice, occasion: .turnClosed)
         }
+    }
+
+    /// Files a closed turn under the stretch of work it belongs to. A turn that stopped to ask
+    /// the person something ends the stretch there, because the answer is theirs to give; any
+    /// other ending waits for the work to settle before the devices that want that hear of it.
+    private func noteEnding(_ id: String, began: Date, tools: Int, ending: PendingEnding) {
+        guard ending.notice.kind != .question else {
+            work.waitsOnPerson(id)
+            settleChecks[id] = nil
+            return
+        }
+        work.turnEnded(id, began: began, tools: tools, ending: ending)
+        scheduleSettleCheck(id)
     }
 
     /// Queues one more turn when the one that just ended left background work running.
@@ -2409,12 +2502,17 @@ actor SessionStore {
             sessionID: id, messages: [], settled: .interrupted, duration: duration,
             toolCount: tools, prompt: interruption.prompt,
             server: NoticePush.serverName)
+        noteEnding(
+            id, began: interruption.startedAt, tools: tools,
+            ending: PendingEnding(
+                title: title, claudeID: record.claudeSessionID ?? id, failed: true,
+                ending: .interrupted, endedAt: now, lastMessageID: nil, notice: notice))
         Task {
             await pusher.endTurn(
                 sessionID: id, toolCount: tools, ending: .interrupted, title: title, now: now)
             await devicePusher.pushTurnEnd(
                 sessionID: id, title: title, toolCount: tools, failed: true,
-                duration: duration, goal: nil, notice: notice)
+                duration: duration, goal: nil, notice: notice, occasion: .turnClosed)
         }
         guard session.autoResume ?? autoResumeDefault else { return }
         resumeInterrupted(id)

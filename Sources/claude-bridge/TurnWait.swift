@@ -52,11 +52,14 @@ struct TurnWait: Codable, Sendable, Equatable {
     var duration: TimeInterval?
     var lastMessageID: String?
     var endedAt: Date?
+    /// The answer was held until the work settled (`until=settled`): nothing is running, carried
+    /// or queued, and `duration` and `toolCount` are the whole stretch of work.
+    var settled: Bool?
 
     init(
         state: TurnWaitState, waited: Bool, ending: TurnWaitEnding? = nil, title: String? = nil,
         toolCount: Int? = nil, background: Int? = nil, duration: TimeInterval? = nil,
-        lastMessageID: String? = nil, endedAt: Date? = nil
+        lastMessageID: String? = nil, endedAt: Date? = nil, settled: Bool? = nil
     ) {
         self.state = state
         self.waited = waited
@@ -67,6 +70,7 @@ struct TurnWait: Codable, Sendable, Equatable {
         self.duration = duration
         self.lastMessageID = lastMessageID
         self.endedAt = endedAt
+        self.settled = settled
     }
 }
 
@@ -100,5 +104,25 @@ enum TurnWaitResolution {
 
     static func capped() -> TurnWait {
         TurnWait(state: .running, waited: true)
+    }
+
+    /// The same reading held for settled work: a turn that ended is not an answer while the work
+    /// goes on, and once it has settled the answer speaks for the whole stretch. An ask is
+    /// answered at once either way — it is waiting on the person, not on the work.
+    static func settled(_ reading: TurnWait?, _ settle: SettleReading) -> TurnWait? {
+        guard var reading else { return nil }
+        guard reading.state == .ended else { return reading }
+        guard case .settled(let done) = settle else { return nil }
+        reading.settled = true
+        reading.background = nil
+        if let done {
+            reading.ending = done.ending
+            reading.title = done.title
+            reading.duration = done.length
+            reading.toolCount = done.tools
+            reading.endedAt = done.endedAt
+            reading.lastMessageID = done.lastMessageID ?? reading.lastMessageID
+        }
+        return reading
     }
 }
