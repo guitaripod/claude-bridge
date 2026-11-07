@@ -295,8 +295,8 @@ enum ClaudeUsage {
     ///
     /// Never read from `~/.claude/.credentials.json`. That file is written at login and the CLI
     /// rewrites only the tokens in it, so its `rateLimitTier` is whatever the plan was the day the
-    /// account signed in — an account that moved from Max 20× to Max 5× goes on being told it is
-    /// on 20× forever, with the gauges underneath it already measuring the smaller plan. The
+    /// account signed in — an account that moved from Ultra to Max goes on being told it is
+    /// on Ultra forever, with the gauges underneath it already measuring the smaller plan. The
     /// account is the authority on the account, so the multiplier comes from the profile endpoint
     /// or it does not come at all: a plan named without its multiplier is incomplete, and a plan
     /// named with the wrong one is false.
@@ -306,7 +306,16 @@ enum ClaudeUsage {
             let multiplier = tier.split(separator: "_").last, multiplier.hasSuffix("x"),
             let count = Int(multiplier.dropLast())
         else { return plan }
+        if plan == "Max" { return maxPlanName(multiplier: count) }
         return "\(plan) · \(count)×"
+    }
+
+    /// What Anthropic calls a Max account of this multiplier. Since 2026-10-30 the 5× plan is
+    /// "Max" and the 20× plan is "Ultra", while the API still reports `claude_max` with a
+    /// `default_claude_max_20x` tier for both, and Ultra's weekly allowance is 10× Pro rather
+    /// than 20×, so no multiplier is shown beside either name.
+    private static func maxPlanName(multiplier: Int) -> String {
+        multiplier >= 20 ? "Ultra" : "Max"
     }
 
     private static func planName(_ subscriptionType: String) -> String {
