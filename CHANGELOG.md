@@ -4,6 +4,11 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.21.1 — 2026-11-08
+
+- A message sent while a chat's background work runs is taken again. Once a turn that left a workflow, a subagent or a background command running had been over for 45 seconds, every message to that chat was refused with "This session is running on the server right now" until the work finished, because what the work's agents wrote was taken for somebody else working in the chat. While the bridge's own Claude process carries the work, and for 45 seconds after it ends, its agents' writes are known as the bridge's own; a chat whose conversation a terminal is writing is still refused.
+- The usage card names the 20× Max account Ultra and the 5× one Max, with no multiplier beside either.
+
 ## 1.21.0 — 2026-11-06
 
 - A push says the work is done when the work is done, not when a turn is. A turn that leaves a background command, a subagent or a workflow running, that a queued message follows, or that Claude follows on its own once that work finishes is one stretch of work, and the phone hears about it once, ten seconds after nothing is running, carried or queued any more, with how long the whole stretch took and every tool it ran. A turn that stops to ask still pushes at once.
