@@ -1015,7 +1015,9 @@ func registerRoutes(
         await adoptIfNeeded(id)
         let claudeID = (await store.get(id))?.claudeSessionID ?? id
         if await !store.recentRunnerActivity(claudeSessionID: claudeID, within: 45),
-            await index.isWriting(claudeID, within: 30)
+            await index.isWriting(
+                claudeID, within: 30,
+                countingSidecars: !(await store.carriesWork(claudeSessionID: claudeID, within: 45)))
         {
             return jsonResponse(
                 [

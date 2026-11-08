@@ -903,6 +903,9 @@ actor SessionStore {
     /// goes out on the stream the moment the CLI says so rather than on the next sweep.
     private var carriedWork: [String: BackgroundWork] = [:]
 
+    /// When the last of the work a process carried on each transcript ended, by Claude session id.
+    private var lastWorkEnd: [String: Date] = [:]
+
     func backgroundWork(for id: String) -> BackgroundWork? { carriedWork[id] }
 
     func lastEnding(_ id: String) -> LastTurnEnding? { lastEndings[id] }
@@ -941,6 +944,9 @@ actor SessionStore {
 
     private func setBackgroundWork(_ id: String, _ carried: BackgroundWork?) {
         guard carriedWork[id] != carried else { return }
+        if carried == nil, carriedWork[id] != nil {
+            lastWorkEnd[sessions[id]?.claudeSessionID ?? id] = Date()
+        }
         carriedWork[id] = carried
         publish(id, .background(carried))
         guard carried == nil, work.spans[id]?.ending != nil else { return }
@@ -2038,6 +2044,20 @@ actor SessionStore {
         if runnerTurnClaudeIDs[claudeSessionID] != nil { return true }
         guard let finished = lastRunnerFinish[claudeSessionID] else { return false }
         return Date().timeIntervalSince(finished) < seconds
+    }
+
+    /// Whether a process this bridge holds carries background work on the transcript, or let the
+    /// last of it go within the window. The agents and workflows such work runs write the
+    /// transcript's sidecars long after the turn that started them closed, and those writes are
+    /// this bridge's own; the transcript itself stays quiet until the CLI takes up the work's
+    /// report in a turn of its own.
+    func carriesWork(claudeSessionID: String, within seconds: TimeInterval) -> Bool {
+        let carrying = carriedWork.keys.contains { id in
+            (sessions[id]?.claudeSessionID ?? id) == claudeSessionID
+        }
+        if carrying { return true }
+        guard let ended = lastWorkEnd[claudeSessionID] else { return false }
+        return Date().timeIntervalSince(ended) < seconds
     }
 
     private var lastRunnerFinish: [String: Date] = [:]

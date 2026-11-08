@@ -710,14 +710,17 @@ actor TranscriptIndex {
     }
 
     /// True when the transcript (or its subagent sidecars) was written within
-    /// the window — someone's process is actively working in the session.
-    func isWriting(_ id: String, within seconds: TimeInterval) -> Bool {
+    /// the window — someone's process is actively working in the session. A caller that knows
+    /// whose agents are writing the sidecars leaves them out with `countingSidecars: false`.
+    func isWriting(
+        _ id: String, within seconds: TimeInterval, countingSidecars: Bool = true
+    ) -> Bool {
         guard let path = path(for: id) else { return false }
         let threshold = Date().addingTimeInterval(-seconds)
         if let content = TranscriptParser.lastContentDate(atPath: path), content > threshold {
             return true
         }
-        return isSidecarActive(transcriptPath: path, after: threshold)
+        return countingSidecars && isSidecarActive(transcriptPath: path, after: threshold)
     }
 
     private func isSidecarActive(transcriptPath: String, after threshold: Date) -> Bool {

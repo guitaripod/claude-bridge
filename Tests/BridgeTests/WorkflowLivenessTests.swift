@@ -152,6 +152,30 @@ import Testing
         #expect(agents.filter { $0.completed == true }.count == 1)
     }
 
+    /// A run's agents write only their sidecars; the parent transcript stays quiet until its CLI
+    /// takes up the run's report. A caller that knows the run is its own leaves the sidecars out
+    /// and still hears the transcript itself being written by anybody else.
+    @Test func sidecarsCanBeLeftOutOfWhetherTheSessionIsBeingWritten() async throws {
+        let world = try makeWorld(started: 4, results: 1, agentAge: 1, marker: false)
+        defer { try? FileManager.default.removeItem(at: world.root) }
+        let index = index(world)
+
+        #expect(await index.isWriting(world.sessionID, within: 30))
+        #expect(!(await index.isWriting(world.sessionID, within: 30, countingSidecars: false)))
+
+        let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: world.transcript))
+        try handle.seekToEnd()
+        try handle.write(
+            contentsOf: Data(
+                (line([
+                    "type": "user", "uuid": "u2",
+                    "timestamp": ISO8601DateFormatter().string(from: Date()),
+                    "message": ["role": "user", "content": "and the tests too"],
+                ]) + "\n").utf8))
+        try handle.close()
+        #expect(await index.isWriting(world.sessionID, within: 30, countingSidecars: false))
+    }
+
     /// A run lives inside the CLI that launched it. Once no CLI serves the session, its unbalanced
     /// ledger is the record of a harness that died, and the row settles now rather than after
     /// the half-hour bound.

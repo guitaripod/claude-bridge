@@ -457,6 +457,33 @@ struct PersistentProcessTests {
         #expect(notice.contains("Explore the repository"))
     }
 
+    @Test("Work the process carries is known by its transcript while it runs and a while after")
+    func carriedWorkIsKnownByItsTranscript() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "one"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        let claudeID = try #require(await store.get(session.id)?.claudeSessionID)
+        #expect(await !store.carriesWork(claudeSessionID: claudeID, within: 30))
+
+        _ = await store.send(session.id, request: SendRequest(text: "delegate this one"))
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+        await waitUntil { await store.backgroundWork(for: session.id) != nil }
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(await store.carriesWork(claudeSessionID: claudeID, within: 0.05))
+        #expect(await !store.recentRunnerActivity(claudeSessionID: claudeID, within: 0.05))
+
+        _ = await store.stopBackgroundWork(session.id)
+        #expect(await store.backgroundWork(for: session.id) == nil)
+        #expect(await store.carriesWork(claudeSessionID: claudeID, within: 30))
+        try await Task.sleep(for: .milliseconds(100))
+        #expect(await !store.carriesWork(claudeSessionID: claudeID, within: 0.05))
+        #expect(await !store.carriesWork(claudeSessionID: "another-transcript", within: 30))
+    }
+
     @Test("A command the harness backgrounded is ended by hand when the CLI will not")
     func stopEndsHarnessBackgroundedShellWithoutTheCLI() async throws {
         let fake = try StdinClaude()
