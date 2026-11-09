@@ -70,6 +70,9 @@ actor SessionStore {
     /// clients on one session are the normal case, so a second prompt queues rather than starting
     /// a second `claude -p --resume` against the same transcript in the same working directory.
     private var inFlight: Set<String> = []
+    /// Conversations with a title call out, so a second turn ending meanwhile does not send
+    /// another look at the same messages.
+    private var titlingInFlight: Set<String> = []
     private var pendingPrompts: [String: [QueuedPrompt]] = [:]
     /// The messages people queued behind a running turn, per session, in arrival order. Held here
     /// rather than on each device so every client of the conversation sees and can change the
@@ -418,7 +421,9 @@ actor SessionStore {
             createdAt: now, updatedAt: now,
             messages: source.messages,
             lastCostUSD: source.lastCostUSD, lastTokens: source.lastTokens,
-            pendingFork: source.claudeSessionID != nil ? true : nil)
+            pendingFork: source.claudeSessionID != nil ? true : nil,
+            chapters: ChapterBook.forked(source.chapters, title: "Fork of \(source.title)"),
+            chaptersRevision: source.chaptersRevision)
         sessions[session.id] = session
         order.insert(session.id, at: 0)
         persistNow()
@@ -427,10 +432,13 @@ actor SessionStore {
 
     func rename(_ id: String, title: String) -> Bool {
         guard var session = sessions[id] else { return false }
+        let prior = session.title
         session.title = title
         session.customTitle = true
+        let rechaptered = ChapterBook.renamed(&session, to: title, by: .person, priorTitle: prior)
         sessions[id] = session
         persistNow()
+        if rechaptered { publishChapters(id) }
         let pusher = self.pusher
         Task { await pusher.retitle(sessionID: id, title: title) }
         return true
@@ -493,9 +501,12 @@ actor SessionStore {
         session.priorClaudeSessionIDs = nil
         session.autoTitled = nil
         session.titledAtTurn = nil
+        let hadChapters = session.chapters != nil
+        session.chapters = nil
         session.updatedAt = Date()
         sessions[id] = session
         persistNow()
+        if hadChapters { publishChapters(id) }
     }
 
     /// The store session whose conversation lives in the given CLI transcript, if any — the id
@@ -604,16 +615,19 @@ actor SessionStore {
             id: UUID().uuidString, role: .user,
             parts: files.map { Part.file($0) } + [.text(display)], createdAt: Date())
         session.messages.append(userMessage)
+        let prior = session.title
         if session.title == "New chat"
             || (session.customTitle != true && session.messages.count <= 1)
         {
             session.title = Self.deriveTitle(display, fallback: session.title)
         }
+        let rechaptered = ChapterBook.recorded(&session, message: userMessage, priorTitle: prior)
         session.updatedAt = Date()
         sessions[id] = session
         moveToFront(id)
         persist()
         broadcaster(for: id).send(.messageUpserted(userMessage))
+        if rechaptered { publishChapters(id) }
         return true
     }
 
@@ -1616,10 +1630,15 @@ actor SessionStore {
             case .title(let title):
                 guard var session = sessions[id], session.customTitle != true, session.title != title
                 else { continue }
+                let prior = session.title
                 session.title = title
                 session.autoTitled = true
+                session.agentTitled = true
+                let rechaptered = ChapterBook.renamed(
+                    &session, to: title, by: .agent, priorTitle: prior)
                 sessions[id] = session
                 persist()
+                if rechaptered { publishChapters(id) }
             case .context:
                 continue
             }
@@ -2592,13 +2611,15 @@ actor SessionStore {
         return true
     }
 
-    /// After the first completed turn (and after /clear), replace the
-    /// prompt-derived title with a short LLM-written one, then every few
-    /// messages look again at whether the topic has moved and rename the chat
-    /// if it has. A user rename (customTitle) always wins, including against a
-    /// title call already in flight.
+    /// After the first completed turn (and after /clear), replace the prompt-derived title with a
+    /// short model-written one, then every few messages look again at whether the topic has moved,
+    /// renaming the chat and opening a chapter where it did. A person's rename pins the title but
+    /// not the chapters: the topic can still move under a name the person chose, so the looks go
+    /// on and only the chapters follow them. A schedule's conversation and one its agent names
+    /// itself are never looked at. One look per conversation is out at a time.
     private func maybeAutoTitle(_ id: String) {
-        guard let session = sessions[id], session.customTitle != true,
+        guard let session = sessions[id], session.scheduleID == nil, session.agentTitled != true,
+            !titlingInFlight.contains(id),
             let user = session.messages.last(where: { $0.role == .user })
                 .map(Self.plainText), !user.isEmpty,
             let assistant = session.messages.last(where: { $0.role == .assistant })
@@ -2607,24 +2628,30 @@ actor SessionStore {
         let turn = session.messages.filter { $0.role == .user }.count
         let binary = runner.claudePath
         let projects = projectsDir
-        if session.autoTitled != true {
-            let first = session.messages.first(where: { $0.role == .user })
-                .map(Self.plainText) ?? user
-            let firstAnswer = session.messages.first(where: { $0.role == .assistant })
-                .map(Self.plainText) ?? assistant
+        if session.customTitle != true, session.autoTitled != true {
+            let opening = ChapterBook.opening(of: session)
+            let first = opening?.user ?? user
+            let firstAnswer = opening?.answer ?? assistant
+            let anchor = opening?.id ?? session.messages.last(where: { $0.role == .user })?.id
+            titlingInFlight.insert(id)
             Task.detached { [weak self] in
-                guard let title = await Titler.title(
+                let title = await Titler.title(
                     binary: binary, projectsDir: projects, user: first, assistant: firstAnswer)
-                else { return }
-                await self?.applyAutoTitle(id, title: title, turn: turn)
+                await self?.applyAutoTitle(id, title: title, turn: turn, anchor: anchor)
             }
         } else if Self.retitleDue(turn: turn, titledAt: session.titledAtTurn) {
-            let current = session.title
+            let current = session.chapters?.last?.title ?? session.title
+            let shown = ChapterBook.recent(
+                session.messages, since: session.titledAtTurn, through: turn)
+            guard !shown.isEmpty else { return }
+            let texts = shown.map { ChapterBook.text(of: $0.message) }
+            let ids = shown.map(\.message.id)
+            titlingInFlight.insert(id)
             Task.detached { [weak self] in
-                let title = await Titler.revised(
+                let verdict = await Titler.revised(
                     binary: binary, projectsDir: projects, current: current,
-                    user: user, assistant: assistant)
-                await self?.applyAutoTitle(id, title: title ?? current, turn: turn)
+                    prompts: texts, assistant: assistant)
+                await self?.applyRevision(id, verdict: verdict, shown: ids, turn: turn)
             }
         }
     }
@@ -2638,17 +2665,124 @@ actor SessionStore {
         turn - (titledAt ?? 0) >= retitleEvery
     }
 
-    private func applyAutoTitle(_ id: String, title: String, turn: Int) {
-        guard var session = sessions[id], session.customTitle != true else { return }
-        let changed = session.title != title
+    /// Lands the first model title, unless the conversation it was written for is gone — cleared
+    /// while the call ran — or someone else named it meanwhile.
+    private func applyAutoTitle(_ id: String, title: String?, turn: Int, anchor: String?) {
+        titlingInFlight.remove(id)
+        guard let title, var session = sessions[id], session.customTitle != true,
+            session.agentTitled != true,
+            anchor.map({ anchor in session.messages.contains { $0.id == anchor } }) ?? true
+        else { return }
+        let prior = session.title
+        let changed = prior != title
         session.title = title
         session.autoTitled = true
-        session.titledAtTurn = turn
+        session.titledAtTurn = max(session.titledAtTurn ?? 0, turn)
+        let rechaptered = ChapterBook.renamed(&session, to: title, by: .model, priorTitle: prior)
         sessions[id] = session
         persist()
+        if rechaptered { publishChapters(id) }
         guard changed else { return }
         let pusher = self.pusher
         Task { await pusher.retitle(sessionID: id, title: title) }
+    }
+
+    /// Lands a look at the title. A failed look stamps nothing, so the next turn asks again; a KEEP
+    /// stamps when the title was last looked at; a rename renames the current chapter, never one
+    /// the person named; a move opens a chapter at the message the look named and sums up the one
+    /// it closed. Under a title the person pinned only the chapters change. A look whose messages
+    /// a clear took away, or that an older look overtook, is dropped.
+    private func applyRevision(_ id: String, verdict: Titler.Verdict, shown: [String], turn: Int) {
+        titlingInFlight.remove(id)
+        guard var session = sessions[id], session.scheduleID == nil, session.agentTitled != true,
+            let newest = shown.last, session.messages.contains(where: { $0.id == newest }),
+            turn >= (session.titledAtTurn ?? 0)
+        else { return }
+        let pinned = session.customTitle == true
+        switch verdict {
+        case .failed:
+            return
+        case .kept:
+            session.titledAtTurn = turn
+            sessions[id] = session
+            persist()
+        case .renamed(let title):
+            session.titledAtTurn = turn
+            guard session.chapters?.last?.namedBy != .person else {
+                sessions[id] = session
+                persist()
+                return
+            }
+            let prior = session.chapters?.last?.title ?? session.title
+            let retitled = !pinned && session.title != title
+            if !pinned { session.title = title }
+            let rechaptered = ChapterBook.renamed(&session, to: title, by: .model, priorTitle: prior)
+            sessions[id] = session
+            persist()
+            if rechaptered { publishChapters(id) }
+            if retitled {
+                let pusher = self.pusher
+                Task { await pusher.retitle(sessionID: id, title: title) }
+            }
+        case .moved(let title, let start):
+            session.titledAtTurn = turn
+            guard shown.indices.contains(start - 1),
+                let boundary = session.messages.first(where: { $0.id == shown[start - 1] })
+            else {
+                sessions[id] = session
+                persist()
+                return
+            }
+            let prior = session.chapters?.last?.title ?? session.title
+            let retitled = !pinned && session.title != title
+            if !pinned { session.title = title }
+            let closed = ChapterBook.opened(&session, title: title, at: boundary, priorTitle: prior)
+            if closed == nil, session.chapters?.last?.namedBy != .person {
+                ChapterBook.renamed(&session, to: title, by: .model, priorTitle: prior)
+            }
+            sessions[id] = session
+            publishChapters(id)
+            if retitled {
+                let pusher = self.pusher
+                Task { await pusher.retitle(sessionID: id, title: title) }
+            }
+            if let closed { sumUp(id, closed: closed) }
+        }
+    }
+
+    /// Writes the closed chapter's one-sentence gist in the background and puts it on the chapter
+    /// it was written for. A failed call leaves the chapter without one; nothing retries.
+    private func sumUp(_ id: String, closed index: Int) {
+        guard let session = sessions[id], let chapter = session.chapters?[index],
+            let input = ChapterBook.gistInput(session, closed: index)
+        else { return }
+        let binary = runner.claudePath
+        let projects = projectsDir
+        Task.detached { [weak self] in
+            guard let gist = await Titler.gist(
+                binary: binary, projectsDir: projects, title: chapter.title,
+                prompts: input.prompts, answer: input.answer)
+            else { return }
+            await self?.applyGist(id, chapter: chapter, gist: gist)
+        }
+    }
+
+    private func applyGist(_ id: String, chapter: Chapter, gist: String) {
+        guard var session = sessions[id], ChapterBook.summed(&session, chapter: chapter, gist: gist)
+        else { return }
+        sessions[id] = session
+        publishChapters(id)
+    }
+
+    /// The conversation's chapters changed: the change is counted, written down at once, and every
+    /// client watching is handed the whole list with its count.
+    private func publishChapters(_ id: String) {
+        guard var session = sessions[id] else { return }
+        let revision = (session.chaptersRevision ?? 0) + 1
+        session.chaptersRevision = revision
+        sessions[id] = session
+        persistNow()
+        broadcaster(for: id).send(.chapters(session.chapters ?? [], revision: revision))
     }
 
     /// How a turn's own messages say it ended: on a question it is still waiting to have answered

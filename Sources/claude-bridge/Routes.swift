@@ -178,6 +178,9 @@ struct BridgeStatus: Encodable {
     /// cut-off turn and the provider wait as the whole word on each, so a client refreshing a
     /// conversation asks for none of them separately.
     var detail = 1
+    /// Protocol version of chapters: a session read carries `chapters` and `chaptersRevision`,
+    /// and the session stream a `chapters` frame whenever they change.
+    var chapters = 1
 }
 
 struct AuthCodeRequest: Decodable {

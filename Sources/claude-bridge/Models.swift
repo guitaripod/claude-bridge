@@ -182,6 +182,16 @@ struct Session: Codable, Sendable, Equatable {
     /// How many of the person's messages the conversation had when its title was last written or
     /// confirmed, so the next look at whether the topic has moved waits for a few more.
     var titledAtTurn: Int?
+    /// The stretches the conversation has been through, one per topic, oldest first. Kept beside
+    /// the title because the title only ever says what the conversation is about now; absent for
+    /// a conversation this bridge has not seen named since it began keeping them.
+    var chapters: [Chapter]?
+    /// Counts every change to ``chapters``, a clear included, and is never reset, so a client
+    /// holding a newer list never adopts an older one that a slow read brings back.
+    var chaptersRevision: Int?
+    /// The ACP agent names this conversation itself, so the bridge's own titler leaves it alone:
+    /// two namers taking turns would rename it back and forth every turn.
+    var agentTitled: Bool?
     /// A turn that was running when this bridge stopped and was not running when it came back.
     /// Kept on the session until it is picked up or dismissed, so a client that was not connected
     /// when the machine died still finds out that work was cut off rather than finding silence.
@@ -471,12 +481,17 @@ enum BridgeEvent: Codable, Sendable {
     /// answering again or the turn ended. Separate from ``status``: the turn stays open throughout,
     /// and what changes is only whether anybody can say why nothing is arriving.
     case retry(RetryWait?)
+    /// The conversation's chapters changed: one opened, one was renamed or summed up, or a clear
+    /// dropped them. Always the whole list, so a client that missed a frame is right again after
+    /// the next one.
+    case chapters([Chapter], revision: Int)
 
     private enum CodingKeys: String, CodingKey {
         case type, message, messageID, delta, tool, status, error, goal, phase, interruption
         case tasks, task, since, stalled
         case queue, paused
         case retry
+        case chapters, revision
     }
 
     func encode(to encoder: Encoder) throws {
@@ -522,6 +537,10 @@ enum BridgeEvent: Codable, Sendable {
         case .retry(let wait):
             try c.encode("retry", forKey: .type)
             try c.encodeIfPresent(wait, forKey: .retry)
+        case .chapters(let chapters, let revision):
+            try c.encode("chapters", forKey: .type)
+            try c.encode(chapters, forKey: .chapters)
+            try c.encode(revision, forKey: .revision)
         }
     }
 
@@ -560,6 +579,10 @@ enum BridgeEvent: Codable, Sendable {
                     queue: try c.decodeIfPresent([QueuedItem].self, forKey: .queue) ?? [],
                     paused: try c.decodeIfPresent(Bool.self, forKey: .paused) ?? false))
         case "retry": self = .retry(try c.decodeIfPresent(RetryWait.self, forKey: .retry))
+        case "chapters":
+            self = .chapters(
+                try c.decodeIfPresent([Chapter].self, forKey: .chapters) ?? [],
+                revision: try c.decodeIfPresent(Int.self, forKey: .revision) ?? 0)
         default: self = .error(try c.decode(String.self, forKey: .error))
         }
     }
