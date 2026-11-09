@@ -288,3 +288,96 @@ struct ChapterStoreTests {
         #expect(await reopened.get(fork?.id ?? "")?.chapters?.count == 2)
     }
 }
+
+@Suite("A history older than chapters is split into them once")
+struct ChapterBackfillTests {
+    @Test("A split reply is read into chapters that tile the messages")
+    func readsSegments() {
+        let raw = """
+            1 | Blank feed after resume | Traced the blank feed to a 401 hang.
+            garbage line
+            4 | Deploys wait for idle uploads | Deploys now wait for idle uploads.
+            3 | Backwards | Dropped.
+            **7 | Release notes in settings |**
+            """
+        let segments = Titler.segments(from: raw, count: 8)
+        #expect(segments?.map(\.start) == [1, 4, 7])
+        #expect(segments?.map(\.title) == ["Blank feed after resume", "Deploys wait for idle uploads", "Release notes in settings"])
+        #expect(segments?.first?.gist == "Traced the blank feed to a 401 hang.")
+        #expect(segments?.last?.gist == nil)
+        #expect(Titler.segments(from: "3 | Starts late | x", count: 8)?.first?.start == 1)
+        #expect(Titler.segments(from: "nothing useful", count: 8) == nil)
+        #expect(Titler.segments(from: "99 | Out of range | x", count: 8) == nil)
+    }
+
+    @Test("Chapters come from the split; the last keeps the chat's name; chapters already there win")
+    func builds() {
+        let messages = conversation(turns: 8)
+        let shown = ChapterBook.backfillPrompts(messages)
+        #expect(shown.count == 8)
+        let segments = [
+            Titler.Segment(start: 1, title: "A", gist: "Did A."),
+            Titler.Segment(start: 5, title: "Model's B", gist: nil),
+        ]
+        let chapters = ChapterBook.backfilled(session(messages, title: "Chat's B"), segments: segments, shown: shown)
+        #expect(chapters?.map(\.title) == ["A", "Chat's B"])
+        #expect(chapters?.map(\.turn) == [1, 5])
+        #expect(chapters?.map(\.messageID) == ["u1", "u5"])
+        #expect(chapters?.first?.gist == "Did A.")
+        #expect(ChapterBook.backfilled(
+            session(messages, chapters: [chapter("Own", turn: 1)]), segments: segments, shown: shown) == nil)
+    }
+
+    @Test("A long history is thinned evenly and notices are left out")
+    func thins() {
+        var messages = conversation(turns: 400)
+        messages.append(user("n", "The session limit was reached. Picking the work back up at 9:00.", at: 9000))
+        let shown = ChapterBook.backfillPrompts(messages)
+        #expect(shown.count == ChapterBook.backfillShown)
+        #expect(shown.first?.turn == 1)
+        #expect(shown.last?.turn == 400)
+        #expect(!shown.contains { $0.message.id == "n" })
+    }
+
+    @Test("Reading a long conversation splits it once and hands clients the chapters")
+    func storeBackfills() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("backfill-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fake = root.appendingPathComponent("claude")
+        let calls = root.appendingPathComponent("calls")
+        try """
+            #!/bin/sh
+            echo call >> "\(calls.path)"
+            printf '1 | Blank feed after resume | Traced the blank feed to a 401 hang.\\n5 | Release notes | \\n'
+            """.write(to: fake, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
+        let store = SessionStore(
+            runner: ClaudeRunner(claudePath: fake.path, workdir: root.path, permissionMode: "default"),
+            defaults: MachineDefaults(modelOverride: "sonnet", effortOverride: "medium", home: NSTemporaryDirectory()),
+            storeURL: root.appendingPathComponent("sessions.json"), projectsDir: root.path)
+        var long = session(conversation(turns: 8), title: "Release notes in settings")
+        long.id = "long"
+        _ = await store.adopt(long)
+        var short = session(conversation(turns: 3), title: "Short")
+        short.id = "short"
+        _ = await store.adopt(short)
+
+        await store.backfillChaptersIfNeeded("long")
+        await store.backfillChaptersIfNeeded("short")
+        let deadline = ContinuousClock.now + .seconds(10)
+        while await store.get("long")?.chapters == nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        let chapters = await store.get("long")?.chapters
+        #expect(chapters?.map(\.title) == ["Blank feed after resume", "Release notes in settings"])
+        #expect(chapters?.map(\.turn) == [1, 5])
+        #expect((await store.get("long")?.chaptersRevision ?? 0) > 0)
+        #expect(await store.get("short")?.chapters == nil)
+
+        await store.backfillChaptersIfNeeded("long")
+        try await Task.sleep(for: .milliseconds(200))
+        let made = (try? String(contentsOf: calls, encoding: .utf8))?.split(separator: "\n").count
+        #expect(made == 1)
+    }
+}

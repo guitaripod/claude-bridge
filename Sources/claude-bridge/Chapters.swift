@@ -206,6 +206,45 @@ enum ChapterBook {
         return (texts, answer)
     }
 
+    /// A conversation older than chapters is worth splitting once it has this many of the person's
+    /// own messages; a shorter one is one chapter whatever happened in it.
+    static let backfillFloor = 6
+
+    /// At most this many of the person's messages are shown when splitting a long history: the
+    /// first, the last, and the rest taken evenly between.
+    static let backfillShown = 150
+
+    /// The person's own messages a history is split from — notices left out, and a long history
+    /// thinned evenly to `backfillShown` — with the turn and message each one is.
+    static func backfillPrompts(_ messages: [Message]) -> [(turn: Int, message: Message)] {
+        let spoken = prompts(in: messages).filter { !isNotice($0.message) && !text(of: $0.message).isEmpty }
+        guard spoken.count > backfillShown else { return spoken }
+        return (0..<backfillShown).map { spoken[$0 * (spoken.count - 1) / (backfillShown - 1)] }
+    }
+
+    /// Chapters for a conversation that had none, from the stretches its history was split into.
+    /// The last one keeps the name the conversation wears now, so the title and the current
+    /// chapter never disagree. Nil when the conversation gained chapters meanwhile.
+    static func backfilled(
+        _ session: Session, segments: [Titler.Segment], shown: [(turn: Int, message: Message)]
+    ) -> [Chapter]? {
+        guard session.chapters?.isEmpty ?? true, !segments.isEmpty else { return nil }
+        var chapters: [Chapter] = []
+        for (index, segment) in segments.enumerated() {
+            guard shown.indices.contains(segment.start - 1) else { continue }
+            let opening = shown[segment.start - 1]
+            guard session.messages.contains(where: { $0.id == opening.message.id }) else { return nil }
+            let isLast = index == segments.count - 1
+            chapters.append(
+                Chapter(
+                    title: isLast ? session.title : segment.title, turn: opening.turn,
+                    messageID: opening.message.id, startedAt: opening.message.createdAt,
+                    gist: isLast ? nil : segment.gist,
+                    namedBy: isLast && session.customTitle == true ? .person : .model))
+        }
+        return chapters.isEmpty ? nil : chapters
+    }
+
     /// Puts a gist on the chapter it was written for, found again by where it starts, so a
     /// conversation cleared or re-chaptered while the gist was being written is left alone.
     static func summed(_ session: inout Session, chapter: Chapter, gist: String) -> Bool {

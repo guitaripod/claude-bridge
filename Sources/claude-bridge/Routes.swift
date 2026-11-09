@@ -598,6 +598,7 @@ func registerRoutes(
     router.get("sessions/:id") { request, context in
         let id = context.parameters.get("id") ?? ""
         if var session = await store.get(id) {
+            await store.backfillChaptersIfNeeded(id)
             let live = await liveness(of: session)
             session.active = live.active
             session.turnOpen = live.turnOpen

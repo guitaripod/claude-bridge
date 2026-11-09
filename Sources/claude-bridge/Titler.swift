@@ -104,6 +104,70 @@ enum Titler {
         return .renamed(title)
     }
 
+    /// One stretch a conversation's history was split into: the message it began at (counted from
+    /// one in the list the model was shown), its title, and what it came to.
+    struct Segment: Equatable, Sendable {
+        var start: Int
+        var title: String
+        var gist: String?
+    }
+
+    /// Splits a conversation that already happened into its chapters, for one that is older than
+    /// chapters: the person's messages, numbered, go in, and one line per chapter comes back.
+    static func segments(
+        binary: String, projectsDir: String, current: String, prompts: [String]
+    ) async -> [Segment]? {
+        guard !prompts.isEmpty else { return nil }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let cwd = "\(home)/.claude-bridge/titler"
+        try? FileManager.default.createDirectory(
+            atPath: cwd, withIntermediateDirectories: true)
+        defer { cleanupTranscripts(projectsDir: projectsDir, cwd: cwd) }
+
+        let numbered = prompts.enumerated().map { index, text in
+            "\(index + 1): \(condense(text, cap: 160))"
+        }.joined(separator: "\n")
+        let prompt = """
+            Below are the person's messages in a coding-agent conversation now titled \
+            "\(current)", numbered, oldest first. Split the conversation into its chapters: \
+            stretches in which the focus stayed on one task, problem or phase of the work. A single \
+            side question is not a chapter. Most conversations have one to six. Reply with one line \
+            per chapter, oldest first, and nothing else:
+            <number of the message it began at> | <title, 3 to 6 words, plain text> | <one \
+            past-tense sentence of at most 16 words saying what that stretch did or decided>
+            Leave the last chapter's sentence empty: it is still going. The first chapter begins \
+            at message 1.
+
+            \(numbered)
+            """
+        guard let raw = await run(binary: binary, cwd: cwd, prompt: prompt) else { return nil }
+        return segments(from: raw, count: prompts.count)
+    }
+
+    /// Reads a segmentation reply: one `n | title | sentence` line per chapter. Lines that are not
+    /// that shape are skipped; the first chapter is made to begin at the first message, and a
+    /// start that does not move forward is dropped, so what comes back always tiles the messages.
+    static func segments(from raw: String, count: Int) -> [Segment]? {
+        var result: [Segment] = []
+        for line in raw.split(whereSeparator: \.isNewline) {
+            let cleaned = line.trimmingCharacters(in: CharacterSet(charactersIn: " \t*_`#>-"))
+            let fields = cleaned.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+            guard fields.count >= 2, let start = Int(fields[0]), (1...max(1, count)).contains(start),
+                let title = replacement(from: fields[1], current: "")
+            else { continue }
+            let gist = fields.count > 2 ? gistLine(from: fields[2]) : nil
+            if result.isEmpty {
+                result.append(Segment(start: 1, title: title, gist: gist))
+            } else if start > result[result.count - 1].start {
+                result.append(Segment(start: start, title: title, gist: gist))
+            }
+        }
+        guard !result.isEmpty else { return nil }
+        result[result.count - 1].gist = nil
+        return result
+    }
+
     /// One sentence saying what a finished stretch of the conversation came to, written once the
     /// next stretch begins, so a reader can follow a long conversation's arc without rereading it.
     static func gist(

@@ -73,6 +73,9 @@ actor SessionStore {
     /// Conversations with a title call out, so a second turn ending meanwhile does not send
     /// another look at the same messages.
     private var titlingInFlight: Set<String> = []
+    /// Conversations whose history this process has already tried to split into chapters, so a
+    /// failed split is not asked again every time the chat is read.
+    private var backfillTried: Set<String> = []
     private var pendingPrompts: [String: [QueuedPrompt]] = [:]
     /// The messages people queued behind a running turn, per session, in arrival order. Held here
     /// rather than on each device so every client of the conversation sees and can change the
@@ -2770,6 +2773,42 @@ actor SessionStore {
     private func applyGist(_ id: String, chapter: Chapter, gist: String) {
         guard var session = sessions[id], ChapterBook.summed(&session, chapter: chapter, gist: gist)
         else { return }
+        sessions[id] = session
+        publishChapters(id)
+    }
+
+    /// Splits a conversation older than chapters into them, once, the first time it is read with
+    /// enough history: the person's messages go to the titler, the chapters come back with what
+    /// each closed one came to, and every client watching is handed them. A conversation that
+    /// gains chapters of its own meanwhile keeps those.
+    func backfillChaptersIfNeeded(_ id: String) {
+        guard !backfillTried.contains(id), !titlingInFlight.contains(id),
+            let session = sessions[id], session.chapters?.isEmpty ?? true,
+            session.scheduleID == nil
+        else { return }
+        let shown = ChapterBook.backfillPrompts(session.messages)
+        guard shown.count >= ChapterBook.backfillFloor else { return }
+        backfillTried.insert(id)
+        titlingInFlight.insert(id)
+        let binary = runner.claudePath
+        let projects = projectsDir
+        let current = session.title
+        let texts = shown.map { ChapterBook.text(of: $0.message) }
+        Task.detached { [weak self] in
+            let segments = await Titler.segments(
+                binary: binary, projectsDir: projects, current: current, prompts: texts)
+            await self?.applyBackfill(id, segments: segments, shown: shown)
+        }
+    }
+
+    private func applyBackfill(
+        _ id: String, segments: [Titler.Segment]?, shown: [(turn: Int, message: Message)]
+    ) {
+        titlingInFlight.remove(id)
+        guard let segments, var session = sessions[id],
+            let chapters = ChapterBook.backfilled(session, segments: segments, shown: shown)
+        else { return }
+        session.chapters = chapters
         sessions[id] = session
         publishChapters(id)
     }
