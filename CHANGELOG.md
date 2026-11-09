@@ -4,6 +4,14 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.22.0 — 2026-11-09
+
+- A long conversation keeps its chapters. Each time the topic moves on, the bridge now opens a new chapter at the message where the new work began, instead of only overwriting the title, and once a chapter closes it writes one sentence saying what that stretch did. Tailscode shows them as headings in the chat and as a list you can jump from. A reworded title for the same work renames the chapter rather than starting another.
+- A rename you give a chat sticks, and its chapters still follow the topic underneath it.
+- A failed title check is tried again at the next message instead of being taken as "keep", and two checks never race each other.
+- A chat with an agent that names its own conversation is no longer renamed back and forth by the bridge every turn.
+- A fork carries the chapters it was cut from and takes its first title from where its own part began.
+
 ## 1.21.1 — 2026-11-08
 
 - A message sent while a chat's background work runs is taken again. Once a turn that left a workflow, a subagent or a background command running had been over for 45 seconds, every message to that chat was refused with "This session is running on the server right now" until the work finished, because what the work's agents wrote was taken for somebody else working in the chat. While the bridge's own Claude process carries the work, and for 45 seconds after it ends, its agents' writes are known as the bridge's own; a chat whose conversation a terminal is writing is still refused.
