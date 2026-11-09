@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.23.0 — 2026-11-09
+
+- A long conversation from before chapters gets them too. The first time a chat with six or more of your messages is opened, the bridge splits its history into chapters once, with a line on what each one came to, and every device showing it updates. A chat that already has chapters keeps its own.
+
 ## 1.22.0 — 2026-11-09
 
 - A long conversation keeps its chapters. Each time the topic moves on, the bridge now opens a new chapter at the message where the new work began, instead of only overwriting the title, and once a chapter closes it writes one sentence saying what that stretch did. Tailscode shows them as headings in the chat and as a list you can jump from. A reworded title for the same work renames the chapter rather than starting another.
