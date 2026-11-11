@@ -156,8 +156,10 @@ it) and what the binary prints for `--version`. `.github/workflows/release.yml` 
 `X.Y.Z` tag for linux-x86_64 and linux-aarch64 inside `swift:6.4.1-jammy` (glibc 2.35, so the
 archive runs on Ubuntu 22.04 and newer, Debian 12, Fedora and the like; it needs the system's
 `libcurl.so.4`, which any machine that can run the installer's `curl` has) and for darwin-arm64 on
-`macos-15`, then publishes them with `latest.txt`, the pointer the installer reads. Nothing in the
-workflow has been run yet.
+the `xcode-27` runner, then publishes them with `latest.txt`, the pointer the installer reads. Every
+release is started on the machine that built it and sent a body after its headers before it is
+published, because Xcode 26's Swift 6.3 miscompiles that wait (swiftlang/swift#84793) while Swift
+6.4 does not.
 
 Each archive also holds `install.sh`, and `CHANGELOG-<version>.md` (the changelog as of that
 release, from its own heading down) is published beside it for the bridge to read.
@@ -230,7 +232,7 @@ identity when the gate is on — see Security.
 | Method | Path | Body | Response |
 |---|---|---|---|
 | GET | `/health` | — | `ok` |
-| GET | `/status` | — | `{"agent": "claude", "model": …, "version": …, "authenticated": bool, "proto": 2, "epoch": …, "turnWait": 1, "marks": 1, "queue": 1, "agents": 1, "schedules": 1}` — `proto`/`epoch` announce the sequenced `/stream` protocol, `turnWait` the protocol version of `/sessions/:id/wait`, `marks` that conversations carry `saved`/`pinned`/`archived`/`readAt`, `queue` that this bridge holds the shared queue (see Shared queue), `agents` that it hosts ACP agents (see Other agents), `schedules` that it keeps schedules (see Schedules) |
+| GET | `/status` | — | `{"agent": "claude", "model": …, "version": …, "authenticated": bool, "access": {…}, "proto": 2, "epoch": …, "turnWait": 2, "marks": 1, "queue": 1, "agents": 1, "schedules": 1, "detail": 1, "chapters": 1}` — `proto`/`epoch` announce the sequenced `/stream` protocol, `turnWait` the protocol version of `/sessions/:id/wait` (`2` holds an `until=settled` wait until the work is over), `marks` that conversations carry `saved`/`pinned`/`archived`/`readAt`, `queue` that this bridge holds the shared queue (see Shared queue), `agents` that it hosts ACP agents (see Other agents), `schedules` that it keeps schedules (see Schedules), `detail` that the session read answers the goal, cut-off turn and provider wait whole, `chapters` that it serves a conversation's chapters (see Chapters), and `access` which door let the request in |
 | GET | `/stream` | `Last-Event-ID` header or `?since=epoch:seq` | one sequenced SSE stream of everything this bridge knows is happening (below) |
 | GET | `/auth` | — | whether the CLI is signed in, as whom, and the sign-in in progress if there is one |
 | POST | `/auth/login` | — | starts `claude auth login` on a pseudo-terminal and answers with the URL it printed |
@@ -246,6 +248,7 @@ identity when the gate is on — see Security.
 | POST | `/sessions` | `{title?, directory?, model?, effort?}` | the created `Session`; `directory` sets the project directory its turns run in |
 | GET | `/sessions/:id` | — | `Session` (404 if unknown), including the turn in flight; tagged, so `If-None-Match` gets a `304` |
 | GET | `/sessions/:id/revision` | — | `{updatedAt, active, turnOpen, background*}` — the session's state in one small answer, for a client polling while its stream is quiet |
+| GET | `/sessions/:id/context` | — | what fills the conversation's context window as its own CLI counts it: the system prompt, tools, memory files, skills and agents, the messages split by kind, the buffer held back for auto-compaction, the window and where compaction starts; `404` when this conversation's window cannot be measured (an agent conversation, or one with no transcript yet) |
 | PATCH | `/sessions/:id` | `{title?, saved?, pinned?, archived?, read?: "seen"\|"unread", at?}` | `{"ok": true}` (404 if a title names an unknown session; marks are accepted for any id). `at` is when the person decided: each mark keeps the later decision, not the later arrival |
 | DELETE | `/sessions/:id` | — | `{"ok": true}` |
 | POST | `/sessions/:id/message` | `{text, model?, effort?, attachments?}` | `202 {"ok": true, "queued": false}`; the turn runs async, watch `/events`. A prompt sent while this bridge is already running a turn on the session is accepted and **queued** behind it as an item of the shared queue (no transcript echo until it starts) — `202 {"ok": true, "queued": true, "position": n}` — so two clients on one session cannot start two `claude` processes against one transcript. `409` when the session is being written by a turn started outside this bridge (a terminal), which it cannot serialize against |
@@ -282,12 +285,15 @@ identity when the gate is on — see Security.
 | GET | `/files/raw` | `?path=`, `?tool=`, `?session=` | the file's bytes with its MIME type — what an image part points at; a deleted file falls back to the copy that session's transcript kept for that tool call |
 | GET | `/attachments/:session/:name` | — | the bytes a prompt carried, served back with its MIME type |
 | POST | `/sessions/:id/live-activity` | `LiveActivityRegistration` | registers an ActivityKit push token for this session |
-| POST | `/push/device` | `{token, environment}` | `{"ok": true, "delivers": bool}` — registers a device token for turn-end pushes; `delivers` says whether this bridge actually holds an APNs key, so a client can tell a real push from one an older bridge only pretended to accept (requires an authenticated bridge — a password or the tailnet gate) |
+| POST | `/push/device` | `{token, environment, rules?}` | `{"ok": true, "delivers": bool}` — registers a device token for turn-end pushes; `rules` is what this phone wants to hear (`finish`: `settled`, `everyTurn`, `failures` or `never`; `minimumWork`, `needsYou`, `muted`), applied per device, and a phone that registered before the rules existed gets `settled`; `delivers` says whether this bridge actually holds an APNs key, so a client can tell a real push from one an older bridge only pretended to accept (requires an authenticated bridge — a password or the tailnet gate) |
 | POST | `/push/device/unregister` | `{token}` | forgets it |
 
 `Session`: `{id, title, directory?, claudeSessionID?, priorClaudeSessionIDs?, model, effort,
 createdAt, updatedAt, messages, lastCostUSD?, lastTokens?, pendingFork?, customTitle?,
-autoTitled?, goal?, interruption?, autoResume?}`.
+autoTitled?, chapters?, chaptersRevision?, goal?, interruption?, autoResume?, agent?,
+agentName?, agentSessionID?, scheduleID?, retry?}` — `chapters` oldest first, each
+`{title, turn, messageID?, startedAt, gist?, namedBy}`, with `chaptersRevision` counting every
+change so a slow read never undoes a newer list; `retry` is the provider wait an open turn is in.
 `Message`: `{id, role: "user"|"assistant"|"system", parts, createdAt}` — `system` carries
 transcript boundaries such as compactions.
 `Part` is `{kind: "text"|"reasoning", text}`, `{kind: "tool", tool: ToolCall}`,
@@ -347,6 +353,26 @@ The machine keeps the clock: a schedule lives here, in `~/.claude-bridge/schedul
 | POST | `/schedules/:id/run` | — | asks now; a repeat keeps its hour |
 
 A conversation a schedule made carries `scheduleID` and is `scheduled: true` in a listing.
+
+## Chapters
+
+A title says what a conversation is about now, not how it got there, so the bridge also keeps its
+stretches. Every third of the person's messages the bridge's one-shot titler looks at whether the
+name still fits and answers `KEEP`, `RENAME: …` for the same work reworded, or `MOVED n: …` where a
+new topic began. A move renames the conversation, opens a chapter at the message named and sums up
+the chapter it closed in one past-tense sentence; a person's own rename pins the title while the
+chapters still follow the topic underneath it. A failed look is asked again at the next message
+instead of read as `KEEP`, and an ACP agent that names its own conversation is left alone.
+
+A conversation older than chapters and six or more of the person's messages long is split once, the
+first time it is read: its messages are numbered and the titler answers one `n | title | what it
+came to` line per chapter, with a split that opens a chapter at nearly every message refused and
+one finer than a chapter per three messages folded to that.
+
+`Session.chapters` is the list oldest first — `{title, turn, messageID?, startedAt, gist?,
+namedBy}` where `namedBy` is `prompt`, `model`, `person`, `agent`, `schedule`, `fork` or `kept` —
+and `chaptersRevision` counts every change. The stream carries a `chapters` frame whenever they
+change, and a fork carries the chapters it was cut from. `GET /status` reports `chapters: 1`.
 
 ## Signing in
 
@@ -451,6 +477,9 @@ Each event on `/sessions/:id/events` is one `data: <json>\n\n` frame:
 | `goal` | `goal?` | The session's `/goal` changed; the field is absent once nothing is being pursued |
 | `compaction` | `phase`, `error?` | A compaction started, finished, or failed — the turn is still running throughout. The seam itself arrives as a `system` message upsert with one `compaction` part, carrying the numbers at once and the summary once the transcript has it; what the model says after it is a new assistant message |
 | `background` | `tasks?`, `task?`, `since?`, `stalled?` | The background work the conversation's process carries changed; absent fields once nothing is running. No turn is open either way |
+| `queue` | `queue`, `paused` | The shared queue changed (see Shared queue); the whole snapshot |
+| `retry` | `retry?` | An open turn is waiting on Anthropic between attempts: the attempt, the reason, the HTTP status and when it tries next; absent once an answer arrives or the turn ends |
+| `chapters` | `chapters`, `revision` | A conversation's chapters changed — one opened, one renamed or summed up, or a clear dropped them; the whole list and its revision |
 | `interrupted` | `interruption?` | A turn was cut off by the machine, with what it had already done; the field is absent once it is picked back up or dismissed |
 | `error` | `error` | Turn-level failure (e.g. the `claude` binary could not be launched) |
 
@@ -485,6 +514,12 @@ has nothing to say about it; `ending` is one of `finished`, `answerless`, `faile
 a `/wait` answer for the same turn never disagree. A hold is capped at `BRIDGE_WAIT_MAX` seconds
 (default 10800, three hours); past it the answer is `{"state":"running","waited":true}` and the
 caller is expected to open another wait rather than treat it as an ending.
+
+`?until=settled` holds past the turn's end until the conversation's work is over: nothing running,
+nothing carried in the background, nothing queued, and ten seconds of quiet. The answer says
+`"settled": true`, and `duration` and `toolCount` cover the whole stretch, so a phone says one
+piece of work is done once rather than once per turn. A bridge that predates it answers at the
+turn's end and leaves `settled` out.
 
 This bridge runs Claude with a fixed permission mode, so no turn ever stops on an interactive
 approval prompt — `state: "needsYou"` here only ever means a question, never `ending: "approval"`.
@@ -577,7 +612,7 @@ Everything is environment variables. Empty values fall back to the default.
 | `BRIDGE_LAUNCH_TIMEOUT` | `300` | Seconds a process that has never written a line gets before its launch is called failed |
 | `BRIDGE_TURN_SILENCE_TTL` | `7200` | Seconds an open turn may go without a line from its process before it is ended |
 | `BRIDGE_STALL_WINDOW` | `600` | Seconds a background shell past its budget must show no CPU and no output before it is ended; `0` leaves it to the person |
-| `BRIDGE_STORE` | `~/.claude-bridge/sessions.json` | Session persistence file |
+| `BRIDGE_STORE` | `~/.claude-bridge/sessions.json` | Session persistence. From 1.19 this file is an index of every conversation without its messages; each conversation's messages live in `conversations/<id>.json` beside it |
 | `BRIDGE_PROJECTS` | `~/.claude/projects` | Claude Code CLI transcript root scanned for discoverable sessions |
 | `BRIDGE_RELEASE_BASE` | the project's `releases/latest/download` | Installer only: where `latest.txt`, the archives and `CHANGELOG-<version>.md` are served from. A prebuilt install records the one it used in `install.json` and the bridge reads it from there |
 | `BRIDGE_SRC` | `~/.claude-bridge/src` | The checkout self-update operates on (set by the installer's generated runner) |
