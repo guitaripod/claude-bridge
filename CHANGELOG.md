@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.24.0 — 2026-11-13
+
+- Each workflow agent now says which run fanned it out (`runID` on `GET /sessions/:id/agents`, the same id the Workflow call answers with), so Tailscode puts every agent on the card of the workflow that ran it. A chat that ran several workflows showed nearly all of their agents on the newest card, 1,816 in one, while the runs that did the work said no agents had appeared yet.
+
 ## 1.23.0 — 2026-11-09
 
 - A long conversation from before chapters gets them too. The first time a chat with six or more of your messages is opened, the bridge splits its history into chapters once, with a line on what each one came to, and every device showing it updates. A chat that already has chapters keeps its own.
