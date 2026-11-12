@@ -557,6 +557,7 @@ actor TranscriptIndex {
                     updatedAt: lastContent,
                     active: active,
                     completed: completed)
+                if dir.lastPathComponent != "subagents" { summary.runID = dir.lastPathComponent }
                 if active {
                     let progress = progress(atPath: file.path)
                     summary.startedAt = progress.startedAt

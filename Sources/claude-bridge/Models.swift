@@ -356,6 +356,11 @@ struct SubagentSummary: Codable, Sendable, Equatable {
     var updatedAt: Date
     var active: Bool
     var completed: Bool
+    /// The workflow run that fanned this agent out — the `workflows/<runID>/` folder its sidecar
+    /// sits in, which is the `Run ID` the Workflow call answered with. A workflow agent has no
+    /// spawning call to name it, and its sidecar no start time a client can trust, so without this
+    /// a chat that ran several workflows seated every agent it could not place on the newest one.
+    var runID: String?
     /// What a live agent is doing right now, from its sidecar transcript: when it keeps a todo
     /// list, how far through it is; always, how many tools it has run and which one is current.
     var startedAt: Date?

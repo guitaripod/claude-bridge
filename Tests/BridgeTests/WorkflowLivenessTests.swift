@@ -152,6 +152,18 @@ import Testing
         #expect(agents.filter { $0.completed == true }.count == 1)
     }
 
+    /// Every agent of a run names the run it belongs to, so a client can put six hundred agents on
+    /// the card that launched them rather than on whichever run it happens to have drawn last.
+    @Test func everyWorkflowAgentNamesItsRun() async throws {
+        let world = try makeWorld(started: 4, results: 4, agentAge: 300, marker: true)
+        defer { try? FileManager.default.removeItem(at: world.root) }
+        let index = index(world)
+
+        let agents = await index.subagents(for: world.sessionID)
+        #expect(agents.count == 4)
+        #expect(agents.allSatisfy { $0.runID == "wf_test" })
+    }
+
     /// A run's agents write only their sidecars; the parent transcript stays quiet until its CLI
     /// takes up the run's report. A caller that knows the run is its own leaves the sidecars out
     /// and still hears the transcript itself being written by anybody else.
