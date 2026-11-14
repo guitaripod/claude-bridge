@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.26.0 — 2026-11-15
+
+- A chat that finished while you were away says what the agent said. The list of chats now carries the opening of the last answer for each chat you have not read yet, so the app can show it under the chat's name instead of the word "Finished". It shows in the Tailscode builds that follow this release; older apps ignore it.
+
 ## 1.25.0 — 2026-11-14
 
 - Stop works when pressed right after sending. A stop in the second or two while Claude was still starting was lost, and the message ran to its end; now the turn is stopped before the message reaches Claude.
