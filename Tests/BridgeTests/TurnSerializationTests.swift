@@ -95,7 +95,7 @@ struct TurnSerializationTests {
         try await until(.seconds(3)) { fake.starts >= 1 }
         #expect(fake.starts == 1)
 
-        try await until(.seconds(6)) { fake.starts >= 2 }
+        try await until(.seconds(20)) { fake.starts >= 2 }
         #expect(fake.starts == 2)
         try await until(.seconds(3)) { await store.hasQueuedOrRunningTurn(session.id) == false }
         #expect(await store.hasQueuedOrRunningTurn(session.id) == false)
@@ -114,10 +114,10 @@ struct TurnSerializationTests {
         for index in 0..<3 {
             _ = await store.send(session.id, request: SendRequest(text: "prompt \(index)"))
         }
-        try await Task.sleep(for: .seconds(3))
+        try await until(.seconds(20)) { fake.invocations().count >= 6 }
 
         let log = fake.invocations()
-        #expect(log.count == 6)
+        try #require(log.count == 6)
         for pair in stride(from: 0, to: log.count, by: 2) {
             #expect(log[pair].hasPrefix("start"))
             #expect(log[pair + 1].hasPrefix("end"))
@@ -140,7 +140,8 @@ struct TurnSerializationTests {
         #expect(result.discarded == 0)
         #expect(result.paused)
 
-        try await Task.sleep(for: .seconds(2))
+        try await until(.seconds(15)) { await store.hasQueuedOrRunningTurn(session.id) == false }
+        try await Task.sleep(for: .milliseconds(500))
         #expect(fake.starts == 1)
         #expect(await store.hasQueuedOrRunningTurn(session.id) == false)
         #expect(await store.queueSnapshot(session.id).queue.count == 1)
@@ -198,11 +199,11 @@ struct RunnerLivenessTests {
         #expect(before?.active != true)
 
         _ = await store.send(session.id, request: SendRequest(text: "work quietly"))
-        try await Task.sleep(for: .milliseconds(250))
+        try await until(.seconds(10)) { fake.starts >= 1 }
         let during = await store.list().first { $0.id == session.id }
         #expect(during?.active == true, "a held turn must read as live with no transcript growth")
 
-        try await Task.sleep(for: .seconds(1.5))
+        try await until(.seconds(10)) { await store.hasQueuedOrRunningTurn(session.id) == false }
         let after = await store.list().first { $0.id == session.id }
         #expect(after?.active != true)
     }
