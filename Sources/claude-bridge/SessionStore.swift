@@ -776,6 +776,7 @@ actor SessionStore {
             }
             await existing.close()
         }
+        if let registered = processes[id] { return registered }
         let process = ClaudeProcess(
             claudePath: runner.claudePath, permissionMode: runner.permissionMode, launch: launch,
             model: model, effort: effort,
