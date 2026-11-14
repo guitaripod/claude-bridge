@@ -44,4 +44,11 @@ struct HardeningTests {
         #expect(kept.count == 1)
     }
 
+    @Test("The password check accepts only the exact header")
+    func thePasswordCheckIsExact() {
+        #expect(AccessMiddleware.matches("Basic abc", "Basic abc"))
+        #expect(!AccessMiddleware.matches("Basic abd", "Basic abc"))
+        #expect(!AccessMiddleware.matches("Basic ab", "Basic abc"))
+        #expect(!AccessMiddleware.matches(nil, "Basic abc"))
+    }
 }
