@@ -11,7 +11,15 @@ private struct FakeClaude {
     let binary: String
     let invocationLog: URL
 
-    init(holdSeconds: Double = 0.6, sessionID: String = "fake-session") throws {
+    /// It speaks and holds only once the prompt arrives, as the real CLI does: a fake that held
+    /// from its own start could exit before a busy test machine handed it the prompt, and the
+    /// bridge rightly started another, and one that announced itself before any prompt opened a
+    /// turn of its own after a stop had closed the one it was started for. `forkExtraSeconds`
+    /// holds a forked launch that much longer, so a fork started a moment after its parent
+    /// reliably outlives it.
+    init(
+        holdSeconds: Double = 0.6, sessionID: String = "fake-session", forkExtraSeconds: Double = 0
+    ) throws {
         root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("bridge-tests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -24,13 +32,13 @@ private struct FakeClaude {
         let body = """
             #!/bin/sh
             echo "start $$" >> "\(invocationLog.path)"
+            IFS= read -r prompt
             /usr/bin/printf '%s\\n' '{"type":"system","subtype":"init","session_id":"\(sessionID)"}'
             sleep \(holdSeconds)
+            case "$*" in *--fork-session*) sleep \(forkExtraSeconds) ;; esac
             echo "end $$" >> "\(invocationLog.path)"
             """
-        try body.write(to: script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755], ofItemAtPath: script.path)
+        try writeExecutable(body, to: script)
         binary = script.path
     }
 
@@ -140,7 +148,7 @@ struct TurnSerializationTests {
 
     @Test("A fork's first turn is not mistaken for its parent's")
     func forkDoesNotStealTheParentsTurnSlot() async throws {
-        let fake = try FakeClaude(holdSeconds: 3.0)
+        let fake = try FakeClaude(holdSeconds: 3.0, forkExtraSeconds: 2.0)
         defer { fake.cleanUp() }
         let (store, _) = makeStore(fake)
         let parent = await store.create(CreateRequest(directory: fake.root.path))

@@ -712,7 +712,12 @@ actor SessionStore {
             closeTurn(id, fallback: "⚠️ Could not start Claude.")
             return
         }
-        registerTurnProcess(id, pid: await process.pid)
+        let pid = await process.pid
+        guard !stoppedTurns.contains(id) else {
+            closeTurn(id, fallback: nil)
+            return
+        }
+        registerTurnProcess(id, pid: pid)
         do {
             try await process.send(prompt)
         } catch {
@@ -1813,7 +1818,11 @@ actor SessionStore {
     /// message, an enqueue or a resume lets the queue run again.
     ///
     /// The turn is interrupted the way the TUI's Escape does it, which keeps the process and the
-    /// background work it carries; a process that does not answer the interrupt is terminated.
+    /// background work it carries; a process that does not answer the interrupt is terminated. A
+    /// stop that lands before the turn's prompt was handed to the CLI, while it is still starting,
+    /// is not sent to it: the launch sees the stop before it hands the prompt over and closes the
+    /// turn instead. The interrupt used to fail on a process not yet running, or reach the CLI
+    /// ahead of the prompt, and the prompt then ran to its end.
     func abortTurn(_ id: String) -> (stopped: Bool, discarded: Int, paused: Bool) {
         let discarded = pendingPrompts.removeValue(forKey: id)?.count ?? 0
         let stopping = openTurns[id] != nil
@@ -1843,6 +1852,7 @@ actor SessionStore {
             kill(pid, SIGTERM)
             return (true, discarded, paused)
         }
+        guard turnProcessIDs[id] != nil else { return (true, discarded, paused) }
         let grace = abortGrace
         Task { [weak self] in
             guard await process.interrupt() else {

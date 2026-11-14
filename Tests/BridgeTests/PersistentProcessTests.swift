@@ -539,7 +539,7 @@ struct PersistentProcessTests {
         let session = await store.create(CreateRequest(directory: fake.root.path))
 
         _ = await store.send(session.id, request: SendRequest(text: "a slow one"))
-        try await Task.sleep(for: .milliseconds(300))
+        await waitUntil { FileManager.default.fileExists(atPath: fake.root.appendingPathComponent("slow").path) }
         let result = await store.abortTurn(session.id)
         #expect(result.stopped)
         await waitUntil(.seconds(2)) { await !store.hasQueuedOrRunningTurn(session.id) }
@@ -671,7 +671,7 @@ struct PersistentProcessEdgeTests {
         let session = await store.create(CreateRequest(directory: fake.root.path))
 
         _ = await store.send(session.id, request: SendRequest(text: "hang here"))
-        try await Task.sleep(for: .milliseconds(300))
+        await waitUntil { FileManager.default.fileExists(atPath: fake.root.appendingPathComponent("hang").path) }
         #expect(await store.hasQueuedOrRunningTurn(session.id))
         let result = await store.abortTurn(session.id)
         #expect(result.stopped)
