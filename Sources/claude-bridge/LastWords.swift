@@ -66,7 +66,9 @@ enum LastWords {
         line.count >= 3 && line.allSatisfy { $0 == "-" || $0 == "*" || $0 == "_" || $0 == "=" || $0 == " " }
     }
 
-    /// `[words](address)` as its words.
+    /// `[words](address)` as its words. A bracket that opens no link is kept as written and the
+    /// line is read on past it, so `array[0]` early in a sentence does not leave a link after it
+    /// in its markup.
     private static func unlinked(_ text: String) -> String {
         var out = ""
         var rest = Substring(text)
@@ -74,7 +76,11 @@ enum LastWords {
             guard let close = rest[open...].firstIndex(of: "]"),
                 rest.index(after: close) < rest.endIndex, rest[rest.index(after: close)] == "(",
                 let end = rest[close...].firstIndex(of: ")")
-            else { break }
+            else {
+                out += rest[...open]
+                rest = rest[rest.index(after: open)...]
+                continue
+            }
             out += rest[..<open]
             out += rest[rest.index(after: open)..<close]
             rest = rest[rest.index(after: end)...]

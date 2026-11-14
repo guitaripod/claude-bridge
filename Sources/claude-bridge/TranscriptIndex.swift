@@ -1311,7 +1311,7 @@ enum TranscriptParser {
                 return false
             case "user":
                 guard line["isMeta"] as? Bool != true, line["isCompactSummary"] as? Bool != true,
-                    let typed = message["content"] as? String, !typed.hasPrefix("<")
+                    isPrompt(message["content"])
                 else { return true }
                 found = ""
                 return false
@@ -1320,6 +1320,15 @@ enum TranscriptParser {
             }
         }
         return found
+    }
+
+    /// Whether a user line's content is something a person sent: typed words, or words with a
+    /// picture or a file beside them, which the CLI writes as blocks. A tool coming back is blocks
+    /// too and is the turn going on, and the CLI's own angle-bracket bookkeeping is nobody's prompt.
+    static func isPrompt(_ content: Any?) -> Bool {
+        if let typed = content as? String { return !typed.hasPrefix("<") }
+        guard let blocks = content as? [[String: Any]], !blocks.isEmpty else { return false }
+        return !blocks.contains { $0["type"] as? String == "tool_result" }
     }
 
     /// First line of the first user prompt in a (sidecar) transcript — the

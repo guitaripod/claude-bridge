@@ -119,6 +119,31 @@ import Testing
                 == "Result Fixed the render() hold: see the notes. Tests pass")
     }
 
+    @Test func aBracketThatOpensNoLinkDoesNotHideTheLinkAfterIt() {
+        #expect(
+            LastWords.digest("The index is at array[0]; see [the notes](https://example.com/a).")
+                == "The index is at array[0]; see the notes.")
+        #expect(LastWords.digest("A lone [ stays as written.") == "A lone [ stays as written.")
+    }
+
+    @Test func aPromptSentWithAPictureStillBeginsItsTurn() throws {
+        let withPicture = try line([
+            "type": "user",
+            "message": [
+                "role": "user",
+                "content": [
+                    ["type": "text", "text": "what is this?"],
+                    ["type": "image", "source": ["type": "base64", "data": "AAAA"]],
+                ],
+            ],
+        ])
+        let path = try write([
+            try prompt("first"), try said("An older answer."), withPicture, try toolCall(),
+            try toolResult(),
+        ])
+        #expect(TranscriptParser.lastWords(atPath: path) == nil)
+    }
+
     @Test func aLongAnswerIsCutAtAWord() throws {
         let text = String(repeating: "seven letters ", count: 40)
         let digest = try #require(LastWords.digest(text))
