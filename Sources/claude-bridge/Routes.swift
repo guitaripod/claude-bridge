@@ -384,7 +384,10 @@ func registerRoutes(
     /// Whether this machine keeps itself current on its own. The setting belongs to the machine
     /// rather than to whichever device last asked, so every client reads back the same answer.
     router.post("update/auto") { request, _ in
-        let body = try await decodeBody(AutoUpdateRequest.self, request)
+        guard let body = try? await decodeBody(AutoUpdateRequest.self, request) else {
+            return jsonResponse(
+                ["error": "Say whether to update on its own: {\"enabled\": true}"], status: .badRequest)
+        }
         return jsonResponse(await updater.setAutomation(enabled: body.enabled))
     }
 
