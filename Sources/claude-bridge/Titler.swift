@@ -238,11 +238,15 @@ enum Titler {
                 var environment = ProcessInfo.processInfo.environment
                 environment["CLAUDE_CODE_ENTRYPOINT"] = "claude-bridge-titler"
                 process.environment = environment
-                let stdout = Pipe()
-                process.standardOutput = stdout
                 process.standardError = FileHandle.nullDevice
+                let stdout: Pipe
                 do {
-                    try process.run()
+                    stdout = try Spawning.serialized {
+                        let stdout = Pipe()
+                        process.standardOutput = stdout
+                        try process.runAllowingBusyExecutable()
+                        return stdout
+                    }
                 } catch {
                     continuation.resume(returning: nil)
                     return

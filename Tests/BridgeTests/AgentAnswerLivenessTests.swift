@@ -259,15 +259,13 @@ import Testing
         try FileManager.default.createDirectory(at: tasks, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let cli = root.appendingPathComponent("claude")
-        try "#!/bin/bash\nexec 7<\"$1\"\nwhile sleep 1; do :; done\n".write(
-            to: cli, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
+        try writeExecutable("#!/bin/bash\nexec 7<\"$1\"\nwhile sleep 1; do :; done\n", to: cli)
         let process = Process()
         process.executableURL = cli
         process.arguments = [tasks.path]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
-        try process.run()
+        try process.runAllowingBusyExecutable()
         defer { kill(process.processIdentifier, SIGKILL) }
         var served: Set<String>?
         for _ in 0..<50 {

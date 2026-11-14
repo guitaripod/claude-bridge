@@ -125,9 +125,7 @@ private struct StdinClaude {
             done
             echo "end $$" >> "\(invocationLog.path)"
             """
-        try body.write(to: script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755], ofItemAtPath: script.path)
+        try writeExecutable(body, to: script)
         binary = script.path
     }
 
@@ -160,10 +158,14 @@ private func shellAlive(_ needle: String) -> Bool {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
     process.arguments = ["-f", needle]
-    let pipe = Pipe()
-    process.standardOutput = pipe
     process.standardError = FileHandle.nullDevice
-    guard (try? process.run()) != nil else { return false }
+    let launched = try? Spawning.serialized {
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        try process.runAllowingBusyExecutable()
+        return pipe
+    }
+    guard let pipe = launched else { return false }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
     process.waitUntilExit()
     let own = String(ProcessInfo.processInfo.processIdentifier)

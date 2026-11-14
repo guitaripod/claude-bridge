@@ -182,13 +182,17 @@ enum Shell {
         process.executableURL = url
         process.arguments = arguments
         if let cwd { process.currentDirectoryURL = URL(fileURLWithPath: cwd) }
-        let pipe = Pipe()
         process.standardOutput = FileHandle.nullDevice
-        process.standardError = pipe
         var environment = ProcessInfo.processInfo.environment
         environment["GIT_TERMINAL_PROMPT"] = "0"
         process.environment = environment
-        guard (try? process.run()) != nil else { return "could not run \(executable)" }
+        let launched = try? Spawning.serialized {
+            let pipe = Pipe()
+            process.standardError = pipe
+            try process.runAllowingBusyExecutable()
+            return pipe
+        }
+        guard let pipe = launched else { return "could not run \(executable)" }
         let output = Output()
         let handle = pipe.fileHandleForReading
         let finished = DispatchSemaphore(value: 0)
@@ -197,8 +201,7 @@ enum Shell {
             finished.signal()
         }
         if finished.wait(timeout: .now() + timeout) == .timedOut {
-            process.terminate()
-            _ = finished.wait(timeout: .now() + 5)
+            end(process, finished: finished)
             return "timed out after \(Int(timeout))s"
         }
         process.waitUntilExit()
@@ -216,13 +219,17 @@ enum Shell {
         process.executableURL = url
         process.arguments = arguments
         if let cwd { process.currentDirectoryURL = URL(fileURLWithPath: cwd) }
-        let pipe = Pipe()
-        process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         var environment = ProcessInfo.processInfo.environment
         environment["GIT_TERMINAL_PROMPT"] = "0"
         process.environment = environment
-        guard (try? process.run()) != nil else { return Data() }
+        let launched = try? Spawning.serialized {
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            try process.runAllowingBusyExecutable()
+            return pipe
+        }
+        guard let pipe = launched else { return Data() }
         let output = Output()
         let handle = pipe.fileHandleForReading
         let finished = DispatchSemaphore(value: 0)
@@ -231,11 +238,22 @@ enum Shell {
             finished.signal()
         }
         if finished.wait(timeout: .now() + timeout) == .timedOut {
-            process.terminate()
-            _ = finished.wait(timeout: .now() + 5)
+            end(process, finished: finished)
+        } else {
+            process.waitUntilExit()
+        }
+        return output.data
+    }
+
+    /// Ends a child that outran its deadline and reaps it: SIGTERM first, SIGKILL for one still
+    /// there five seconds later, so the wait that lets Foundation release it is bounded even for a
+    /// child that ignores the polite signal.
+    private static func end(_ process: Process, finished: DispatchSemaphore) {
+        process.terminate()
+        if finished.wait(timeout: .now() + 5) == .timedOut, process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
         }
         process.waitUntilExit()
-        return output.data
     }
 
     /// Starts a command and walks away: no pipe to read, no exit to wait for. Backgrounding
@@ -252,7 +270,8 @@ enum Shell {
         var merged = ProcessInfo.processInfo.environment
         for (key, value) in environment { merged[key] = value }
         process.environment = merged
-        try? process.run()
+        process.terminationHandler = { $0.releaseFinished() }
+        try? process.runAllowingBusyExecutable()
     }
 
     static func which(_ executable: String) -> URL? {

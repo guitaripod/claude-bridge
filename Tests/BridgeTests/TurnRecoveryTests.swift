@@ -28,9 +28,7 @@ private struct Wreckage {
             /usr/bin/printf '%s\\n' '{"type":"system","subtype":"init","session_id":"resumed"}'
             exit 0
             """
-        try body.write(to: script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755], ofItemAtPath: script.path)
+        try writeExecutable(body, to: script)
         claudeBinary = script.path
         transcripts = TranscriptIndex(
             root: projects,

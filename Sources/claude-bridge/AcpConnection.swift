@@ -95,9 +95,9 @@ actor AcpConnection {
     private(set) var sessionID: String?
 
     private let process = Process()
-    private let stdinPipe = Pipe()
-    private let stdoutPipe = Pipe()
-    private let stderrPipe = Pipe()
+    private let stdinPipe = Spawning.pipe()
+    private let stdoutPipe = Spawning.pipe()
+    private let stderrPipe = Spawning.pipe()
     private let exit = ExitLatch()
     private let errorTail = ErrorTail()
     private var nextID = 0
@@ -134,7 +134,10 @@ actor AcpConnection {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
         let latch = exit
-        process.terminationHandler = { _ in latch.signal() }
+        process.terminationHandler = { finished in
+            finished.releaseFinished()
+            latch.signal()
+        }
         let tail = errorTail
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
             let chunk = handle.availableData
@@ -144,7 +147,7 @@ actor AcpConnection {
                 tail.append(chunk)
             }
         }
-        try process.run()
+        try process.runAllowingBusyExecutable()
         pid = process.processIdentifier
         isRunning = true
         lastActivityAt = Date()

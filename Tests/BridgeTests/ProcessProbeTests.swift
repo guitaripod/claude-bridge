@@ -11,7 +11,7 @@ import Testing
         child.arguments = ["-c", "sleep 30"]
         child.standardOutput = FileHandle.nullDevice
         child.standardError = FileHandle.nullDevice
-        try child.run()
+        try child.runAllowingBusyExecutable()
         defer { child.terminate() }
         let me = ProcessInfo.processInfo.processIdentifier
         let children = ProcessProbe.children(of: me)

@@ -771,10 +771,11 @@ actor AgentService {
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             process.terminationHandler = { finished in
+                finished.releaseFinished()
                 continuation.resume(returning: finished.terminationStatus)
             }
             do {
-                try process.run()
+                try process.runAllowingBusyExecutable()
             } catch {
                 continuation.resume(returning: -1)
             }

@@ -346,12 +346,12 @@ struct ChapterBackfillTests {
         defer { try? FileManager.default.removeItem(at: root) }
         let fake = root.appendingPathComponent("claude")
         let calls = root.appendingPathComponent("calls")
-        try """
+        let script = """
             #!/bin/sh
             echo call >> "\(calls.path)"
             printf '1 | Blank feed after resume | Traced the blank feed to a 401 hang.\\n5 | Release notes | \\n'
-            """.write(to: fake, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fake.path)
+            """
+        try writeExecutable(script, to: fake)
         let store = SessionStore(
             runner: ClaudeRunner(claudePath: fake.path, workdir: root.path, permissionMode: "default"),
             defaults: MachineDefaults(modelOverride: "sonnet", effortOverride: "medium", home: NSTemporaryDirectory()),

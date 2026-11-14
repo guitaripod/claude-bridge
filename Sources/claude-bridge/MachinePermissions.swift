@@ -108,7 +108,7 @@ actor MachinePermissionService {
         process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return false }
+        guard (try? process.runAllowingBusyExecutable()) != nil else { return false }
         process.waitUntilExit()
         return process.terminationStatus == 0
     }
@@ -128,7 +128,8 @@ actor MachinePermissionService {
         process.arguments = arguments
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
-        try? process.run()
+        process.terminationHandler = { $0.releaseFinished() }
+        try? process.runAllowingBusyExecutable()
     }
 }
 

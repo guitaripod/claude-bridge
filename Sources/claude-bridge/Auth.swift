@@ -194,8 +194,8 @@ private final class LoginSession: @unchecked Sendable {
     private let claudePath: String
     private let workdir: String
     private let process = Process()
-    private let input = Pipe()
-    private let output = Pipe()
+    private let input = Spawning.pipe()
+    private let output = Spawning.pipe()
     private let lock = NSLock()
     private var transcript = ""
 
@@ -236,7 +236,8 @@ private final class LoginSession: @unchecked Sendable {
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             self?.append(text)
         }
-        try process.run()
+        process.terminationHandler = { $0.releaseFinished() }
+        try process.runAllowingBusyExecutable()
     }
 
     func send(_ code: String) {

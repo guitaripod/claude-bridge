@@ -490,8 +490,8 @@ actor ClaudeProcess {
     private let claudePath: String
     private let permissionMode: String
     private let process = Process()
-    private let stdinPipe = Pipe()
-    private let stdoutPipe = Pipe()
+    private let stdinPipe = Spawning.pipe()
+    private let stdoutPipe = Spawning.pipe()
     private let exit = ExitLatch()
     private let sink: @Sendable (ClaudeProcess, String) async -> Void
     private let onExit: @Sendable (ClaudeProcess) async -> Void
@@ -581,8 +581,11 @@ actor ClaudeProcess {
         process.standardOutput = stdoutPipe
         process.standardError = FileHandle.nullDevice
         let latch = exit
-        process.terminationHandler = { _ in latch.signal() }
-        try process.run()
+        process.terminationHandler = { finished in
+            finished.releaseFinished()
+            latch.signal()
+        }
+        try process.runAllowingBusyExecutable()
         pid = process.processIdentifier
         isRunning = true
         lastActivityAt = Date()

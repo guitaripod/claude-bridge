@@ -36,7 +36,7 @@ func run(
     var launchError = ""
     for _ in 0..<5 where !launched {
         do {
-            try process.run()
+            try process.runAllowingBusyExecutable()
             launched = true
         } catch {
             launchError = "\(error)"
@@ -48,6 +48,17 @@ func run(
     try? sink.close()
     let output = (try? String(contentsOf: capture, encoding: .utf8)) ?? ""
     return Ran(status: process.terminationStatus, output: output)
+}
+
+/// Writes a script and marks it executable while no child is being started. Foundation on Linux
+/// lets a child started at that moment inherit the half-written file's descriptor (see
+/// ``Spawning``), and a long-lived child holds it open for good, so running the script is refused
+/// with "text file busy" however often it is retried.
+func writeExecutable(_ body: String, to url: URL) throws {
+    try Spawning.serialized {
+        try Data(body.utf8).write(to: url)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    }
 }
 
 func makeTemporaryDirectory(_ name: String = "bridge-test") -> URL {
@@ -112,7 +123,7 @@ final class ReleaseWorld: @unchecked Sendable {
         ]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
-        try? process.run()
+        try? process.runAllowingBusyExecutable()
         var found = 0
         for _ in 0..<100 {
             if let text = try? String(contentsOf: portFile, encoding: .utf8), let number = Int(text) {
@@ -174,9 +185,9 @@ final class ReleaseWorld: @unchecked Sendable {
         let work = makeTemporaryDirectory("publish")
         defer { try? FileManager.default.removeItem(at: work) }
         let program = work.appendingPathComponent("claude-bridge")
-        try? "#!/bin/sh\ncase \"${1:-}\" in --version) echo \"claude-bridge \(version)\" ;; esac\n"
-            .write(to: program, atomically: true, encoding: .utf8)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: program.path)
+        try? writeExecutable(
+            "#!/bin/sh\ncase \"${1:-}\" in --version) echo \"claude-bridge \(version)\" ;; esac\n",
+            to: program)
         let notes = work.appendingPathComponent("CHANGELOG.md")
         try? changelog.write(to: notes, atomically: true, encoding: .utf8)
         var packaged = Ran(status: 1, output: "")

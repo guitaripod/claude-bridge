@@ -37,9 +37,7 @@ struct LiveBackgroundOutcomeTests {
                 [ -f "$root/turn-$n.jsonl" ] && /bin/cat "$root/turn-$n.jsonl"
                 exit 0
                 """
-            try body.write(to: script, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes(
-                [.posixPermissions: 0o755], ofItemAtPath: script.path)
+            try writeExecutable(body, to: script)
             binary = script.path
         }
 

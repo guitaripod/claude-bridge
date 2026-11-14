@@ -22,8 +22,8 @@ final class AgentSignIn: @unchecked Sendable {
     let agent: String
     let method: String
     private let process = Process()
-    private let input = Pipe()
-    private let output = Pipe()
+    private let input = Spawning.pipe()
+    private let output = Spawning.pipe()
     private let lock = NSLock()
     private var transcript = ""
     private var ended: (state: String, code: Int32?)?
@@ -72,6 +72,7 @@ final class AgentSignIn: @unchecked Sendable {
             self?.append(String(decoding: data, as: UTF8.self))
         }
         process.terminationHandler = { [weak self] finished in
+            finished.releaseFinished()
             guard let self else { return }
             self.lock.lock()
             if self.ended == nil {
@@ -81,7 +82,7 @@ final class AgentSignIn: @unchecked Sendable {
             self.lock.unlock()
             self.onExit(self)
         }
-        try process.run()
+        try process.runAllowingBusyExecutable()
     }
 
     func send(_ text: String) {

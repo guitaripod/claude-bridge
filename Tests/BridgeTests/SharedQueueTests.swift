@@ -24,9 +24,7 @@ private struct QueueFakeClaude {
             sleep \(holdSeconds)
             echo "end $$" >> "\(invocationLog.path)"
             """
-        try body.write(to: script, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o755], ofItemAtPath: script.path)
+        try writeExecutable(body, to: script)
         binary = script.path
     }
 
