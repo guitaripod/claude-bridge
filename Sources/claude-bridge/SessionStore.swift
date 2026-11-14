@@ -287,7 +287,8 @@ actor SessionStore {
 
     func list(
         activeClaudeIDs: Set<String> = [], transcriptDates: [String: Date] = [:],
-        agents: [String: AgentActivity] = [:], settings: [String: TranscriptSettings] = [:]
+        agents: [String: AgentActivity] = [:], settings: [String: TranscriptSettings] = [:],
+        lastWords: [String: String] = [:]
     ) -> [SessionSummary] {
         order.compactMap { id -> SessionSummary? in
             guard let session = sessions[id] else { return nil }
@@ -325,6 +326,7 @@ actor SessionStore {
                 summary.backgroundSince = work.since
                 summary.backgroundStalled = work.stalled
             }
+            summary.lastWords = summary.active == true ? nil : lastWords[claudeID]
             return summary
         }
         .sorted { $0.updatedAt > $1.updatedAt }
@@ -353,11 +355,11 @@ actor SessionStore {
     }
 
     /// The same rows, each carrying what the person decided about it. Applied to the whole
-    /// listing rather than inside ``list(activeClaudeIDs:transcriptDates:agents:settings:)``,
+    /// listing rather than inside ``list(activeClaudeIDs:transcriptDates:agents:settings:lastWords:)``,
     /// because half of a listing is transcripts the store has never adopted.
     func stampingMarks(_ summaries: [SessionSummary], now: Date = Date()) -> [SessionSummary] {
         if marks.noteListed(summaries.map(\.id), now: now) { marksDirty = true }
-        return summaries.map { marks.stamping($0) }
+        return summaries.map { marks.stamping($0, now: now) }
     }
 
     /// Forgets the marks of conversations nothing has listed for a month, and writes down the

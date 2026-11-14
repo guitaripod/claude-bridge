@@ -22,6 +22,8 @@ actor TranscriptIndex {
         var createdAt: Date
         var updatedAt: Date
         var path: String
+        /// What the answer that closed the last turn began with; nil while a turn is open.
+        var lastWords: String?
     }
 
     private struct CacheSlot {
@@ -645,6 +647,18 @@ actor TranscriptIndex {
         return settings
     }
 
+    /// What each settled conversation's last answer began with, for the stored sessions whose
+    /// records hold no words at all.
+    func transcriptLastWords() -> [String: String] {
+        scan()
+        var words: [String: String] = [:]
+        for slot in cache.values {
+            guard let entry = slot.entry, let said = entry.lastWords else { continue }
+            words[entry.id] = said
+        }
+        return words
+    }
+
     func transcriptSettings(for id: String) -> TranscriptSettings? {
         guard let path = path(for: id), let entry = cache[path]?.entry else { return nil }
         guard entry.model != nil || entry.effort != nil else { return nil }
@@ -1042,7 +1056,8 @@ actor TranscriptIndex {
             active: active,
             turnOpen: turnOpen,
             agents: agents?.count,
-            agentTask: agents?.task)
+            agentTask: agents?.task,
+            lastWords: active ? nil : entry.lastWords)
     }
 
     /// A lookup for a session that has no transcript yet — every freshly created chat, until its
@@ -1094,9 +1109,11 @@ actor TranscriptIndex {
         let settings = TranscriptParser.lastSettings(atPath: file.path)
         if let model = settings.model { entry?.model = model }
         entry?.effort = settings.effort
+        let turnClosed = TranscriptParser.isTurnClosed(atPath: file.path)
+        entry?.lastWords = turnClosed ? TranscriptParser.lastWords(atPath: file.path) : nil
         cache[file.path] = CacheSlot(
             mtime: mtime, size: size, entry: entry, contentDate: contentDate,
-            turnClosed: TranscriptParser.isTurnClosed(atPath: file.path))
+            turnClosed: turnClosed)
         if entry != nil { pathByID[id] = file.path }
     }
 }
@@ -1252,6 +1269,57 @@ enum TranscriptParser {
             if span == size { break }
         }
         return TranscriptSettings()
+    }
+
+    /// What the answer that closed the transcript's last turn began with, as a list row can quote
+    /// it. The newest text the conversation's own model wrote, looked for no further back than the
+    /// prompt that began the turn: a turn that ended without a word has nothing to quote, and the
+    /// answer before it is not this turn's.
+    static func lastWords(atPath path: String) -> String? {
+        guard let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+        let size = (try? handle.seekToEnd()).map(Int.init) ?? 0
+        for window in [256 * 1024, 4 * 1024 * 1024] {
+            let span = min(size, window)
+            try? handle.seek(toOffset: UInt64(size - span))
+            guard let data = try? handle.read(upToCount: span) else { break }
+            if let found = lastWords(in: data) { return found.isEmpty ? nil : found }
+            if span == size { break }
+        }
+        return nil
+    }
+
+    /// The quote this window holds, an empty string when the window reaches the turn's prompt
+    /// without finding one, or nil when it holds neither and a wider window may.
+    static func lastWords(in data: Data) -> String? {
+        var found: String?
+        forEachJSONLineReversed(in: data) { line in
+            guard line["isSidechain"] as? Bool != true,
+                let message = line["message"] as? [String: Any]
+            else { return true }
+            switch line["type"] as? String {
+            case "assistant":
+                guard message["model"] as? String != "<synthetic>",
+                    let blocks = message["content"] as? [[String: Any]]
+                else { return true }
+                let text = blocks.reversed().lazy.compactMap { block -> String? in
+                    guard block["type"] as? String == "text" else { return nil }
+                    return (block["text"] as? String).flatMap { LastWords.digest($0) }
+                }.first
+                guard let text else { return true }
+                found = text
+                return false
+            case "user":
+                guard line["isMeta"] as? Bool != true, line["isCompactSummary"] as? Bool != true,
+                    let typed = message["content"] as? String, !typed.hasPrefix("<")
+                else { return true }
+                found = ""
+                return false
+            default:
+                return true
+            }
+        }
+        return found
     }
 
     /// First line of the first user prompt in a (sidecar) transcript — the

@@ -187,8 +187,10 @@ actor ObserverLoop {
         let dates = await index.transcriptDates()
         let agents = lastActivity
         let settings = await index.transcriptSettings()
+        let words = await index.transcriptLastWords()
         let stored = await store.list(
-            activeClaudeIDs: active, transcriptDates: dates, agents: agents, settings: settings)
+            activeClaudeIDs: active, transcriptDates: dates, agents: agents, settings: settings,
+            lastWords: words)
         let (claimed, hidden) = await store.excludedTranscriptIDs()
         let discovered = await index.list(excluding: claimed, hidden: hidden)
         var byID: [String: SessionSummary] = [:]

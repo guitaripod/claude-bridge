@@ -340,6 +340,10 @@ struct SessionSummary: Codable, Sendable, Equatable {
     var agentName: String? = nil
     /// A schedule made this conversation and runs into it.
     var scheduled: Bool? = nil
+    /// The first words of the answer that closed the last turn, for a row nobody has read yet.
+    /// Absent while a turn is open, once the chat has been read, and on a chat that has not moved
+    /// in ``LastWords/window``: a list shows it only on an unread row, so it rides on no other.
+    var lastWords: String? = nil
 }
 
 /// The agents working for one session, as a list row can describe them.
