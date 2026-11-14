@@ -1825,7 +1825,7 @@ actor SessionStore {
     /// ahead of the prompt, and the prompt then ran to its end.
     func abortTurn(_ id: String) -> (stopped: Bool, discarded: Int, paused: Bool) {
         let discarded = pendingPrompts.removeValue(forKey: id)?.count ?? 0
-        let stopping = openTurns[id] != nil
+        let stopping = openTurns[id] != nil || isAdoptedTurn(id)
         let paused = (stopping || !(sharedQueues[id] ?? []).isEmpty) && pauseQueue(id)
         if journal.turns[id] != nil {
             journal.turns[id]?.queued = []
@@ -1863,6 +1863,12 @@ actor SessionStore {
             await self?.endIfStillStopping(id, process, turnStartedAt: stoppedTurn)
         }
         return (true, discarded, paused)
+    }
+
+    /// A turn a CLI kept running across a restart of the bridge, adopted rather than opened here:
+    /// it has no open turn of its own, only the process id it runs as, which Stop ends.
+    private func isAdoptedTurn(_ id: String) -> Bool {
+        openTurns[id] == nil && inFlight.contains(id) && turnProcessIDs[id] != nil
     }
 
     /// An interrupt the CLI accepted and then never closed the turn for — a tool it could not
@@ -2477,7 +2483,8 @@ actor SessionStore {
         let owed = record.queued.map(QueuedPrompt.init)
         guard let first = owed.first else {
             inFlight.remove(id)
-            broadcaster(for: id).send(.status("idle"))
+            drainQueueIfIdle(id)
+            if !inFlight.contains(id) { broadcaster(for: id).send(.status("idle")) }
             return
         }
         inFlight.insert(id)
@@ -2552,6 +2559,7 @@ actor SessionStore {
         let caster = broadcaster(for: id)
         caster.send(.interrupted(interruption))
         caster.send(.status("idle"))
+        drainQueueIfIdle(id)
         let title = session.title
         let tools = interruption.progress.toolCount
         let duration = interruption.detectedAt.timeIntervalSince(interruption.startedAt)
