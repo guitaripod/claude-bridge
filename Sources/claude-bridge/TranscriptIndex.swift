@@ -87,10 +87,7 @@ actor TranscriptIndex {
 
     func updatedAt(for id: String) -> Date? {
         guard let path = path(for: id) else { return nil }
-        let values = try? URL(fileURLWithPath: path).resourceValues(forKeys: [
-            .contentModificationDateKey
-        ])
-        return values?.contentModificationDate ?? cache[path]?.mtime
+        return Self.statMtime(path) ?? cache[path]?.mtime
     }
 
     /// Session ids whose transcript (or subagent sidecar files) were written to
@@ -381,10 +378,7 @@ actor TranscriptIndex {
             let inRun = dir.lastPathComponent != "subagents"
             var finished: Set<String>?
             for file in files where file.pathExtension == "jsonl" {
-                guard
-                    let written = (try? file.resourceValues(
-                        forKeys: [.contentModificationDateKey]))?.contentModificationDate
-                else { continue }
+                guard let written = Self.statMtime(file.path) else { continue }
                 any = max(any ?? written, written)
                 let name = file.deletingPathExtension().lastPathComponent
                 if written > horizon, name.hasPrefix("agent-") {
@@ -484,10 +478,7 @@ actor TranscriptIndex {
         return
             files
             .filter { $0.pathExtension == "jsonl" }
-            .compactMap {
-                (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?
-                    .contentModificationDate
-            }
+            .compactMap { Self.statMtime($0.path) }
             .max()
     }
 
@@ -519,8 +510,7 @@ actor TranscriptIndex {
                 guard name.hasPrefix("agent-") else { return nil }
                 let lastContent =
                     lastLineStamp(atPath: file.path)
-                    ?? (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?
-                    .contentModificationDate ?? .distantPast
+                    ?? Self.statMtime(file.path) ?? .distantPast
                 var title = "Agent"
                 var agentType: String?
                 var toolUseID: String?
@@ -638,8 +628,7 @@ actor TranscriptIndex {
     }
 
     private func fileSize(_ path: String) -> UInt64 {
-        ((try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? NSNumber)?
-            .uint64Value ?? 0
+        UInt64(Self.statSize(path) ?? 0)
     }
 
     /// Latest transcript mtime per session id, for freshening stored sessions
@@ -868,6 +857,28 @@ actor TranscriptIndex {
                 + TimeInterval(seconds.tv_nsec) / 1_000_000_000)
     }
 
+    /// A transcript's date and size from one `stat`. The scan asks this of every transcript every
+    /// two seconds, and `URL.resourceValues` costs a few hundred times as much for the same two
+    /// numbers, most of an idle bridge's CPU.
+    nonisolated static func statMtimeAndSize(_ path: String) -> (Date, Int)? {
+        var status = stat()
+        guard stat(path, &status) == 0 else { return nil }
+        #if os(Linux)
+            let seconds = status.st_mtim
+        #else
+            let seconds = status.st_mtimespec
+        #endif
+        let mtime = Date(
+            timeIntervalSince1970: TimeInterval(seconds.tv_sec)
+                + TimeInterval(seconds.tv_nsec) / 1_000_000_000)
+        return (mtime, Int(status.st_size))
+    }
+
+    nonisolated static func isDirectory(_ path: String) -> Bool {
+        var status = stat()
+        return stat(path, &status) == 0 && (status.st_mode & S_IFMT) == S_IFDIR
+    }
+
     nonisolated static func statSize(_ path: String) -> Int? {
         var status = stat()
         guard stat(path, &status) == 0 else { return nil }
@@ -1051,7 +1062,7 @@ actor TranscriptIndex {
 
         var seen = Set<String>()
         for dir in projectDirs {
-            guard (try? dir.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true,
+            guard Self.isDirectory(dir.path),
                 let files = try? fileManager.contentsOfDirectory(
                     at: dir, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
                     options: .skipsHiddenFiles)
@@ -1073,13 +1084,7 @@ actor TranscriptIndex {
     }
 
     private func refresh(_ file: URL, id: String) {
-        guard
-            let values = try? file.resourceValues(forKeys: [
-                .contentModificationDateKey, .fileSizeKey,
-            ]),
-            let mtime = values.contentModificationDate,
-            let size = values.fileSize
-        else { return }
+        guard let (mtime, size) = Self.statMtimeAndSize(file.path) else { return }
         if let slot = cache[file.path], slot.mtime == mtime, slot.size == size { return }
 
         let contentDate = TranscriptParser.lastContentDate(atPath: file.path)

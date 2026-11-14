@@ -271,14 +271,16 @@ enum ProcessProbe {
 
     /// A Claude Code process, however it was installed: the native binary names itself `claude`,
     /// a package install runs under node with the package on its command line. The bridge itself
-    /// is `claude-bridge` and never matches.
+    /// is `claude-bridge` and never matches. The command line is read only for a JavaScript
+    /// runtime: this runs over every process on the machine every two seconds, and reading the
+    /// command line of each one doubled the files it opened for nothing.
     private static func isClaudeCLI(_ pid: Int32) -> Bool {
-        if let comm = readProcText("/proc/\(pid)/comm"),
-            comm.trimmingCharacters(in: .whitespacesAndNewlines) == "claude"
-        {
-            return true
-        }
-        guard let data = readProcFile("/proc/\(pid)/cmdline"),
+        guard let comm = readProcText("/proc/\(pid)/comm")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        else { return false }
+        if comm == "claude" { return true }
+        guard Self.scriptRuntimes.contains(comm) || Self.isVersionName(comm),
+            let data = readProcFile("/proc/\(pid)/cmdline"),
             !data.isEmpty
         else { return false }
         let arguments = data.split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
@@ -286,6 +288,14 @@ enum ProcessProbe {
             return true
         }
         return arguments.prefix(3).contains { $0.contains("@anthropic-ai/claude-code") }
+    }
+
+    private static let scriptRuntimes: Set<String> = ["node", "nodejs", "bun"]
+
+    /// A native install runs a binary named for its version (`versions/2.1.323`), which is the
+    /// name the kernel shows until the CLI renames itself `claude` a moment into its life.
+    private static func isVersionName(_ comm: String) -> Bool {
+        !comm.isEmpty && comm.allSatisfy { $0.isNumber || $0 == "." }
     }
 
     static func commandLine(_ pid: Int32) -> String? {
