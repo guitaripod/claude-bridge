@@ -632,7 +632,7 @@ enum FileBrowsing {
     }
 
     static func content(_ path: String, cap: Int = 262_144) -> String? {
-        guard let handle = FileHandle(forReadingAtPath: path),
+        guard isRegularFile(path), let handle = FileHandle(forReadingAtPath: path),
             let data = try? handle.read(upToCount: cap)
         else { return nil }
         try? handle.close()
@@ -649,12 +649,17 @@ enum FileBrowsing {
     /// How big a file is, when it is a regular file this bridge will serve at all — the same
     /// question `bytes` asks, answered without reading it, so a route can stream instead.
     static func readableSize(_ path: String, cap: Int = 40 * 1024 * 1024) -> Int? {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
-            !isDirectory.boolValue,
-            let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size]) as? Int,
-            size <= cap
+        var info = stat()
+        guard stat(path, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG, Int(info.st_size) <= cap
         else { return nil }
-        return size
+        return Int(info.st_size)
+    }
+
+    /// Only a regular file is read. Opening a named pipe with no writer blocks the thread that
+    /// opens it until one appears, and a device such as /dev/zero reports no size and never ends,
+    /// so a tap in the file browser could hold a thread for good or stream without end.
+    static func isRegularFile(_ path: String) -> Bool {
+        var info = stat()
+        return stat(path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFREG
     }
 }

@@ -5,6 +5,21 @@ import Testing
 
 @Suite("Hardening")
 struct HardeningTests {
+    @Test("Only regular files are read, so a named pipe or a device cannot hold a thread")
+    func onlyRegularFilesAreRead() throws {
+        let dir = makeTemporaryDirectory("fifo")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fifo = dir.appendingPathComponent("pipe").path
+        #expect(mkfifo(fifo, 0o600) == 0)
+        #expect(FileBrowsing.content(fifo) == nil)
+        #expect(FileBrowsing.readableSize(fifo) == nil)
+        #expect(FileBrowsing.readableSize("/dev/zero") == nil)
+        let regular = dir.appendingPathComponent("note.txt")
+        try "hello".write(to: regular, atomically: true, encoding: .utf8)
+        #expect(FileBrowsing.content(regular.path) == "hello")
+        #expect(FileBrowsing.readableSize(regular.path) == 5)
+    }
+
     @Test("A diff path that looks like an option is never read as one")
     func aDiffPathIsNeverAnOption() throws {
         let repo = makeTemporaryDirectory("diff-option")
