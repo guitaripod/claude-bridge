@@ -77,18 +77,45 @@ final class StoreWriter: @unchecked Sendable {
     /// file yet keeps the ones the index itself carried, which is how a store written before the
     /// split is read.
     static func load(from url: URL) -> [Session]? {
-        guard let data = try? Data(contentsOf: url),
-            let index = try? JSONCoding.decoder.decode([Session].self, from: data)
-        else { return nil }
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        guard let index = try? JSONCoding.decoder.decode([Session].self, from: data) else {
+            setAside(url)
+            return nil
+        }
         return index.map { entry in
             var session = entry
             let file = messagesURL(for: entry.id, besides: url)
-            if let stored = try? Data(contentsOf: file),
-                let messages = try? JSONCoding.decoder.decode([Message].self, from: stored)
-            {
-                session.messages = messages
+            if let stored = try? Data(contentsOf: file) {
+                if let messages = try? JSONCoding.decoder.decode([Message].self, from: stored) {
+                    session.messages = messages
+                } else {
+                    setAside(file)
+                }
             }
             return session
         }
+    }
+
+    /// Records what is already on disk, so the first write after a start rewrites only the
+    /// conversations that changed rather than every one the machine has ever held.
+    func noteLoaded(_ sessions: [Session]) {
+        lock.lock()
+        defer { lock.unlock() }
+        for session in sessions {
+            let file = Self.messagesURL(for: session.id, besides: url)
+            guard FileManager.default.fileExists(atPath: file.path) else { continue }
+            written[session.id] = session.messages
+        }
+    }
+
+    /// Moves a file this bridge cannot read out of the way instead of letting the next write
+    /// replace it with an empty store or an empty conversation: one that a newer bridge wrote, or
+    /// that a crash cut short, keeps what it held for somebody to recover.
+    private static func setAside(_ file: URL) {
+        let stamp = Int(Date().timeIntervalSince1970)
+        let aside = file.deletingPathExtension()
+            .appendingPathExtension("unreadable-\(stamp).\(file.pathExtension)")
+        try? FileManager.default.moveItem(at: file, to: aside)
+        print("[store] could not read \(file.lastPathComponent); kept it as \(aside.lastPathComponent)")
     }
 }

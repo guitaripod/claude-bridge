@@ -250,10 +250,12 @@ actor SessionStore {
         hiddenTranscripts = Self.loadHidden(from: Self.hiddenURL(for: storeURL))
         marks = MarksLedger.load(
             from: Self.marksURL(for: storeURL), legacySaved: Self.savedURL(for: storeURL))
-        for session in Self.loadStored(from: storeURL) {
+        let stored = Self.loadStored(from: storeURL)
+        for session in stored {
             sessions[session.id] = session
             order.append(session.id)
         }
+        writer.noteLoaded(stored)
         let restored = Self.restoredQueues(journal: &journal, sessions: sessions)
         sharedQueues = restored.items
         pausedQueues = Set(restored.ids)
