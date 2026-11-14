@@ -4,6 +4,19 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.25.0 — 2026-11-14
+
+- Stop works when pressed right after sending. A stop in the second or two while Claude was still starting was lost, and the message ran to its end; now the turn is stopped before the message reaches Claude.
+- A message sent within ten seconds of pressing Stop is no longer killed by that stop. The stop's timer ended whatever turn was running when it fired, so the next turn died ten seconds in with a cut-off answer.
+- Deleting a chat while it is working no longer leaves the machine thinking a turn is still running. That kept the machine from ever counting as quiet, so a waiting update never installed, and the chat's uploaded pictures and files are now deleted with it.
+- Stop works on a turn the bridge kept running across its own restart, and a message you sent while that turn ran goes once it finishes instead of waiting for the next one.
+- The bridge no longer hangs waiting for a program that has already finished. Starting several at once could hand one program another's exit signal, so the bridge waited for good, and a fake engine in the test suite hung about one run in six; programs are now started one at a time, and every one is let go once it exits.
+- An idle bridge spends about a quarter of the CPU it did: checking which conversations changed now reads each file's date directly, and the look at running processes skips the ones that cannot be Claude.
+- A store or conversation file this bridge cannot read is kept aside as `*.unreadable-*.json` instead of being overwritten with nothing, and a restart no longer rewrites every conversation file.
+- Security: a diff request can no longer be turned into a command that empties a file, the file browser no longer hangs on a named pipe or streams /dev/zero, and the password is compared in constant time.
+- A single failed look at Tailscale no longer locks every device on your tailnet out for ten minutes; it is tried again five seconds later.
+- A chat's title run that outlives its minute is killed rather than left holding the chat's titling for good, and turning automatic updates on or off with a malformed request answers 400 instead of an error.
+
 ## 1.24.0 — 2026-11-13
 
 - Each workflow agent now says which run fanned it out (`runID` on `GET /sessions/:id/agents`, the same id the Workflow call answers with), so Tailscode puts every agent on the card of the workflow that ran it. A chat that ran several workflows showed nearly all of their agents on the newest card, 1,816 in one, while the runs that did the work said no agents had appeared yet.
