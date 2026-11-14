@@ -228,6 +228,16 @@ enum Titler {
         return String(flattened.prefix(cap))
     }
 
+    /// Ends a title run that outlived its deadline: SIGTERM, then SIGKILL five seconds later for
+    /// one still there, since the read waiting on its output ends only when it does and the chat
+    /// stays marked as being titled until then.
+    private static func end(_ process: Process) {
+        process.terminate()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
+            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+        }
+    }
+
     private static func run(binary: String, cwd: String, prompt: String) async -> String? {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
@@ -251,7 +261,7 @@ enum Titler {
                     continuation.resume(returning: nil)
                     return
                 }
-                let killer = DispatchWorkItem { process.terminate() }
+                let killer = DispatchWorkItem { Self.end(process) }
                 DispatchQueue.global().asyncAfter(deadline: .now() + 45, execute: killer)
                 let data = stdout.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
