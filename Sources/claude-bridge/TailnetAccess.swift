@@ -200,7 +200,9 @@ actor TailnetGate {
     }
 
     private func currentSelfLogin(cli: String) async -> String? {
-        if let selfLogin, Date().timeIntervalSince(selfLogin.at) < Self.selfTTL {
+        if let selfLogin,
+            Date().timeIntervalSince(selfLogin.at) < (selfLogin.value == nil ? Self.missTTL : Self.selfTTL)
+        {
             return selfLogin.value
         }
         let value = await Task.detached(priority: .userInitiated) { Self.readSelfLogin(cli: cli) }.value
