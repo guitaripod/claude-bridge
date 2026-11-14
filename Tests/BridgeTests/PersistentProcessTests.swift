@@ -56,6 +56,7 @@ private struct StdinClaude {
                   case "$line" in
                     *slow*)
                       rm -f "\(stop)"
+                      touch "\(root.appendingPathComponent("slow").path)"
                       ( sleep 3; [ -f "\(stop)" ] || $P '%s\\n' '{"type":"result","subtype":"success","is_error":false}' ) &
                       ;;
                     *hang*)
@@ -683,4 +684,30 @@ struct PersistentProcessEdgeTests {
         await waitUntil { await assistantTexts(store, session.id).count == 2 }
         #expect(fake.starts == 2)
     }
+
+    @Test("A stop's grace never ends the turn sent after the stopped one closed")
+    func aStopsGraceSparesTheNextTurn() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake, abortGrace: 0.5)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "a slow one"))
+        await waitUntil {
+            FileManager.default.fileExists(atPath: fake.root.appendingPathComponent("slow").path)
+        }
+        let stoppedAt = ContinuousClock.now
+        #expect(await store.abortTurn(session.id).stopped)
+        await waitUntil { await !store.hasQueuedOrRunningTurn(session.id) }
+
+        _ = await store.send(session.id, request: SendRequest(text: "hang now"))
+        await waitUntil {
+            FileManager.default.fileExists(atPath: fake.root.appendingPathComponent("hang").path)
+        }
+        try await Task.sleep(until: stoppedAt + .seconds(0.5) + ClaudeProcess.closeGrace + .seconds(1))
+        #expect(await store.hasQueuedOrRunningTurn(session.id))
+        #expect(await store.liveProcessCount() == 1)
+        #expect(fake.starts == 1)
+    }
+
 }

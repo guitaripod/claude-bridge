@@ -1662,8 +1662,11 @@ actor SessionStore {
         if openTurns[id]?.startedAt == started { closeTurn(id, fallback: nil) }
     }
 
-    private func endAgentTurnIfStillStopping(_ id: String, _ connection: AcpConnection) async {
-        guard openTurns[id] != nil, agentConnections[id] === connection else { return }
+    private func endAgentTurnIfStillStopping(
+        _ id: String, _ connection: AcpConnection, turnStartedAt stopped: Date?
+    ) async {
+        guard let open = openTurns[id], open.startedAt == stopped, agentConnections[id] === connection
+        else { return }
         agentConnections[id] = nil
         await connection.terminate()
         finishAgentTurn(id, nil, stopReason: "cancelled", failure: nil)
@@ -1821,6 +1824,7 @@ actor SessionStore {
             journal.write(to: journalURL)
         }
         guard stopping else { return (false, discarded, paused) }
+        let stoppedTurn = openTurns[id]?.startedAt
         stoppedTurns.insert(id)
         let pusher = self.pusher
         let now = Date()
@@ -1830,7 +1834,7 @@ actor SessionStore {
             Task { [weak self] in
                 await connection.cancel()
                 try? await Task.sleep(for: .seconds(grace))
-                await self?.endAgentTurnIfStillStopping(id, connection)
+                await self?.endAgentTurnIfStillStopping(id, connection, turnStartedAt: stoppedTurn)
             }
             return (true, discarded, paused)
         }
@@ -1846,15 +1850,20 @@ actor SessionStore {
                 return
             }
             try? await Task.sleep(for: .seconds(grace))
-            await self?.endIfStillStopping(id, process)
+            await self?.endIfStillStopping(id, process, turnStartedAt: stoppedTurn)
         }
         return (true, discarded, paused)
     }
 
     /// An interrupt the CLI accepted and then never closed the turn for — a tool it could not
-    /// kill — is finished the hard way, so a stop that was pressed is a stop that happens.
-    private func endIfStillStopping(_ id: String, _ process: ClaudeProcess) async {
-        guard openTurns[id] != nil, processes[id] === process else { return }
+    /// kill — is finished the hard way, so a stop that was pressed is a stop that happens. Only the
+    /// turn that was stopped: one the person sent after the stop closed it runs on the same process
+    /// and was killed by this timer ten seconds in.
+    private func endIfStillStopping(
+        _ id: String, _ process: ClaudeProcess, turnStartedAt stopped: Date?
+    ) async {
+        guard let open = openTurns[id], open.startedAt == stopped, processes[id] === process
+        else { return }
         await process.terminate()
     }
 
