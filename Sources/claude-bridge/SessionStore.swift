@@ -453,15 +453,32 @@ actor SessionStore {
     /// Every conversation the journal says had a turn open when this process last stopped.
     func journaledSessions() -> Set<String> { Set(journal.turns.keys) }
 
+    /// Deletes a conversation and settles a turn it still had open, after the conversation is
+    /// gone so nothing is saved, titled or continued for it: the process is dropped before its
+    /// exit can close that turn, so the turn used to stay open for good, and the machine read as
+    /// busy, keeping a waiting update from ever restarting it.
     func delete(_ id: String) {
+        pendingPrompts[id] = nil
+        discardQueue(id)
         sessions[id] = nil
+        closeTurn(id, fallback: nil)
+        inFlight.remove(id)
+        removeAttachments(of: id)
         order.removeAll { $0 == id }
         broadcasters[id] = nil
         dropProcess(id)
         dropAgentConnection(id)
         persistNow()
         forgetMarks(id)
-        discardQueue(id)
+    }
+
+    /// A deleted conversation's uploads go with it: they were kept beyond the conversation, and
+    /// served to anyone asking for the old path, for as long as the machine lived.
+    private func removeAttachments(of id: String) {
+        let dir = storeURL.deletingLastPathComponent()
+            .appendingPathComponent("attachments", isDirectory: true)
+            .appendingPathComponent(Self.safeFileComponent(id), isDirectory: true)
+        try? FileManager.default.removeItem(at: dir)
     }
 
     /// A deleted conversation takes its queue, and the files kept for it, with it.

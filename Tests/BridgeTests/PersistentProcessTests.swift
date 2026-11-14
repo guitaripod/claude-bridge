@@ -710,4 +710,20 @@ struct PersistentProcessEdgeTests {
         #expect(fake.starts == 1)
     }
 
+    @Test("Deleting a chat in the middle of a turn settles the turn")
+    func deletingMidTurnSettlesIt() async throws {
+        let fake = try StdinClaude()
+        defer { fake.cleanUp() }
+        let store = makeStore(fake)
+        let session = await store.create(CreateRequest(directory: fake.root.path))
+
+        _ = await store.send(session.id, request: SendRequest(text: "hang here"))
+        await waitUntil {
+            FileManager.default.fileExists(atPath: fake.root.appendingPathComponent("hang").path)
+        }
+        #expect(await store.hasQueuedOrRunningTurn(session.id))
+        await store.delete(session.id)
+        #expect(await !store.hasQueuedOrRunningTurn(session.id))
+        #expect(await store.turnsInFlight(activeClaudeIDs: []) == 0)
+    }
 }
