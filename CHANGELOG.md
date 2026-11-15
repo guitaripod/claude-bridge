@@ -4,6 +4,12 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.27.0 — 2026-11-15
+
+- Claude's usage is reported the way Anthropic's limiter sees it. The usage page rounds to whole percents, so a week at 99.5 % read as used up for the half hour it went on answering; the bridge now takes the exact figure and Anthropic's own verdict from the last reply a chat got, so the apps say used up when requests are actually refused, and not before.
+- A week that has reset no longer reads as used up until the next check: a reading taken before a reset is read again right after it, even while the bridge is waiting out failed reads, and a reading served from the cache says it is cached and shows a reset week as reset.
+- The weekly reset time is shown as exact rather than "about", since Anthropic states it.
+
 ## 1.26.0 — 2026-11-15
 
 - A chat that finished while you were away says what the agent said. The list of chats now carries the opening of the last answer for each chat you have not read yet, so the app can show it under the chat's name instead of the word "Finished". It shows in the Tailscode builds that follow this release; older apps ignore it.
