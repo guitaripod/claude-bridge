@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.28.0 — 2026-11-15
+
+- Claude knows its replies are read in Tailscode. Every new chat starts with a short fixed note, added after Claude Code's own instructions rather than in place of them, saying you may be away from the machine, which Markdown the app shows and that pictures written as Markdown, HTML, Mermaid and LaTeX show as text, that it can show you an image by opening it, and that notifications show only its first sentence or two, so it leads with the outcome. A chat that already exists picks it up at its next compaction. `BRIDGE_CLIENT_NOTE=0` turns it off.
+
 ## 1.27.0 — 2026-11-15
 
 - Claude's usage is reported the way Anthropic's limiter sees it. The usage page rounds to whole percents, so a week at 99.5 % read as used up for the half hour it went on answering; the bridge now takes the exact figure and Anthropic's own verdict from the last reply a chat got, so the apps say used up when requests are actually refused, and not before.
