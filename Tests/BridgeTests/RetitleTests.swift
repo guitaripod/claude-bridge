@@ -21,6 +21,14 @@ struct RetitleTests {
         #expect(Titler.replacement(from: "One\nTwo", current: "Fix login crash") == nil)
     }
 
+    @Test("A title call saves no session, so no client ever lists it")
+    func titleCallLeavesNoTranscript() {
+        let arguments = Titler.arguments(prompt: "Write a title")
+        #expect(arguments.first == "-p")
+        #expect(arguments.contains("--no-session-persistence"))
+        #expect(arguments.last == "Write a title")
+    }
+
     @Test("A moved topic wears the new title")
     func takesTheNewTitle() {
         #expect(

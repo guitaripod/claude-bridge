@@ -1,9 +1,9 @@
 import Foundation
 
 /// Generates a short human title for a session from its first exchange using
-/// a one-shot `claude -p` haiku call. Runs in a dedicated working directory
-/// whose transcript project dir is deleted afterwards, so title calls never
-/// surface as discovered sessions.
+/// a one-shot `claude -p` haiku call. The call saves no session, so it never
+/// surfaces as a discovered conversation, not even while it runs, and its
+/// dedicated working directory's project dir is deleted afterwards.
 enum Titler {
     static func title(
         binary: String, projectsDir: String, user: String, assistant: String
@@ -238,12 +238,21 @@ enum Titler {
         }
     }
 
+    /// The one-shot call's command line. `--no-session-persistence` keeps the CLI from writing
+    /// a transcript the bridge's discovery would list as a conversation for as long as it runs.
+    static func arguments(prompt: String) -> [String] {
+        [
+            "-p", "--no-session-persistence", "--model", "haiku", "--output-format", "text",
+            prompt,
+        ]
+    }
+
     private static func run(binary: String, cwd: String, prompt: String) async -> String? {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: binary)
-                process.arguments = ["-p", "--model", "haiku", "--output-format", "text", prompt]
+                process.arguments = arguments(prompt: prompt)
                 process.currentDirectoryURL = URL(fileURLWithPath: cwd)
                 var environment = ProcessInfo.processInfo.environment
                 environment["CLAUDE_CODE_ENTRYPOINT"] = "claude-bridge-titler"
