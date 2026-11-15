@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.28.1 — 2026-11-15
+
+- The quick calls that name your conversations no longer flash up in the session list as conversations of their own while they run: they save no session at all.
+
 ## 1.28.0 — 2026-11-15
 
 - Claude knows its replies are read in Tailscode. Every new chat starts with a short fixed note, added after Claude Code's own instructions rather than in place of them, saying you may be away from the machine, which Markdown the app shows and that pictures written as Markdown, HTML, Mermaid and LaTeX show as text, that it can show you an image by opening it, and that notifications show only its first sentence or two, so it leads with the outcome. A chat that already exists picks it up at its next compaction. `BRIDGE_CLIENT_NOTE=0` turns it off.
