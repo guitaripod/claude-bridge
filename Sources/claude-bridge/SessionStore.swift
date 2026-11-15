@@ -836,6 +836,9 @@ actor SessionStore {
     /// One stream-json object folded into whatever turn is open — a Claude line, or an agent's
     /// update already translated into one.
     private func fold(_ id: String, _ object: [String: Any]) {
+        if let reading = RateLimitReading(event: object, now: Date()) {
+            Task { await RateLimitLedger.shared.note(reading) }
+        }
         if openTurns[id] == nil {
             guard Self.opensTurn(object) else { return }
             beginUnsolicitedTurn(id)

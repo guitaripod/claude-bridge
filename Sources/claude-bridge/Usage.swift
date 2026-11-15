@@ -13,6 +13,11 @@ struct UsageGauge: Codable, Sendable {
     var usedUSD: Double?
     var limitUSD: Double?
     var startsAt: String?
+    /// The limiter's verdict on this window from the last response a turn here got: `true` while
+    /// it refuses requests, `false` while it answers them, nil when no turn has said
+    /// (``RateLimitOverlay``). A refusal reads `fraction` 1 like a whole 100 % does; this tells the
+    /// two apart for a client folding several machines' readings.
+    var refused: Bool?
 
     init(
         key: String, label: String, fraction: Double, resetsAt: String?, trustedReset: Bool,
@@ -61,6 +66,19 @@ struct UsageSnapshot: Codable, Sendable {
         self.errorCode = errorCode
         self.accountID = accountID
         self.schema = schema
+    }
+}
+
+extension UsageSnapshot {
+    /// Whether a window in this reading, taken at `readAt`, has reset since then and by `now`,
+    /// which makes it a picture of a window that has ended. A reading taken after its own stated
+    /// reset (the endpoint lagging its clock) is the newest there is, and asking again at once
+    /// would only ask again.
+    func hasReset(after readAt: Date, by now: Date) -> Bool {
+        gauges.contains { gauge in
+            guard let reset = gauge.resetsAt.flatMap(BridgeTimestamps.date) else { return false }
+            return reset > readAt && reset <= now
+        }
     }
 }
 
@@ -114,26 +132,65 @@ enum ClaudeUsage {
         }
     }
 
+    /// A reading a minute old is served as it is, unless one of its windows has reset since: a
+    /// week that opened at 21:00 is not still used up at 21:00:30 because the last answer said so.
+    /// A failed read backs off, except once after each reset its last reading was waiting for.
     static func snapshot() async -> UsageSnapshot {
-        if let fresh = await cache.fresh(within: 60) { return fresh }
-        if await cache.inBackoff {
-            if let stale = await cache.fresh(within: staleWindow) { return cached(stale) }
+        let now = Date()
+        if let held = await cache.held(within: 60),
+            !held.snapshot.hasReset(after: held.at, by: now)
+        {
+            return await sharpened(held.snapshot, readAt: held.at)
+        }
+        if await cache.inBackoff, !(await cache.owesReadAfterReset(now: now)) {
+            if let stale = await cache.held(within: staleWindow) {
+                return await sharpened(cached(stale.snapshot), readAt: stale.at)
+            }
             return unavailable("rate limited — retrying later")
         }
+        await cache.noteAttempt(at: now)
         do {
             let snapshot = try await loadAndFetch()
             await cache.store(snapshot)
-            return snapshot
+            return await sharpened(snapshot, readAt: Date())
         } catch {
             await cache.noteFailure()
-            if let stale = await cache.fresh(within: staleWindow) { return cached(stale) }
+            if let stale = await cache.held(within: staleWindow) {
+                return await sharpened(cached(stale.snapshot), readAt: stale.at)
+            }
             return unavailable("\(error)")
         }
     }
 
-    private static func cached(_ snapshot: UsageSnapshot) -> UsageSnapshot {
+    /// A reading served from the last good one is not live, and says so: a client folding several
+    /// machines' readings of one account lets a live one speak over it. A window in it whose reset
+    /// has passed is served as the reset window it now is — empty, opened at that reset, with no
+    /// reset of its own until a read names one — because the account said when it would open.
+    static func cached(_ snapshot: UsageSnapshot, now: Date = Date()) -> UsageSnapshot {
         var served = snapshot
         served.source = "api.anthropic.com · cached"
+        served.live = false
+        served.gauges = snapshot.gauges.map { gauge in
+            guard let reset = gauge.resetsAt, let date = BridgeTimestamps.date(reset), date <= now,
+                !(gauge.usedUSD != nil && gauge.limitUSD == nil)
+            else { return gauge }
+            var opened = gauge
+            opened.fraction = 0
+            opened.startsAt = reset
+            opened.resetsAt = nil
+            if opened.limitUSD != nil { opened.usedUSD = 0 }
+            return opened
+        }
+        return served
+    }
+
+    /// The endpoint's reading with the last turn's limiter reading laid over it
+    /// (``RateLimitOverlay``).
+    private static func sharpened(_ snapshot: UsageSnapshot, readAt: Date) async -> UsageSnapshot {
+        var served = snapshot
+        served.gauges = RateLimitOverlay.apply(
+            snapshot.gauges, readAt: readAt, reading: await RateLimitLedger.shared.latest,
+            now: Date())
         return served
     }
 
@@ -211,27 +268,32 @@ enum ClaudeUsage {
     private static func parse(
         _ json: [String: Any], creds: ClaudeCredentials, profile: ClaudeProfile?
     ) -> UsageSnapshot {
-        var gauges: [UsageGauge] = []
-        if let limits = json["limits"] as? [[String: Any]] {
-            gauges = limits.compactMap(gaugeFromLimit)
-        }
-        if gauges.isEmpty { gauges = gaugesFromTopLevel(json) }
-        if let extra = gaugeFromExtra(json) { gauges.append(extra) }
-
-        return UsageSnapshot(
+        UsageSnapshot(
             providerName: "Claude",
             subtitle: subtitle(creds, profile: profile),
             source: "api.anthropic.com · live",
             live: true,
-            gauges: gauges,
+            gauges: gauges(from: json),
             details: details(json),
             error: nil)
     }
 
-    private static func gaugeFromLimit(_ item: [String: Any]) -> UsageGauge? {
+    /// Every window the usage endpoint's answer states, in its own order.
+    static func gauges(from json: [String: Any]) -> [UsageGauge] {
+        var gauges: [UsageGauge] = []
+        if let limits = json["limits"] as? [[String: Any]] {
+            gauges = limits.compactMap { gaugeFromLimit($0, in: json) }
+        }
+        if gauges.isEmpty { gauges = gaugesFromTopLevel(json) }
+        if let extra = gaugeFromExtra(json) { gauges.append(extra) }
+        return gauges
+    }
+
+    private static func gaugeFromLimit(_ item: [String: Any], in json: [String: Any]) -> UsageGauge? {
         guard let kind = item["kind"] as? String,
-            let percent = (item["percent"] as? NSNumber)?.doubleValue
+            let rounded = (item["percent"] as? NSNumber)?.doubleValue
         else { return nil }
+        let percent = finer(rounded, kind: kind, in: json)
         let model = ((item["scope"] as? [String: Any])?["model"] as? [String: Any])?["display_name"] as? String
         let label: String
         switch (kind, model) {
@@ -242,16 +304,33 @@ enum ClaudeUsage {
         case (let other, .some(let name)): label = "\(pretty(other)) · \(name)"
         case (let other, .none): label = pretty(other)
         }
+        let resetsAt = normalizeTS(item["resets_at"])
         return UsageGauge(
             key: kind, label: label,
             fraction: min(1, max(0, percent / 100)),
-            resetsAt: normalizeTS(item["resets_at"]),
-            trustedReset: kind == "session",
+            resetsAt: resetsAt,
+            trustedReset: resetsAt != nil,
             usedUSD: nil, limitUSD: nil)
     }
 
+    /// A row's percent is rounded to a whole number, so a week at 99.5 % reads as used up while it
+    /// is still being answered. The same window's top-level `utilization` is the endpoint's own
+    /// figure before rounding; it is taken where it agrees with the row to within that rounding.
+    private static func finer(_ rounded: Double, kind: String, in json: [String: Any]) -> Double {
+        let key: String
+        switch kind {
+        case "session": key = "five_hour"
+        case "weekly_all": key = "seven_day"
+        default: return rounded
+        }
+        guard let utilization = ((json[key] as? [String: Any])?["utilization"] as? NSNumber)?.doubleValue,
+            abs(utilization - rounded) <= 1
+        else { return rounded }
+        return utilization
+    }
+
     private static func gaugesFromTopLevel(_ json: [String: Any]) -> [UsageGauge] {
-        [("five_hour", "5-hour session", true), ("seven_day", "Weekly · all models", false)]
+        [("five_hour", "5-hour session", true), ("seven_day", "Weekly · all models", true)]
             .compactMap { key, label, trusted in
                 guard let obj = json[key] as? [String: Any],
                     let utilization = (obj["utilization"] as? NSNumber)?.doubleValue
@@ -441,12 +520,19 @@ actor UsageSnapshotCache {
     }
 
     private let name: String
+    private let directory: URL
     private var stored: Stored?
     private var backoffUntil: Date = .distantPast
+    private var lastAttemptAt: Date = .distantPast
     private var loaded = false
 
-    init(name: String) {
+    init(
+        name: String,
+        directory: URL = FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: ".claude-bridge")
+    ) {
         self.name = name
+        self.directory = directory
     }
 
     var inBackoff: Bool { Date() < backoffUntil }
@@ -455,10 +541,31 @@ actor UsageSnapshotCache {
         backoffUntil = Date().addingTimeInterval(seconds)
     }
 
+    func noteAttempt(at date: Date) {
+        lastAttemptAt = date
+    }
+
     func fresh(within seconds: TimeInterval) -> UsageSnapshot? {
+        held(within: seconds)?.snapshot
+    }
+
+    /// The last good reading and when it was taken, while it is younger than `seconds`.
+    func held(within seconds: TimeInterval) -> (snapshot: UsageSnapshot, at: Date)? {
         loadIfNeeded()
         guard let stored, Date().timeIntervalSince(stored.at) < seconds else { return nil }
-        return stored.snapshot
+        return (stored.snapshot, stored.at)
+    }
+
+    /// Whether a window in the last good reading has reset since the last attempt to read the
+    /// account. That reading is about a window that has ended, so it is worth one read even while
+    /// failures are being backed off.
+    func owesReadAfterReset(now: Date) -> Bool {
+        loadIfNeeded()
+        guard let stored else { return false }
+        return stored.snapshot.gauges.contains { gauge in
+            guard let reset = gauge.resetsAt.flatMap(BridgeTimestamps.date) else { return false }
+            return reset <= now && reset > lastAttemptAt
+        }
     }
 
     func store(_ snapshot: UsageSnapshot) {
@@ -480,8 +587,7 @@ actor UsageSnapshotCache {
     }
 
     private func fileURL() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: ".claude-bridge/usage-cache-\(name).json")
+        directory.appending(path: "usage-cache-\(name).json")
     }
 }
 
