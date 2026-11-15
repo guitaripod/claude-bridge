@@ -782,8 +782,8 @@ actor SessionStore {
         }
         if let registered = processes[id] { return registered }
         let process = ClaudeProcess(
-            claudePath: runner.claudePath, permissionMode: runner.permissionMode, launch: launch,
-            model: model, effort: effort,
+            claudePath: runner.claudePath, permissionMode: runner.permissionMode,
+            clientNote: runner.appendsClientNote, launch: launch, model: model, effort: effort,
             sink: { [weak self] process, line in await self?.ingest(id, from: process, line: line) },
             onExit: { [weak self] process in await self?.processExited(id, process) },
             onTasksChanged: { [weak self] process, work in

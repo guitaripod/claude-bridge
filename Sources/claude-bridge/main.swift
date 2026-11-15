@@ -126,7 +126,9 @@ let apnsClient: APNSClient? = {
 }()
 
 let store = SessionStore(
-    runner: ClaudeRunner(claudePath: claudePath, workdir: workdir, permissionMode: permissionMode),
+    runner: ClaudeRunner(
+        claudePath: claudePath, workdir: workdir, permissionMode: permissionMode,
+        appendsClientNote: env("BRIDGE_CLIENT_NOTE", "1") != "0"),
     defaults: machineDefaults, storeURL: storeURL,
     projectsDir: projectsDir,
     pusher: LiveActivityPusher(

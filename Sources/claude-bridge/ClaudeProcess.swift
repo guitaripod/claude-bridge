@@ -489,6 +489,7 @@ actor ClaudeProcess {
 
     private let claudePath: String
     private let permissionMode: String
+    private let clientNote: Bool
     private let process = Process()
     private let stdinPipe = Spawning.pipe()
     private let stdoutPipe = Spawning.pipe()
@@ -514,8 +515,9 @@ actor ClaudeProcess {
     static let closeGrace: Duration = .seconds(3)
 
     init(
-        claudePath: String, permissionMode: String, launch: ClaudeLaunch, model: String,
-        effort: String, sink: @escaping @Sendable (ClaudeProcess, String) async -> Void,
+        claudePath: String, permissionMode: String, clientNote: Bool, launch: ClaudeLaunch,
+        model: String, effort: String,
+        sink: @escaping @Sendable (ClaudeProcess, String) async -> Void,
         onExit: @escaping @Sendable (ClaudeProcess) async -> Void,
         onTasksChanged: @escaping @Sendable (ClaudeProcess, BackgroundWork?) async -> Void = {
             _, _ in
@@ -523,6 +525,7 @@ actor ClaudeProcess {
     ) {
         self.claudePath = claudePath
         self.permissionMode = permissionMode
+        self.clientNote = clientNote
         self.launch = launch
         self.model = model
         self.effort = effort
@@ -548,8 +551,11 @@ actor ClaudeProcess {
         signal(SIGPIPE, SIG_IGN)
     }()
 
-    func start() throws {
-        _ = Self.ignoringBrokenPipes
+    /// The command line one conversation's CLI is started with.
+    static func arguments(
+        launch: ClaudeLaunch, model: String, effort: String, permissionMode: String,
+        clientNote: Bool
+    ) -> [String] {
         var arguments = [
             "-p",
             "--input-format", "stream-json",
@@ -567,12 +573,20 @@ actor ClaudeProcess {
         if launch.ultracode {
             arguments += ["--settings", #"{"ultracode":true}"#]
         }
+        arguments += ClientNote.arguments(enabled: clientNote)
         if let resume = launch.resume {
             arguments += ["--resume", resume]
             if launch.fork { arguments.append("--fork-session") }
         }
+        return arguments
+    }
+
+    func start() throws {
+        _ = Self.ignoringBrokenPipes
         process.executableURL = URL(fileURLWithPath: claudePath)
-        process.arguments = arguments
+        process.arguments = Self.arguments(
+            launch: launch, model: model, effort: effort, permissionMode: permissionMode,
+            clientNote: clientNote)
         process.currentDirectoryURL = URL(fileURLWithPath: launch.directory)
         var environment = ProcessInfo.processInfo.environment
         environment["CLAUDE_CODE_ENTRYPOINT"] = "claude-bridge"

@@ -602,6 +602,7 @@ Everything is environment variables. Empty values fall back to the default.
 | `BRIDGE_PASSWORD` | empty | HTTP Basic auth password (username `claude`). One of two keys: a request carrying it is admitted whoever sent it. Required only when the tailnet gate is off or tailscaled is not running — see Security |
 | `BRIDGE_TAILNET_AUTH` | `same-user` | Who on the tailnet gets in without a password. `same-user` admits every node signed into the Tailscale account this machine is signed into; a comma-separated list of login names and `tag:` names admits exactly those; `off` disables the gate. Needs the `tailscale` CLI (found automatically; `BRIDGE_TAILSCALE` overrides the path) |
 | `BRIDGE_PERMISSION` | `bypassPermissions` | Claude `--permission-mode`. `bypassPermissions` also passes `--dangerously-skip-permissions` |
+| `BRIDGE_CLIENT_NOTE` | `1` | `0` stops appending the short note that tells Claude its replies are read in Tailscode (`--append-system-prompt`, text in `ClientNote.swift`). A conversation keeps the system prompt of its first request until it is compacted, so the switch reaches new chats |
 | `BRIDGE_WORKDIR` | `~/agentapi-workdir` | Working directory for sessions that didn't choose one (created if missing, also passed as `--add-dir`); a session created with `directory` runs in its own |
 | `BRIDGE_CLAUDE` | `~/.local/bin/claude` | Path to the `claude` binary |
 | `BRIDGE_MODEL` | machine's | Default model for new sessions. Unset, it follows `~/.claude/settings.json` (`model`), falling back to `sonnet` |

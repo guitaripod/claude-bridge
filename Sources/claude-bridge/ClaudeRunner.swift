@@ -7,6 +7,8 @@ struct ClaudeRunner: Sendable {
     let claudePath: String
     let workdir: String
     let permissionMode: String
+    /// Whether every conversation's CLI is told where its replies are read (`ClientNote`).
+    var appendsClientNote = true
 
     struct Outcome: Sendable {
         /// What the turn produced, in order: the assistant's chunks and, between them, every
