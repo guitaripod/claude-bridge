@@ -796,13 +796,15 @@ func registerRoutes(
         }
         await store.devicePusher.register(
             token: body.token, environment: body.environment, rules: body.rules)
+        var startsCards = false
         if var starter = body.liveActivity, !starter.token.isEmpty, !starter.deviceID.isEmpty {
             starter.environment = body.environment
             starter.lastSeenAt = Date()
             await store.pusher.registerStarter(starter)
+            startsCards = await store.pusher.enabled
         }
         let delivers = await store.devicePusher.delivers
-        return jsonResponse(["ok": true, "delivers": delivers])
+        return jsonResponse(["ok": true, "delivers": delivers, "startsCards": startsCards])
     }
 
     router.post("push/device/unregister") { request, _ in
