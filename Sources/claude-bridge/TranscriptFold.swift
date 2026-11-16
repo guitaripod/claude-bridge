@@ -138,16 +138,21 @@ struct TranscriptFold: Sendable {
         switch type {
         case "user":
             if let content = message["content"] as? String {
+                let notice = notice(in: content)
                 ingestTaskNotification(content, at: stamp, changed: &changed)
                 guard let text = TranscriptParser.typedText(content)
                         ?? TranscriptParser.commandText(content)
                 else { return }
                 flushTurn()
                 lastPromptAt = stamp
-                place(Message(id: uuid, role: .user, parts: Self.userParts(text), createdAt: stamp))
+                place(
+                    Message(
+                        id: uuid, role: .user, parts: Self.userParts(text), createdAt: stamp,
+                        notice: notice))
                 changed.insert(uuid)
             } else if let blocks = message["content"] as? [[String: Any]] {
                 var texts: [String] = []
+                var notice: Notice?
                 for block in blocks {
                     switch block["type"] as? String {
                     case "tool_result":
@@ -161,8 +166,12 @@ struct TranscriptFold: Sendable {
                             changed: &changed)
                     case "text":
                         guard let raw = block["text"] as? String else { continue }
+                        let said = self.notice(in: raw)
                         ingestTaskNotification(raw, at: stamp, changed: &changed)
-                        if let text = TranscriptParser.typedText(raw) { texts.append(text) }
+                        if let text = TranscriptParser.typedText(raw) {
+                            texts.append(text)
+                            notice = texts.count == 1 ? said : nil
+                        }
                     default:
                         break
                     }
@@ -174,7 +183,7 @@ struct TranscriptFold: Sendable {
                         Message(
                             id: uuid, role: .user,
                             parts: Self.userParts(texts.joined(separator: "\n\n")),
-                            createdAt: stamp))
+                            createdAt: stamp, notice: notice))
                     changed.insert(uuid)
                 }
             }
@@ -486,6 +495,58 @@ struct TranscriptFold: Sendable {
     /// the bound is what keeps a megabyte of `Read` output from being scanned for a phrase that
     /// only ever appears at the top of something else.
     private static let launchBannerLimit = 2_048
+
+    /// What a line is when it is the harness reporting work back rather than somebody typing: the
+    /// kind of work, how it ended and what it was called. Asked before the report is seated on
+    /// its call, and of the call itself when the report names one: a command is whatever `Bash`
+    /// set running and everything else an agent, and a report naming no call this fold has seen
+    /// is read from its own sentence.
+    private func notice(in content: String) -> Notice? {
+        guard let notification = TranscriptParser.taskNotification(content) else { return nil }
+        let summary = notification.summary?.split(separator: "\n").first.map(String.init) ?? ""
+        let launcher =
+            notification.toolUseID.flatMap(call(for:))
+            ?? notification.taskIDs.lazy.compactMap { self.taskLaunches[$0] }
+                .compactMap(self.call(for:)).first
+        let work: Notice.Work
+        if let launcher {
+            work = launcher.name == "Bash" ? .command : .agent
+        } else {
+            work = summary.lowercased().contains("command") ? .command : .agent
+        }
+        let title = Self.quoted(in: summary) ?? Self.described(by: launcher) ?? summary
+        guard !title.isEmpty else { return nil }
+        return Notice(work: work, outcome: notification.status, title: title)
+    }
+
+    private func call(for toolID: String) -> ToolCall? {
+        guard let location = toolLocation[toolID] else { return nil }
+        let parts = location.messageIndex.map { messages[$0].parts } ?? turn?.parts ?? []
+        guard parts.indices.contains(location.partIndex),
+            case .tool(let call) = parts[location.partIndex]
+        else { return nil }
+        return call
+    }
+
+    /// The name the harness put in quotes in its sentence, which is the work's own description.
+    private static func quoted(in sentence: String) -> String? {
+        guard let open = sentence.firstIndex(of: "\""), let close = sentence.lastIndex(of: "\""),
+            open < close
+        else { return nil }
+        let name = sentence[sentence.index(after: open)..<close]
+            .trimmingCharacters(in: .whitespaces)
+        return name.isEmpty ? nil : name
+    }
+
+    /// The description a launching call was given, when the sentence names nothing.
+    private static func described(by call: ToolCall?) -> String? {
+        guard let call, let data = call.input.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let said = object["description"] as? String
+        else { return nil }
+        let name = said.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? nil : name
+    }
 
     /// The harness's report that background work ended, seated back on the call that started it.
     ///

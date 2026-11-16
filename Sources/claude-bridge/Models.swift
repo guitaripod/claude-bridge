@@ -141,6 +141,27 @@ struct Message: Codable, Sendable, Equatable {
     /// Priced from the same rate table the spend report uses, so a turn's own account and the
     /// conversation's total can never disagree. An estimate, and every surface says so.
     var costUSD: Double?
+    /// What this message is when nobody typed it: the harness reporting that work the agent left
+    /// running has ended. The sentence still rides in the message's text for a client that knows
+    /// no better; one that does draws a note between the turns instead of a prompt.
+    var notice: Notice?
+}
+
+/// The harness's own line in a conversation, said in a shape a client can draw without reading
+/// English: which kind of work came back, how it ended, and what it was called.
+///
+/// Claude Code writes the end of a background command or agent as a line in the transcript and
+/// starts a turn of its own on it. Sent as a prompt it wears the reader's voice in every client;
+/// this says whose line it is.
+struct Notice: Codable, Sendable, Equatable {
+    enum Work: String, Codable, Sendable {
+        case command
+        case agent
+    }
+
+    var work: Work
+    var outcome: BackgroundOutcome.Status
+    var title: String
 }
 
 /// One `<task-notification>` line read whole: which work it reports on, which call started that
