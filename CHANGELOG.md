@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.32.0 — 2026-11-16
+
+- Your phone stays quiet while you're at your computer: a desktop Tailscode tells this bridge whether you're in front of it, and a phone that asked to be quiet there has its notices held, gets no new Live Activity and no island opening at the ending; once you've been away for the time it chose, or lock the screen, it gets every held notice you have not already read.
+
 ## 1.31.0 — 2026-11-16
 
 - A phone learns that this bridge starts its Live Activities: registering a device now answers whether the bridge took its start token, so a phone hands the token over again to a bridge that updated since it last registered, without being relaunched.
