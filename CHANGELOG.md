@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.31.0 — 2026-11-16
+
+- A phone learns that this bridge starts its Live Activities: registering a device now answers whether the bridge took its start token, so a phone hands the token over again to a bridge that updated since it last registered, without being relaunched.
+
 ## 1.30.0 — 2026-11-16
 
 - A turn you start anywhere gets a Live Activity on your phone. A message sent from a desktop, drained from a queue, run on a schedule or begun by Claude Code itself starts a card on every phone and tablet that follows turns started elsewhere, a few seconds in, even while the phone is locked, as the Tailscode build that follows this release asks; the card is then kept current like one the phone opened itself. Muted chats and phones that turned it off get none, and a phone that already has the card is never given a second.
