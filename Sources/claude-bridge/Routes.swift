@@ -172,6 +172,9 @@ struct BridgeStatus: Encodable {
     let queue: Int
     /// Protocol version of the ACP agents this bridge hosts besides Claude (`/agents`).
     var agents = 1
+    /// Protocol version of the desks this bridge keeps (`/presence`): who is at a computer, and
+    /// the notices held for the phones that asked to stay quiet while they are.
+    var presence = 1
     /// Protocol version of the schedules this machine keeps and asks (`/schedules`).
     var schedules = 1
     /// Protocol version of the session read's sidecar: `GET /sessions/:id` answers the goal, the
@@ -800,6 +803,7 @@ func registerRoutes(
         if var starter = body.liveActivity, !starter.token.isEmpty, !starter.deviceID.isEmpty {
             starter.environment = body.environment
             starter.lastSeenAt = Date()
+            starter.adopt(body.rules)
             await store.pusher.registerStarter(starter)
             startsCards = await store.pusher.enabled
         }

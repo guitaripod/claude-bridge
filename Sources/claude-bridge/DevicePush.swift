@@ -86,6 +86,17 @@ actor APNSClient {
     }
 }
 
+/// Where a device's alerts go: APNs in production, a recorder in tests.
+protocol DevicePushTransport: Sendable {
+    var bundleTopic: String { get }
+    func send(
+        body: Data, token: String, environment: String,
+        topic: String, pushType: String, priority: String, collapseID: String?
+    ) async -> (status: Int, reason: String?)
+}
+
+extension APNSClient: DevicePushTransport {}
+
 enum PushFormatting {
     static func compactDuration(_ interval: TimeInterval) -> String {
         let seconds = Int(interval.rounded())
@@ -113,6 +124,16 @@ struct DeviceRegisterRequest: Codable, Sendable {
     var liveActivity: LiveActivityStarter?
 }
 
+/// A notice held back because its device's person was at a desk, kept until they leave it.
+struct HeldPush: Codable, Sendable, Equatable {
+    var token: String
+    var sessionID: String
+    var kind: String
+    var body: Data
+    var collapseID: String?
+    var heldAt: Date
+}
+
 struct PushUsage: Codable, Sendable {
     var claude: UsageSnapshot?
     var grok: UsageSnapshot?
@@ -123,10 +144,16 @@ struct PushUsage: Codable, Sendable {
 /// sessions go idle. Tokens persist to devices.json beside sessions.json and
 /// are pruned when APNs reports them dead.
 actor DevicePusher {
-    private let client: APNSClient?
+    private let client: (any DevicePushTransport)?
     private let devicesURL: URL?
     private var devices: [String: DeviceRegistration]
     private var lastSilentPushAt: Date = .distantPast
+    private let desks: DeskRegistry?
+    /// Held notices by device token, then by conversation: a later notice for the same
+    /// conversation replaces an earlier one, as the collapse id would on the phone.
+    private var held: [String: [String: HeldPush]]
+    private var newsCheck: (@Sendable (String, NoticePush.Kind, Date) async -> Bool)?
+    private static let heldMaxAge: TimeInterval = 7 * 86400
 
     private static let silentInterval: TimeInterval = 300
     private static let registrationMaxAge: TimeInterval = 30 * 86400
@@ -134,10 +161,36 @@ actor DevicePusher {
         "BadDeviceToken", "DeviceTokenNotForTopic", "TopicDisallowed",
     ]
 
-    init(client: APNSClient?, devicesURL: URL?) {
+    init(client: (any DevicePushTransport)?, devicesURL: URL?, desks: DeskRegistry? = nil) {
         self.client = client
         self.devicesURL = devicesURL
+        self.desks = desks
         devices = Self.load(from: devicesURL)
+        held = Self.loadHeld(from: devicesURL.map(Self.heldURL))
+    }
+
+    static func heldURL(_ devicesURL: URL) -> URL {
+        devicesURL.deletingLastPathComponent().appendingPathComponent("held-pushes.json")
+    }
+
+    /// How a held notice is judged still worth sending once its person has left a desk: given the
+    /// conversation, the kind of notice and when it was held. Without one, every held notice that
+    /// no desk had on screen since goes out.
+    func setNewsCheck(_ check: @escaping @Sendable (String, NoticePush.Kind, Date) async -> Bool) {
+        newsCheck = check
+    }
+
+    /// The notices held for a device right now, oldest first — for a test, and for the log.
+    func heldPushes(for token: String) -> [HeldPush] {
+        (held[token] ?? [:]).values.sorted { $0.heldAt < $1.heldAt }
+    }
+
+    /// Whether this device's person is at a desk by its own patience, so a notice for it waits.
+    static func isQuiet(
+        _ device: DeviceRegistration, desks: DeskRegistry?, now: Date
+    ) -> Bool {
+        guard let patience = (device.rules ?? .standard).deskPatience, let desks else { return false }
+        return desks.occupied(awayAfter: patience, now: now) != nil
     }
 
     /// Whether this bridge holds an APNs client at all, so a registering client can tell a real
@@ -175,6 +228,7 @@ actor DevicePusher {
     }
 
     func unregister(token: String) {
+        if held.removeValue(forKey: token) != nil { persistHeld() }
         guard devices.removeValue(forKey: token) != nil else {
             log("unregister ignored for unknown device …\(token.suffix(8))")
             return
@@ -211,10 +265,71 @@ actor DevicePusher {
             payload["usage"] = usage
         }
         if let notice { payload = NoticePush.fitted(NoticePush.merged(payload, with: notice)) }
+        let collapseID = Self.truncated("done:\(sessionID)", toBytes: 64)
+        let now = Date()
+        let quiet = targets.filter { Self.isQuiet($0, desks: desks, now: now) }
+        let loud = targets.filter { !Self.isQuiet($0, desks: desks, now: now) }
+        if !quiet.isEmpty, let body = try? JSONSerialization.data(withJSONObject: payload) {
+            hold(
+                body: body, kind: kind, sessionID: sessionID, collapseID: collapseID, for: quiet,
+                now: now)
+        }
+        guard !loud.isEmpty else { return }
         await fanOut(
             payload: payload, topic: client.bundleTopic, pushType: "alert", priority: "10",
-            collapseID: Self.truncated("done:\(sessionID)", toBytes: 64), label: "alert",
-            to: targets)
+            collapseID: collapseID, label: "alert", to: loud)
+    }
+
+    private func hold(
+        body: Data, kind: NoticePush.Kind, sessionID: String, collapseID: String,
+        for targets: [DeviceRegistration], now: Date
+    ) {
+        for device in targets {
+            held[device.token, default: [:]][sessionID] = HeldPush(
+                token: device.token, sessionID: sessionID, kind: kind.rawValue, body: body,
+                collapseID: collapseID, heldAt: now)
+        }
+        persistHeld()
+        let desk = desks?.occupied(awayAfter: .infinity, now: now)?.name ?? "a desk"
+        log("\(kind.rawValue) for \(sessionID) held for \(targets.count) device(s) while at \(desk)")
+    }
+
+    /// Sends what was held for every device whose person has left the desk, by that device's own
+    /// patience, keeping only what is still news: a conversation no desk had on screen since,
+    /// nobody read since, and that is not working again. What is still held for a device that
+    /// unregistered, or that stopped asking to be quiet, goes too. Taken out of the store before
+    /// anything is awaited, so two sweeps at once can never send one notice twice.
+    func releaseHeld(now: Date = Date()) async {
+        guard !held.isEmpty else { return }
+        var due: [(DeviceRegistration, HeldPush)] = []
+        for (token, pushes) in held {
+            guard let device = devices[token] else {
+                held[token] = nil
+                continue
+            }
+            guard !Self.isQuiet(device, desks: desks, now: now) else { continue }
+            held[token] = nil
+            due += pushes.values.sorted { $0.heldAt < $1.heldAt }.map { (device, $0) }
+        }
+        persistHeld()
+        guard let client, !due.isEmpty else { return }
+        for (device, push) in due {
+            guard await isStillNews(push, now: now) else {
+                log("held \(push.kind) for \(push.sessionID) dropped: already seen or moved on")
+                continue
+            }
+            await fanOut(
+                body: push.body, topic: client.bundleTopic, pushType: "alert", priority: "10",
+                collapseID: push.collapseID, label: "held alert", to: [device])
+        }
+    }
+
+    private func isStillNews(_ push: HeldPush, now: Date) async -> Bool {
+        if let desks, desks.looked(push.sessionID, since: push.heldAt) { return false }
+        guard now.timeIntervalSince(push.heldAt) < Self.heldMaxAge else { return false }
+        guard let newsCheck else { return true }
+        let kind = NoticePush.Kind(rawValue: push.kind) ?? .done
+        return await newsCheck(push.sessionID, kind, push.heldAt)
     }
 
     func noteExternalIdle() async {
@@ -239,8 +354,17 @@ actor DevicePusher {
         payload: [String: Any], topic: String, pushType: String, priority: String,
         collapseID: String?, label: String, to chosen: [DeviceRegistration]? = nil
     ) async {
-        guard let client, let body = try? JSONSerialization.data(withJSONObject: payload)
-        else { return }
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        await fanOut(
+            body: body, topic: topic, pushType: pushType, priority: priority,
+            collapseID: collapseID, label: label, to: chosen)
+    }
+
+    private func fanOut(
+        body: Data, topic: String, pushType: String, priority: String,
+        collapseID: String?, label: String, to chosen: [DeviceRegistration]? = nil
+    ) async {
+        guard let client else { return }
         let targets = chosen ?? Array(devices.values)
         var sent = 0
         for device in targets {
@@ -317,6 +441,30 @@ actor DevicePusher {
         let threshold = Date().addingTimeInterval(-registrationMaxAge)
         let fresh = stored.filter { $0.lastSeenAt > threshold }
         return Dictionary(fresh.map { ($0.token, $0) }, uniquingKeysWith: { _, new in new })
+    }
+
+    private static func loadHeld(from url: URL?) -> [String: [String: HeldPush]] {
+        guard let url, let data = try? Data(contentsOf: url),
+            let stored = try? JSONCoding.decoder.decode([HeldPush].self, from: data)
+        else { return [:] }
+        let threshold = Date().addingTimeInterval(-heldMaxAge)
+        var held: [String: [String: HeldPush]] = [:]
+        for push in stored where push.heldAt > threshold {
+            held[push.token, default: [:]][push.sessionID] = push
+        }
+        return held
+    }
+
+    private func persistHeld() {
+        guard let devicesURL else { return }
+        let url = Self.heldURL(devicesURL)
+        let all = held.values.flatMap(\.values).sorted { ($0.token, $0.sessionID) < ($1.token, $1.sessionID) }
+        guard !all.isEmpty else {
+            try? FileManager.default.removeItem(at: url)
+            return
+        }
+        guard let data = try? JSONCoding.encoder.encode(all) else { return }
+        try? data.write(to: url, options: .atomic)
     }
 
     private func persist() {

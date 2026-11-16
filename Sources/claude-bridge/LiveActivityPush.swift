@@ -41,9 +41,14 @@ struct LiveActivityStarter: Codable, Sendable, Equatable {
     var muted: [String]?
     var environment: String = "production"
     var lastSeenAt: Date = Date()
+    /// The device's own wish to stay quiet while its person is at a desk, and its patience, taken
+    /// from the rules it registered with rather than from the starter it sent.
+    var quietAtDesk: Bool?
+    var awayAfter: Int?
 
     private enum CodingKeys: String, CodingKey {
         case token, deviceID, profileID, profileName, follows, cardLimit, muted, environment, lastSeenAt
+        case quietAtDesk, awayAfter
     }
 
     init(
@@ -73,6 +78,14 @@ struct LiveActivityStarter: Codable, Sendable, Equatable {
         muted = try values.decodeIfPresent([String].self, forKey: .muted)
         environment = try values.decodeIfPresent(String.self, forKey: .environment) ?? "production"
         lastSeenAt = try values.decodeIfPresent(Date.self, forKey: .lastSeenAt) ?? Date()
+        quietAtDesk = try values.decodeIfPresent(Bool.self, forKey: .quietAtDesk)
+        awayAfter = try values.decodeIfPresent(Int.self, forKey: .awayAfter)
+    }
+
+    /// Takes the desk wish from the rules the device registered with.
+    mutating func adopt(_ rules: DeviceRules?) {
+        quietAtDesk = rules?.quietAtDesk
+        awayAfter = rules?.awayAfter
     }
 
     func follows(_ sessionID: String) -> Bool {
@@ -392,18 +405,20 @@ actor LiveActivityPusher {
     /// began, so one turn starts at most one card on a device however often it is looked at.
     private var started: [String: (turn: Date, devices: Set<String>)] = [:]
     private let startDelay: TimeInterval
+    private let desks: DeskRegistry?
 
-    init(client: APNSClient?, activitiesURL: URL? = nil) {
-        self.init(transport: client, activitiesURL: activitiesURL)
+    init(client: APNSClient?, activitiesURL: URL? = nil, desks: DeskRegistry? = nil) {
+        self.init(transport: client, activitiesURL: activitiesURL, desks: desks)
     }
 
     init(
         transport: (any LiveActivityTransport)?, activitiesURL: URL? = nil,
-        startDelay: TimeInterval = LiveActivityPusher.startDelay
+        startDelay: TimeInterval = LiveActivityPusher.startDelay, desks: DeskRegistry? = nil
     ) {
         self.transport = transport
         self.activitiesURL = activitiesURL
         self.startDelay = startDelay
+        self.desks = desks
         cards = Self.load(from: activitiesURL)
         starters = Self.loadStarters(from: activitiesURL.map(Self.startersURL))
     }
@@ -413,6 +428,16 @@ actor LiveActivityPusher {
     }
 
     func starter(_ deviceID: String) -> LiveActivityStarter? { starters[deviceID] }
+
+    /// Whether the installation asked to stay quiet while its person is at a desk, and they are:
+    /// no card is started on it and an ending updates its card without opening the island.
+    func quietAtDesk(_ deviceID: String?, now: Date = Date()) -> Bool {
+        guard let deviceID, let starter = starters[deviceID], starter.quietAtDesk == true,
+            let desks
+        else { return false }
+        let patience = starter.awayAfter.map { TimeInterval(max(1, $0)) } ?? DeskRegistry.defaultAwayAfter
+        return desks.occupied(awayAfter: patience, now: now) != nil
+    }
 
     /// A device handed over how this bridge may start its cards.
     func registerStarter(_ starter: LiveActivityStarter) {
@@ -715,6 +740,7 @@ actor LiveActivityPusher {
         let targets = starters.values.filter { starter in
             starter.follows(sessionID) && !card.follows(device: starter.deviceID)
                 && !record.devices.contains(starter.deviceID) && !atLimit(starter)
+                && !quietAtDesk(starter.deviceID, now: now)
         }
         guard !targets.isEmpty else { return }
         let ultra = ultracode[sessionID] == true
@@ -922,7 +948,8 @@ actor LiveActivityPusher {
         var bodies: [String: Data] = [:]
         var sends: [(LiveActivityRegistration, Data)] = []
         for registration in card.registrations {
-            let alert = alerts ? registration.endAlert : nil
+            let alert =
+                alerts && !quietAtDesk(registration.deviceID, now: now) ? registration.endAlert : nil
             let key = alert ?? ""
             if bodies[key] == nil {
                 bodies[key] = Self.body(

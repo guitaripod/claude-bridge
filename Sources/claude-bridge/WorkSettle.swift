@@ -16,18 +16,28 @@ struct DeviceRules: Codable, Sendable, Equatable {
     var minimumWork: Int?
     var needsYou: Bool?
     var muted: [String]?
+    /// Hold this device's notices while the person is at a desk, and hand over the ones still
+    /// unread once they have left it.
+    var quietAtDesk: Bool?
+    /// Seconds without input before the person counts as away from a desk.
+    var awayAfter: Int?
 
     static let standard = DeviceRules(finish: .settled)
 
-    init(finish: Finish, minimumWork: Int? = nil, needsYou: Bool? = nil, muted: [String]? = nil) {
+    init(
+        finish: Finish, minimumWork: Int? = nil, needsYou: Bool? = nil, muted: [String]? = nil,
+        quietAtDesk: Bool? = nil, awayAfter: Int? = nil
+    ) {
         self.finish = finish
         self.minimumWork = minimumWork
         self.needsYou = needsYou
         self.muted = muted
+        self.quietAtDesk = quietAtDesk
+        self.awayAfter = awayAfter
     }
 
     private enum CodingKeys: String, CodingKey {
-        case finish, minimumWork, needsYou, muted
+        case finish, minimumWork, needsYou, muted, quietAtDesk, awayAfter
     }
 
     /// A choice this bridge does not know reads as the default rather than failing the whole
@@ -40,6 +50,15 @@ struct DeviceRules: Codable, Sendable, Equatable {
         minimumWork = try? container.decodeIfPresent(Int.self, forKey: .minimumWork)
         needsYou = try? container.decodeIfPresent(Bool.self, forKey: .needsYou)
         muted = try? container.decodeIfPresent([String].self, forKey: .muted)
+        quietAtDesk = try? container.decodeIfPresent(Bool.self, forKey: .quietAtDesk)
+        awayAfter = try? container.decodeIfPresent(Int.self, forKey: .awayAfter)
+    }
+
+    /// How long this device lets the person sit still before it counts them away from a desk, or
+    /// nil when it wants its notices wherever the person is.
+    var deskPatience: TimeInterval? {
+        guard quietAtDesk == true else { return nil }
+        return awayAfter.map { TimeInterval(max(1, $0)) } ?? DeskRegistry.defaultAwayAfter
     }
 
     var hearsAsks: Bool { needsYou ?? true }

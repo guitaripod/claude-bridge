@@ -125,6 +125,7 @@ let apnsClient: APNSClient? = {
         topic: env("BRIDGE_APNS_TOPIC", "com.guitaripod.tailscode.push-type.liveactivity")))
 }()
 
+let desks = DeskRegistry()
 let store = SessionStore(
     runner: ClaudeRunner(
         claudePath: claudePath, workdir: workdir, permissionMode: permissionMode,
@@ -134,10 +135,12 @@ let store = SessionStore(
     pusher: LiveActivityPusher(
         client: apnsClient,
         activitiesURL: storeURL.deletingLastPathComponent()
-            .appendingPathComponent("live-activities.json")),
+            .appendingPathComponent("live-activities.json"),
+        desks: desks),
     devicePusher: DevicePusher(
         client: apnsClient,
-        devicesURL: storeURL.deletingLastPathComponent().appendingPathComponent("devices.json")),
+        devicesURL: storeURL.deletingLastPathComponent().appendingPathComponent("devices.json"),
+        desks: desks),
     autoResumeDefault: env("BRIDGE_AUTO_RESUME", "0") == "1",
     processTTL: Double(env("BRIDGE_PROCESS_TTL", "1800")) ?? 1800,
     processPool: Int(env("BRIDGE_PROCESS_POOL", "4")) ?? 4,
@@ -205,6 +208,14 @@ registerRoutes(
     projectsDir: projectsDir,
     waitMax: Double(env("BRIDGE_WAIT_MAX", "10800")) ?? 10800)
 startExternalIdleSweep(index: index, store: store)
+await store.devicePusher.setNewsCheck { id, kind, since in
+    await store.stillNews(id, kind: kind, since: since)
+}
+registerDeskRoutes(
+    router, desks: desks, devices: store.devicePusher,
+    hasAuth: !password.isEmpty || tailnetGate != nil,
+    waitMax: Double(env("BRIDGE_WAIT_MAX", "10800")) ?? 10800)
+startHeldSweep(devices: store.devicePusher)
 
 let app = Application(
     router: router,

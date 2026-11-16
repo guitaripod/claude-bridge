@@ -1012,6 +1012,19 @@ actor SessionStore {
             || carriedWork[id] != nil || cooldowns[id].map { $0 > Date() } == true
     }
 
+    /// Whether a notice held since `moment` while its person was at a desk is still worth sending:
+    /// nobody read the conversation since, it is not working again (its next ending will speak for
+    /// itself), and a question is still the last thing it said.
+    func stillNews(_ id: String, kind: NoticePush.Kind, since moment: Date) -> Bool {
+        if let readAt = marks.entries[id]?.readAt, readAt >= SessionMarks.wholeSeconds(moment) {
+            return false
+        }
+        if isWorking(id) { return false }
+        guard kind == .question else { return true }
+        guard let ending = lastEndings[id]?.ending else { return false }
+        return ending == .question || ending == .approval
+    }
+
     /// What a wait held for settled work is told about this conversation right now. A turn closed
     /// outside any stretch — a scheduled run that said nothing new, one adopted from a CLI that
     /// outlived a restart — is not answered with an older stretch's ending: the wait then reads
