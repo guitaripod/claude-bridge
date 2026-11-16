@@ -58,6 +58,7 @@ actor SessionStore {
     private let writer: StoreWriter
     private let projectsDir: String
     let pusher: LiveActivityPusher
+    let cardFeed = CardFeed()
     let devicePusher: DevicePusher
     private var hiddenTranscripts: Set<String>
     private var marks: MarksLedger
@@ -446,8 +447,7 @@ actor SessionStore {
         sessions[id] = session
         persistNow()
         if rechaptered { publishChapters(id) }
-        let pusher = self.pusher
-        Task { await pusher.retitle(sessionID: id, title: title) }
+        toCard { await $0.retitle(sessionID: id, title: title) }
         return true
     }
 
@@ -709,7 +709,7 @@ actor SessionStore {
             id,
             .messageUpserted(
                 Message(id: messageID, role: .assistant, parts: [.text("")], createdAt: Date())))
-        Task { await pusher.noteTurn(sessionID: id, ultracode: ultracode) }
+        toCard { await $0.noteTurn(sessionID: id, ultracode: ultracode) }
         Task {
             await self.launchTurn(
                 id, prompt: text, launch: launch, model: model, effort: effort)
@@ -802,6 +802,13 @@ actor SessionStore {
         return process
     }
 
+    /// Hands one change to the conversation's Live Activity behind every change already handed
+    /// over, so a card always hears a turn end before it hears the next one begin.
+    private func toCard(_ step: @escaping @Sendable (LiveActivityPusher) async -> Void) {
+        let pusher = self.pusher
+        cardFeed.send { await step(pusher) }
+    }
+
     /// One event of a turn, on the wire and in the mirror. What the runner's emit closure used to
     /// do from a detached task, done in order on the actor — so the mirror can never see a turn's
     /// final message after the turn has settled.
@@ -817,10 +824,9 @@ actor SessionStore {
         if case .retry(let wait) = event { retryWaits[id] = wait }
         broadcaster(for: id).send(event)
         mirrorLiveTurn(id, event)
-        let pusher = self.pusher
         let now = Date()
         let title: String? = if case .status("running") = event { sessions[id]?.title } else { nil }
-        Task { await pusher.noteEvent(event, sessionID: id, now: now, title: title) }
+        toCard { await $0.noteEvent(event, sessionID: id, now: now, title: title) }
     }
 
     /// Every line the conversation's process writes, folded into whatever turn is open. A line
@@ -1875,9 +1881,8 @@ actor SessionStore {
         guard stopping else { return (false, discarded, paused) }
         let stoppedTurn = openTurns[id]?.startedAt
         stoppedTurns.insert(id)
-        let pusher = self.pusher
         let now = Date()
-        Task { await pusher.noteStopped(sessionID: id, now: now) }
+        toCard { await $0.noteStopped(sessionID: id, now: now) }
         if let connection = agentConnections[id] {
             let grace = abortGrace
             Task { [weak self] in
@@ -2271,9 +2276,11 @@ actor SessionStore {
                 title: title, claudeID: claudeID, failed: notice.kind == .failed,
                 ending: waitEnding, endedAt: now, lastMessageID: outcome.messages.last?.id,
                 notice: notice))
-        Task {
-            await pusher.endTurn(
+        toCard {
+            await $0.endTurn(
                 sessionID: id, toolCount: toolCount, ending: ending, title: title, now: now)
+        }
+        Task {
             let goal = await index?.goal(for: claudeID)
             await devicePusher.pushTurnEnd(
                 sessionID: id, title: title, toolCount: toolCount, failed: wasFailed,
@@ -2502,7 +2509,6 @@ actor SessionStore {
             let answer = Array(session.messages.reversed().prefix { $0.role != .user }.reversed())
             let ending = Self.ending(of: answer)
             let title = session.title
-            let pusher = self.pusher
             let now = Date()
             let toolCount = answer.flatMap(\.parts).count { part in
                 if case .tool = part { return true }
@@ -2515,8 +2521,8 @@ actor SessionStore {
                 ending: waitEnding, title: title, toolCount: toolCount,
                 duration: now.timeIntervalSince(record.startedAt), lastMessageID: answer.last?.id,
                 endedAt: now)
-            Task {
-                await pusher.endTurn(
+            toCard {
+                await $0.endTurn(
                     sessionID: id, toolCount: nil, ending: ending, title: title, now: now)
             }
         }
@@ -2616,9 +2622,11 @@ actor SessionStore {
             ending: PendingEnding(
                 title: title, claudeID: record.claudeSessionID ?? id, failed: true,
                 ending: .interrupted, endedAt: now, lastMessageID: nil, notice: notice))
-        Task {
-            await pusher.endTurn(
+        toCard {
+            await $0.endTurn(
                 sessionID: id, toolCount: tools, ending: .interrupted, title: title, now: now)
+        }
+        Task {
             await devicePusher.pushTurnEnd(
                 sessionID: id, title: title, toolCount: tools, failed: true,
                 duration: duration, goal: nil, notice: notice, occasion: .turnClosed)
@@ -2753,8 +2761,7 @@ actor SessionStore {
         persist()
         if rechaptered { publishChapters(id) }
         guard changed else { return }
-        let pusher = self.pusher
-        Task { await pusher.retitle(sessionID: id, title: title) }
+        toCard { await $0.retitle(sessionID: id, title: title) }
     }
 
     /// Lands a look at the title. A failed look stamps nothing, so the next turn asks again; a KEEP
@@ -2791,8 +2798,7 @@ actor SessionStore {
             persist()
             if rechaptered { publishChapters(id) }
             if retitled {
-                let pusher = self.pusher
-                Task { await pusher.retitle(sessionID: id, title: title) }
+                toCard { await $0.retitle(sessionID: id, title: title) }
             }
         case .moved(let title, let start):
             session.titledAtTurn = turn
@@ -2813,8 +2819,7 @@ actor SessionStore {
             sessions[id] = session
             publishChapters(id)
             if retitled {
-                let pusher = self.pusher
-                Task { await pusher.retitle(sessionID: id, title: title) }
+                toCard { await $0.retitle(sessionID: id, title: title) }
             }
             if let closed { sumUp(id, closed: closed) }
         }

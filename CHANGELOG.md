@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.33.1 — 2026-11-16
+
+- A Live Activity keeps up with a chat past its first turn: a message you queued while the agent was working used to start its turn before the card heard the previous one end, so the card settled on "finished" and stayed there while the new turn ran. The card now always hears a turn end before the next one begins, and comes back for it.
+
 ## 1.33.0 — 2026-11-16
 
 - Notices the phone raises itself (opencode, Oh My Pi) follow you too: while you're at your computer the phone hands them to this bridge, which sends them through Apple's push once you leave, unless you opened the chat at the computer meanwhile.
