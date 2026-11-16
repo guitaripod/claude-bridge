@@ -13,6 +13,71 @@ struct LiveActivityRegistration: Codable, Sendable, Equatable {
     /// the Dynamic Island opens on how it ended, `sound` alerts with one, absent settles it in
     /// place. Sent by Tailscode from the build that reads the brief; older apps send none.
     var endAlert: String?
+    /// Which installation the card is on. Two devices following one conversation each hold a card
+    /// of their own, and both are pushed; absent from apps before it, which read as one device.
+    var deviceID: String?
+
+    /// Whether this registration is the same card on the same installation as `other`: the same
+    /// device when both say which. An app from before the device's name followed a conversation
+    /// on one device only, so two registrations that name none are the same card with its token
+    /// handed over again.
+    func isSameCard(as other: LiveActivityRegistration) -> Bool {
+        if let deviceID, let otherID = other.deviceID { return deviceID == otherID }
+        return deviceID == nil && other.deviceID == nil
+    }
+}
+
+/// How this bridge may start a Live Activity on one installation by itself: its push-to-start
+/// token, what it calls this machine and which profile that is, whether it follows turns started
+/// elsewhere at all, how many cards may stand there at once and the chats it muted. Handed over
+/// with the device's push registration, and forgotten with it.
+struct LiveActivityStarter: Codable, Sendable, Equatable {
+    var token: String
+    var deviceID: String
+    var profileID: String
+    var profileName: String
+    var follows: Bool
+    var cardLimit: Int?
+    var muted: [String]?
+    var environment: String = "production"
+    var lastSeenAt: Date = Date()
+
+    private enum CodingKeys: String, CodingKey {
+        case token, deviceID, profileID, profileName, follows, cardLimit, muted, environment, lastSeenAt
+    }
+
+    init(
+        token: String, deviceID: String, profileID: String, profileName: String, follows: Bool,
+        cardLimit: Int? = nil, muted: [String]? = nil, environment: String = "production",
+        lastSeenAt: Date = Date()
+    ) {
+        self.token = token
+        self.deviceID = deviceID
+        self.profileID = profileID
+        self.profileName = profileName
+        self.follows = follows
+        self.cardLimit = cardLimit
+        self.muted = muted
+        self.environment = environment
+        self.lastSeenAt = lastSeenAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        token = try values.decode(String.self, forKey: .token)
+        deviceID = try values.decode(String.self, forKey: .deviceID)
+        profileID = try values.decode(String.self, forKey: .profileID)
+        profileName = try values.decode(String.self, forKey: .profileName)
+        follows = try values.decodeIfPresent(Bool.self, forKey: .follows) ?? true
+        cardLimit = try values.decodeIfPresent(Int.self, forKey: .cardLimit)
+        muted = try values.decodeIfPresent([String].self, forKey: .muted)
+        environment = try values.decodeIfPresent(String.self, forKey: .environment) ?? "production"
+        lastSeenAt = try values.decodeIfPresent(Date.self, forKey: .lastSeenAt) ?? Date()
+    }
+
+    func follows(_ sessionID: String) -> Bool {
+        follows && !(muted ?? []).contains(sessionID)
+    }
 }
 
 /// Where a card's pushes go: APNs in production, a recorder in tests.
@@ -99,6 +164,15 @@ enum CardDetail: String, Sendable {
         }
     }
 
+    /// The words a started card's alert says on an Apple Watch, as the app's own catalog holds them.
+    var startKey: String {
+        switch self {
+        case .question, .approval: return "Needs you"
+        case .thinking: return "Thinking"
+        default: return "Working"
+        }
+    }
+
     /// The words an ending's alert says on an Apple Watch, as the key the app's own catalog holds
     /// them under, so the watch reads them in the phone's language.
     var alertKey: String {
@@ -145,7 +219,10 @@ extension CardDetail {
 /// One conversation's card as this bridge last drew it.
 struct LiveActivityCard: Codable, Sendable, Equatable {
     var sessionID: String
-    var registration: LiveActivityRegistration
+    /// Every installation following the conversation, each with the token of its own card. Empty
+    /// for a turn no device has a card for yet: the card is kept from the turn's start so a device
+    /// this bridge starts one on, or one that registers late, joins a turn whose story is whole.
+    var registrations: [LiveActivityRegistration]
     var title: String
     var startedAt: Date
     var detail: String
@@ -171,6 +248,88 @@ struct LiveActivityCard: Codable, Sendable, Equatable {
 
     var isSettled: Bool { endedAt != nil }
     var reading: CardDetail { CardDetail(rawValue: detail) ?? .thinking }
+
+    init(
+        sessionID: String, registrations: [LiveActivityRegistration], title: String,
+        startedAt: Date, detail: String, tool: String?, toolCount: Int, background: Int,
+        failed: Bool, stopped: Bool, turnOpen: Bool, endedAt: Date?, lastPushAt: Date,
+        lastEventAt: Date, brief: CardBrief? = nil
+    ) {
+        self.sessionID = sessionID
+        self.registrations = registrations
+        self.title = title
+        self.startedAt = startedAt
+        self.detail = detail
+        self.tool = tool
+        self.toolCount = toolCount
+        self.background = background
+        self.failed = failed
+        self.stopped = stopped
+        self.turnOpen = turnOpen
+        self.endedAt = endedAt
+        self.lastPushAt = lastPushAt
+        self.lastEventAt = lastEventAt
+        self.brief = brief
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID, registrations, registration, title, startedAt, detail, tool, toolCount
+        case background, failed, stopped, turnOpen, endedAt, lastPushAt, lastEventAt, brief
+    }
+
+    /// Reads a card stored by a bridge that kept one registration per card, as a card with one.
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        sessionID = try values.decode(String.self, forKey: .sessionID)
+        if let many = try values.decodeIfPresent([LiveActivityRegistration].self, forKey: .registrations) {
+            registrations = many
+        } else {
+            registrations = [try values.decode(LiveActivityRegistration.self, forKey: .registration)]
+        }
+        title = try values.decode(String.self, forKey: .title)
+        startedAt = try values.decode(Date.self, forKey: .startedAt)
+        detail = try values.decode(String.self, forKey: .detail)
+        tool = try values.decodeIfPresent(String.self, forKey: .tool)
+        toolCount = try values.decode(Int.self, forKey: .toolCount)
+        background = try values.decode(Int.self, forKey: .background)
+        failed = try values.decode(Bool.self, forKey: .failed)
+        stopped = try values.decode(Bool.self, forKey: .stopped)
+        turnOpen = try values.decode(Bool.self, forKey: .turnOpen)
+        endedAt = try values.decodeIfPresent(Date.self, forKey: .endedAt)
+        lastPushAt = try values.decode(Date.self, forKey: .lastPushAt)
+        lastEventAt = try values.decode(Date.self, forKey: .lastEventAt)
+        brief = try values.decodeIfPresent(CardBrief.self, forKey: .brief)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(sessionID, forKey: .sessionID)
+        try values.encode(registrations, forKey: .registrations)
+        try values.encode(title, forKey: .title)
+        try values.encode(startedAt, forKey: .startedAt)
+        try values.encode(detail, forKey: .detail)
+        try values.encodeIfPresent(tool, forKey: .tool)
+        try values.encode(toolCount, forKey: .toolCount)
+        try values.encode(background, forKey: .background)
+        try values.encode(failed, forKey: .failed)
+        try values.encode(stopped, forKey: .stopped)
+        try values.encode(turnOpen, forKey: .turnOpen)
+        try values.encodeIfPresent(endedAt, forKey: .endedAt)
+        try values.encode(lastPushAt, forKey: .lastPushAt)
+        try values.encode(lastEventAt, forKey: .lastEventAt)
+        try values.encodeIfPresent(brief, forKey: .brief)
+    }
+
+    /// Whether the installation already holds a card for this conversation.
+    func follows(device deviceID: String) -> Bool {
+        registrations.contains { $0.deviceID == deviceID }
+    }
+
+    /// The registrations with this one in place of the same card's older one.
+    mutating func upsert(_ registration: LiveActivityRegistration) {
+        registrations.removeAll { $0.isSameCard(as: registration) }
+        registrations.append(registration)
+    }
 }
 
 /// Drives the app's Live Activities over APNs while the phone is suspended: the app registers each
@@ -206,6 +365,12 @@ actor LiveActivityPusher {
     /// The sound an alert that must not be heard plays, bundled in the app: a tenth of a second
     /// of silence, because an alert has no silent sound of its own.
     static let silentSound = "LiveActivityQuiet.caf"
+    /// How long a turn runs before a card is started for it on the devices that follow turns
+    /// started elsewhere: long enough for the phone that sent it to hand over its own card's
+    /// token, and for a turn refused at once to be over.
+    static let startDelay: TimeInterval = 4
+    /// The type the app's cards decode as, which a start push names.
+    static let attributesType = "ChatActivityAttributes"
 
     private static let deadTokenReasons: Set<String> = [
         "BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic", "ExpiredToken",
@@ -221,15 +386,45 @@ actor LiveActivityPusher {
     /// chat's effort or by the word. Kept beside the cards rather than on one, because the turn
     /// starts before the phone has handed over the token of the card that will follow it.
     private var ultracode: [String: Bool] = [:]
+    /// The installations this bridge may start cards on, by device.
+    private var starters: [String: LiveActivityStarter]
+    /// The devices a card was started on for each conversation's current turn, by when the turn
+    /// began, so one turn starts at most one card on a device however often it is looked at.
+    private var started: [String: (turn: Date, devices: Set<String>)] = [:]
+    private let startDelay: TimeInterval
 
     init(client: APNSClient?, activitiesURL: URL? = nil) {
         self.init(transport: client, activitiesURL: activitiesURL)
     }
 
-    init(transport: (any LiveActivityTransport)?, activitiesURL: URL? = nil) {
+    init(
+        transport: (any LiveActivityTransport)?, activitiesURL: URL? = nil,
+        startDelay: TimeInterval = LiveActivityPusher.startDelay
+    ) {
         self.transport = transport
         self.activitiesURL = activitiesURL
+        self.startDelay = startDelay
         cards = Self.load(from: activitiesURL)
+        starters = Self.loadStarters(from: activitiesURL.map(Self.startersURL))
+    }
+
+    static func startersURL(_ activitiesURL: URL) -> URL {
+        activitiesURL.deletingLastPathComponent().appendingPathComponent("live-activity-starters.json")
+    }
+
+    func starter(_ deviceID: String) -> LiveActivityStarter? { starters[deviceID] }
+
+    /// A device handed over how this bridge may start its cards.
+    func registerStarter(_ starter: LiveActivityStarter) {
+        starters[starter.deviceID] = starter
+        persistStarters()
+        log("start token registered for …\(starter.deviceID.suffix(6)) as \(starter.profileName) (follows: \(starter.follows))")
+    }
+
+    func forgetStarter(deviceID: String) {
+        guard starters.removeValue(forKey: deviceID) != nil else { return }
+        persistStarters()
+        log("start token forgotten for …\(deviceID.suffix(6))")
     }
 
     var enabled: Bool { transport != nil }
@@ -248,7 +443,7 @@ actor LiveActivityPusher {
     func register(_ registration: LiveActivityRegistration, sessionID: String, turnOpen: Bool) {
         let previous = cards[sessionID]
         if var card = previous, Self.isRefresh(registration, of: card) {
-            card.registration = registration
+            card.upsert(registration)
             if card.title.isEmpty { card.title = registration.title }
             cards[sessionID] = card
             persist()
@@ -257,8 +452,11 @@ actor LiveActivityPusher {
         }
         let sameTurn = previous.map { !$0.isSettled && $0.turnOpen && turnOpen } ?? false
         let brief = sameTurn ? previous?.brief : CardBrief(model: previous?.brief?.model)
+        var registrations = previous?.registrations ?? []
+        registrations.removeAll { $0.isSameCard(as: registration) }
+        registrations.append(registration)
         cards[sessionID] = LiveActivityCard(
-            sessionID: sessionID, registration: registration,
+            sessionID: sessionID, registrations: registrations,
             title: registration.title.isEmpty ? (previous?.title ?? "") : registration.title,
             startedAt: registration.startedAt,
             detail: sameTurn ? previous?.detail ?? CardDetail.thinking.rawValue
@@ -273,16 +471,35 @@ actor LiveActivityPusher {
         log("token registered for \(sessionID) (\(registration.environment))")
     }
 
-    func noteEvent(_ event: BridgeEvent, sessionID: String, now: Date = Date()) {
-        guard transport != nil, var card = cards[sessionID], now >= card.lastEventAt else { return }
+    func noteEvent(
+        _ event: BridgeEvent, sessionID: String, now: Date = Date(), title: String? = nil
+    ) {
+        guard transport != nil else { return }
+        if case .status("running") = event, cards[sessionID] == nil, !starters.isEmpty {
+            cards[sessionID] = LiveActivityCard(
+                sessionID: sessionID, registrations: [], title: title ?? "", startedAt: now,
+                detail: CardDetail.thinking.rawValue, tool: nil, toolCount: 0, background: 0,
+                failed: false, stopped: false, turnOpen: true, endedAt: nil, lastPushAt: now,
+                lastEventAt: now, brief: CardBrief())
+            forgetTools(sessionID)
+            persist()
+            scheduleStarts(sessionID, turn: now)
+            return
+        }
+        guard var card = cards[sessionID], now >= card.lastEventAt else { return }
         card.lastEventAt = now
+        if let title, !title.isEmpty, card.title.isEmpty { card.title = title }
         switch event {
         case .status(let status):
-            guard status == "running", card.isSettled || !card.turnOpen else { return }
+            guard status == "running", card.isSettled || !card.turnOpen else {
+                cards[sessionID] = card
+                return
+            }
             revive(&card, now: now)
             cards[sessionID] = card
             persist()
             push(card, event: "update", priority: "10", now: now)
+            scheduleStarts(sessionID, turn: card.startedAt)
             return
         case .background(let work):
             let tasks = work?.tasks ?? 0
@@ -407,7 +624,7 @@ actor LiveActivityPusher {
         }
         cards[sessionID] = card
         persist()
-        push(card, event: "update", priority: "10", now: now, alert: card.registration.endAlert)
+        push(card, event: "update", priority: "10", now: now, alerts: true)
     }
 
     /// The conversation has a better name than the card started with.
@@ -474,6 +691,99 @@ actor LiveActivityPusher {
             try? await Task.sleep(for: .seconds(60))
             tick(now: Date(), inFlight: await inFlight())
         }
+    }
+
+    /// Starts a card for the conversation's turn on every device that follows turns started
+    /// elsewhere and holds none for it, once the turn has run `startDelay`: by then the phone that
+    /// sent it has handed over its own card, and a turn refused at once is already over.
+    private func scheduleStarts(_ sessionID: String, turn: Date) {
+        guard !starters.isEmpty else { return }
+        let delay = startDelay
+        Task {
+            if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
+            self.startCards(sessionID, turn: turn, now: Date())
+        }
+    }
+
+    /// Sends a start push for the conversation's turn to every device that wants one now.
+    func startCards(_ sessionID: String, turn: Date, now: Date) {
+        guard let transport, let card = cards[sessionID], !card.isSettled, card.turnOpen,
+            abs(card.startedAt.timeIntervalSince(turn)) < 1
+        else { return }
+        var record = started[sessionID] ?? (turn, [])
+        if abs(record.turn.timeIntervalSince(turn)) >= 1 { record = (turn, []) }
+        let targets = starters.values.filter { starter in
+            starter.follows(sessionID) && !card.follows(device: starter.deviceID)
+                && !record.devices.contains(starter.deviceID) && !atLimit(starter)
+        }
+        guard !targets.isEmpty else { return }
+        let ultra = ultracode[sessionID] == true
+        var pending = deliveries[sessionID]?.task
+        for starter in targets {
+            record.devices.insert(starter.deviceID)
+            guard let body = Self.startBody(card, starter: starter, now: now, ultra: ultra) else { continue }
+            let previous = pending
+            let task = Task {
+                await previous?.value
+                let (status, reason) = await transport.pushLiveActivity(
+                    body: body, token: starter.token, environment: starter.environment,
+                    priority: "10")
+                self.startDelivered(
+                    sessionID: sessionID, deviceID: starter.deviceID, token: starter.token,
+                    status: status, reason: reason)
+            }
+            pending = task
+        }
+        started[sessionID] = record
+        if let pending { deliveries[sessionID] = (UUID(), pending) }
+    }
+
+    /// Whether a device already has as many live cards from this bridge as it allows.
+    private func atLimit(_ starter: LiveActivityStarter) -> Bool {
+        guard let limit = starter.cardLimit else { return false }
+        let live = cards.values.filter { !$0.isSettled && $0.follows(device: starter.deviceID) }.count
+        return live >= limit
+    }
+
+    private func startDelivered(
+        sessionID: String, deviceID: String, token: String, status: Int, reason: String?
+    ) {
+        if status == 200 {
+            log("start push ok for \(sessionID) on …\(deviceID.suffix(6))")
+            return
+        }
+        log("start push failed \(status) for \(sessionID) on …\(deviceID.suffix(6)): \(reason ?? "no reason")")
+        let dead = status == 410 || Self.deadTokenReasons.contains(reason ?? "")
+        guard dead, starters[deviceID]?.token == token else { return }
+        forgetStarter(deviceID: deviceID)
+    }
+
+    /// The push that starts a card: the app's attributes for the conversation as this device names
+    /// its machine, the card's state, and the alert a start must carry — silent, because the card
+    /// itself is the news — asking for the new card's own update token.
+    static func startBody(
+        _ card: LiveActivityCard, starter: LiveActivityStarter, now: Date, ultra: Bool
+    ) -> Data? {
+        var last: Data?
+        for parts in BriefParts.allCases {
+            var object = payload(card, event: "start", now: now, ultra: ultra, briefParts: parts)
+            guard var aps = object["aps"] as? [String: Any] else { return nil }
+            let title = card.title.isEmpty ? "Tailscode" : card.title
+            aps["attributes-type"] = attributesType
+            aps["attributes"] = [
+                "sessionID": card.sessionID, "sessionTitle": title,
+                "serverName": starter.profileName, "profileID": starter.profileID,
+            ]
+            aps["alert"] = [
+                "title": title, "body": ["loc-key": card.reading.startKey], "sound": silentSound,
+            ] as [String: Any]
+            aps["input-push-token"] = 1
+            object["aps"] = aps
+            guard let data = try? JSONSerialization.data(withJSONObject: object) else { continue }
+            last = data
+            if data.count <= payloadLimit { return data }
+        }
+        return last
     }
 
     private func retire(_ card: LiveActivityCard, now: Date) {
@@ -600,27 +910,40 @@ actor LiveActivityPusher {
 
     /// Sends in order, one conversation at a time: an update that raced ahead of the one before it
     /// would leave the phone showing the older of the two.
+    /// Sends in order, one conversation at a time, to every installation following it: an update
+    /// that raced ahead of the one before it would leave a phone showing the older of the two.
+    /// `alerts` carries each registration's own choice of alert at the ending.
     private func push(
         _ card: LiveActivityCard, event: String, priority: String, now: Date,
-        dismissal: Date? = nil, alert: String? = nil
+        dismissal: Date? = nil, alerts: Bool = false
     ) {
-        guard let transport,
-            let body = Self.body(
-                card, event: event, now: now, dismissal: dismissal, alert: alert,
-                ultra: ultracode[card.sessionID] == true)
-        else { return }
+        guard let transport, !card.registrations.isEmpty else { return }
+        let ultra = ultracode[card.sessionID] == true
+        var bodies: [String: Data] = [:]
+        var sends: [(LiveActivityRegistration, Data)] = []
+        for registration in card.registrations {
+            let alert = alerts ? registration.endAlert : nil
+            let key = alert ?? ""
+            if bodies[key] == nil {
+                bodies[key] = Self.body(
+                    card, event: event, now: now, dismissal: dismissal, alert: alert, ultra: ultra)
+            }
+            guard let body = bodies[key] else { continue }
+            sends.append((registration, body))
+        }
         let sessionID = card.sessionID
-        let registration = card.registration
         let previous = deliveries[sessionID]?.task
         let id = UUID()
         let task = Task {
             await previous?.value
-            let (status, reason) = await transport.pushLiveActivity(
-                body: body, token: registration.token, environment: registration.environment,
-                priority: priority)
-            self.delivered(
-                sessionID: sessionID, token: registration.token, event: event, status: status,
-                reason: reason)
+            for (registration, body) in sends {
+                let (status, reason) = await transport.pushLiveActivity(
+                    body: body, token: registration.token, environment: registration.environment,
+                    priority: priority)
+                self.delivered(
+                    sessionID: sessionID, token: registration.token, event: event, status: status,
+                    reason: reason)
+            }
             if self.deliveries[sessionID]?.id == id { self.deliveries[sessionID] = nil }
         }
         deliveries[sessionID] = (id, task)
@@ -643,11 +966,18 @@ actor LiveActivityPusher {
         }
         log("\(event) push failed \(status) for \(sessionID): \(reason ?? "no reason")")
         let dead = status == 410 || Self.deadTokenReasons.contains(reason ?? "")
-        guard dead, cards[sessionID]?.registration.token == token else { return }
-        cards[sessionID] = nil
-        forgetTools(sessionID)
+        guard dead, var card = cards[sessionID], card.registrations.contains(where: { $0.token == token })
+        else { return }
+        card.registrations.removeAll { $0.token == token }
+        if card.registrations.isEmpty, card.isSettled || starters.isEmpty {
+            cards[sessionID] = nil
+            forgetTools(sessionID)
+            log("dropped the card for \(sessionID): its token is dead")
+        } else {
+            cards[sessionID] = card
+            log("dropped one device's card for \(sessionID): its token is dead")
+        }
         persist()
-        log("dropped the card for \(sessionID): its token is dead")
     }
 
     private struct LegacyStoredActivity: Codable {
@@ -667,7 +997,7 @@ actor LiveActivityPusher {
                 (
                     stored.sessionID,
                     LiveActivityCard(
-                        sessionID: stored.sessionID, registration: stored.registration,
+                        sessionID: stored.sessionID, registrations: [stored.registration],
                         title: stored.registration.title, startedAt: stored.registration.startedAt,
                         detail: CardDetail.thinking.rawValue, tool: nil, toolCount: 0,
                         background: 0, failed: false, stopped: false, turnOpen: true,
@@ -684,6 +1014,23 @@ actor LiveActivityPusher {
         try? FileManager.default.createDirectory(
             at: activitiesURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? data.write(to: activitiesURL, options: .atomic)
+    }
+
+    private static func loadStarters(from url: URL?) -> [String: LiveActivityStarter] {
+        guard let url, let data = try? Data(contentsOf: url),
+            let stored = try? JSONCoding.decoder.decode([LiveActivityStarter].self, from: data)
+        else { return [:] }
+        return Dictionary(stored.map { ($0.deviceID, $0) }, uniquingKeysWith: { _, new in new })
+    }
+
+    private func persistStarters() {
+        guard let activitiesURL else { return }
+        let url = Self.startersURL(activitiesURL)
+        let snapshot = starters.values.sorted { $0.deviceID < $1.deviceID }
+        guard let data = try? JSONCoding.encoder.encode(snapshot) else { return }
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: url, options: .atomic)
     }
 
     private func log(_ message: String) {

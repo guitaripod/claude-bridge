@@ -796,6 +796,11 @@ func registerRoutes(
         }
         await store.devicePusher.register(
             token: body.token, environment: body.environment, rules: body.rules)
+        if var starter = body.liveActivity, !starter.token.isEmpty, !starter.deviceID.isEmpty {
+            starter.environment = body.environment
+            starter.lastSeenAt = Date()
+            await store.pusher.registerStarter(starter)
+        }
         let delivers = await store.devicePusher.delivers
         return jsonResponse(["ok": true, "delivers": delivers])
     }
@@ -812,6 +817,9 @@ func registerRoutes(
             return jsonResponse(["error": "bad request"], status: .badRequest)
         }
         await store.devicePusher.unregister(token: body.token)
+        if let deviceID = body.liveActivity?.deviceID, !deviceID.isEmpty {
+            await store.pusher.forgetStarter(deviceID: deviceID)
+        }
         return jsonResponse(["ok": true])
     }
 

@@ -819,7 +819,8 @@ actor SessionStore {
         mirrorLiveTurn(id, event)
         let pusher = self.pusher
         let now = Date()
-        Task { await pusher.noteEvent(event, sessionID: id, now: now) }
+        let title: String? = if case .status("running") = event { sessions[id]?.title } else { nil }
+        Task { await pusher.noteEvent(event, sessionID: id, now: now, title: title) }
     }
 
     /// Every line the conversation's process writes, folded into whatever turn is open. A line

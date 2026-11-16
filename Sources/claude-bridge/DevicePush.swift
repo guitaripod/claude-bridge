@@ -108,6 +108,9 @@ struct DeviceRegisterRequest: Codable, Sendable {
     var token: String
     var environment: String
     var rules: DeviceRules?
+    /// How this bridge may start the device's Live Activities itself; absent from a device that
+    /// cannot, or that predates it.
+    var liveActivity: LiveActivityStarter?
 }
 
 struct PushUsage: Codable, Sendable {

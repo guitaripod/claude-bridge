@@ -257,7 +257,7 @@ struct LiveActivityPushTests {
         #expect(card?.endedAt == ended)
         #expect(card?.toolCount == 4)
         #expect(card?.detail == "finished")
-        #expect(card?.registration.token == "rotated")
+        #expect(card?.registrations.map(\.token) == ["rotated"])
         await pusher.tick(now: ended.addingTimeInterval(3600), inFlight: [])
         await pusher.settled()
         #expect(await recorder.pushes().last?.event == "end")
