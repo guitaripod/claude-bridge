@@ -709,6 +709,7 @@ actor SessionStore {
             id,
             .messageUpserted(
                 Message(id: messageID, role: .assistant, parts: [.text("")], createdAt: Date())))
+        Task { await pusher.noteTurn(sessionID: id, ultracode: ultracode) }
         Task {
             await self.launchTurn(
                 id, prompt: text, launch: launch, model: model, effort: effort)

@@ -9,6 +9,10 @@ struct LiveActivityRegistration: Codable, Sendable, Equatable {
     var environment: String
     var startedAt: Date
     var title: String
+    /// What the person asked a card to do when its turn ends: `silent` alerts without a sound so
+    /// the Dynamic Island opens on how it ended, `sound` alerts with one, absent settles it in
+    /// place. Sent by Tailscode from the build that reads the brief; older apps send none.
+    var endAlert: String?
 }
 
 /// Where a card's pushes go: APNs in production, a recorder in tests.
@@ -94,6 +98,22 @@ enum CardDetail: String, Sendable {
         case .lost: return "Open the chat to see how it ended"
         }
     }
+
+    /// The words an ending's alert says on an Apple Watch, as the key the app's own catalog holds
+    /// them under, so the watch reads them in the phone's language.
+    var alertKey: String {
+        switch self {
+        case .finished: return "Done"
+        case .question: return "Waiting for your answer"
+        case .answerless: return "Nothing came back"
+        case .failed: return "Something went wrong"
+        case .noResponse: return "No response"
+        case .sendFailed: return "Couldn't send"
+        case .interrupted: return "The server stopped mid-answer"
+        case .lost: return "Open the chat to see how it ended"
+        case .thinking, .writing, .tool, .compacting, .approval, .cancelled: return "Done"
+        }
+    }
 }
 
 /// How a turn ended, as the store saw it. A failure the turn reported along the way and a stop
@@ -146,6 +166,8 @@ struct LiveActivityCard: Codable, Sendable, Equatable {
     /// overtaken on the way — a turn's ending arriving after the next turn's start — is refused
     /// instead of undoing what came after it.
     var lastEventAt: Date
+    /// What the card says beyond its line. Optional so a card stored by an older bridge loads.
+    var brief: CardBrief?
 
     var isSettled: Bool { endedAt != nil }
     var reading: CardDetail { CardDetail(rawValue: detail) ?? .thinking }
@@ -174,6 +196,16 @@ actor LiveActivityPusher {
     static let staleAfter: TimeInterval = 30 * 60
     static let heartbeatAfter: TimeInterval = 10 * 60
     static let progressGap: TimeInterval = 8
+    /// The least time between two pushes that only move the card's steps, plan or question on.
+    static let briefGap: TimeInterval = 2
+    /// How long a live card may hear nothing before the phone redraws it as quiet: the Agents
+    /// wall's own threshold, so a stall reads the same on the Lock Screen as on the wall.
+    static let quietAfter: TimeInterval = 45
+    /// The largest push APNs takes for a Live Activity.
+    static let payloadLimit = 4_000
+    /// The sound an alert that must not be heard plays, bundled in the app: a tenth of a second
+    /// of silence, because an alert has no silent sound of its own.
+    static let silentSound = "LiveActivityQuiet.caf"
 
     private static let deadTokenReasons: Set<String> = [
         "BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic", "ExpiredToken",
@@ -185,6 +217,10 @@ actor LiveActivityPusher {
     private var countedTools: [String: Set<String>] = [:]
     private var openTools: [String: [OpenTool]] = [:]
     private var deliveries: [String: (id: UUID, task: Task<Void, Never>)] = [:]
+    /// Whether the latest turn this bridge started for each conversation runs at ultracode, by the
+    /// chat's effort or by the word. Kept beside the cards rather than on one, because the turn
+    /// starts before the phone has handed over the token of the card that will follow it.
+    private var ultracode: [String: Bool] = [:]
 
     init(client: APNSClient?, activitiesURL: URL? = nil) {
         self.init(transport: client, activitiesURL: activitiesURL)
@@ -220,6 +256,7 @@ actor LiveActivityPusher {
             return
         }
         let sameTurn = previous.map { !$0.isSettled && $0.turnOpen && turnOpen } ?? false
+        let brief = sameTurn ? previous?.brief : CardBrief(model: previous?.brief?.model)
         cards[sessionID] = LiveActivityCard(
             sessionID: sessionID, registration: registration,
             title: registration.title.isEmpty ? (previous?.title ?? "") : registration.title,
@@ -230,7 +267,7 @@ actor LiveActivityPusher {
             toolCount: sameTurn ? previous?.toolCount ?? 0 : 0,
             background: previous?.background ?? 0, failed: sameTurn && previous?.failed == true,
             stopped: false, turnOpen: turnOpen, endedAt: nil, lastPushAt: Date(),
-            lastEventAt: Date())
+            lastEventAt: Date(), brief: brief)
         if !sameTurn { forgetTools(sessionID) }
         persist()
         log("token registered for \(sessionID) (\(registration.environment))")
@@ -266,6 +303,24 @@ actor LiveActivityPusher {
         }
         guard !card.isSettled else { return }
         let before = card.detail
+        let shapeBefore = card.brief?.shape
+        var brief = card.brief ?? CardBrief()
+        switch event {
+        case .messageUpserted(let message):
+            brief.absorb(message)
+            brief.note(now)
+            card.brief = brief
+            cards[sessionID] = card
+            return
+        case .toolUpserted(_, let tool):
+            brief.absorb(tool)
+            brief.note(now)
+        case .partTextDelta, .compaction:
+            brief.note(now)
+        default:
+            break
+        }
+        card.brief = brief
         switch event {
         case .toolUpserted(_, let tool):
             if tool.status == .running {
@@ -279,7 +334,10 @@ actor LiveActivityPusher {
                 }
             } else {
                 guard let index = openTools[sessionID]?.firstIndex(where: { $0.id == tool.id })
-                else { return }
+                else {
+                    cards[sessionID] = card
+                    return
+                }
                 openTools[sessionID]?.remove(at: index)
                 if let still = openTools[sessionID]?.last {
                     card.detail = Self.detail(runningTool: still.name).rawValue
@@ -293,16 +351,25 @@ actor LiveActivityPusher {
         case .compaction(let phase, _):
             card.detail = (phase == "started" ? CardDetail.compacting : .thinking).rawValue
         default:
+            cards[sessionID] = card
             return
         }
         let changed = card.detail != before
-        guard changed || now.timeIntervalSince(card.lastPushAt) > Self.progressGap else {
+        let since = now.timeIntervalSince(card.lastPushAt)
+        let moved = card.brief?.shape != shapeBefore && since > Self.briefGap
+        guard changed || moved || since > Self.progressGap else {
             cards[sessionID] = card
             return
         }
         card.lastPushAt = now
         cards[sessionID] = card
         push(card, event: "update", priority: changed ? "10" : "5", now: now)
+    }
+
+    /// A turn this bridge started, and whether it runs at ultracode, which the card wears as the
+    /// wall's rainbow while the turn runs — whenever the card comes to exist.
+    func noteTurn(sessionID: String, ultracode: Bool) {
+        self.ultracode[sessionID] = ultracode
     }
 
     /// Somebody pressed stop: the turn that ends next ended because they asked it to.
@@ -330,6 +397,7 @@ actor LiveActivityPusher {
         if card.endedAt == nil { card.endedAt = now }
         card.lastPushAt = now
         forgetTools(sessionID)
+        if card.reading != .question { card.brief?.ask = nil }
         guard card.reading != .cancelled else {
             cards[sessionID] = nil
             persist()
@@ -339,7 +407,7 @@ actor LiveActivityPusher {
         }
         cards[sessionID] = card
         persist()
-        push(card, event: "update", priority: "10", now: now)
+        push(card, event: "update", priority: "10", now: now, alert: card.registration.endAlert)
     }
 
     /// The conversation has a better name than the card started with.
@@ -428,6 +496,7 @@ actor LiveActivityPusher {
         card.turnOpen = true
         card.endedAt = nil
         card.lastPushAt = now
+        card.brief = CardBrief(model: card.brief?.model)
         forgetTools(card.sessionID)
     }
 
@@ -455,7 +524,8 @@ actor LiveActivityPusher {
     }
 
     static func payload(
-        _ card: LiveActivityCard, event: String, now: Date, dismissal: Date? = nil
+        _ card: LiveActivityCard, event: String, now: Date, dismissal: Date? = nil,
+        alert: String? = nil, ultra: Bool = false, briefParts: BriefParts = .fitted
     ) -> [String: Any] {
         let reading = card.reading
         let duration = (card.endedAt ?? now).timeIntervalSince(card.startedAt)
@@ -471,28 +541,73 @@ actor LiveActivityPusher {
         if let tool = card.tool, !card.isSettled { state["lastTool"] = tool }
         if let endedAt = card.endedAt { state["endedAt"] = endedAt.timeIntervalSinceReferenceDate }
         if card.isSettled, card.background > 0 { state["background"] = card.background }
+        if let brief = card.brief {
+            var object = CardBrief.fitted(brief, settled: card.isSettled, now: now, parts: briefParts)
+            if ultra, !card.isSettled { object["ultra"] = true }
+            if !object.isEmpty { state["brief"] = object }
+        }
         var aps: [String: Any] = [
             "timestamp": Int(now.timeIntervalSince1970),
             "event": event,
             "content-state": state,
             "relevance-score": reading.relevance,
         ]
-        if !card.isSettled {
-            aps["stale-date"] = Int(now.addingTimeInterval(staleAfter).timeIntervalSince1970)
-        }
+        if !card.isSettled { aps["stale-date"] = Int(staleDate(card, now: now).timeIntervalSince1970) }
         if let dismissal { aps["dismissal-date"] = Int(dismissal.timeIntervalSince1970) }
+        if let alert, card.isSettled, reading != .cancelled {
+            aps["alert"] = [
+                "title": card.title.isEmpty ? "Tailscode" : card.title,
+                "body": ["loc-key": reading.alertKey],
+                "sound": alert == "sound" ? "default" : silentSound,
+            ] as [String: Any]
+        }
         return ["aps": aps]
+    }
+
+    /// When the phone redraws a live card as having heard nothing: the wall's quiet threshold
+    /// after the turn last moved. A turn waiting on its question is waiting, not quiet, and a card
+    /// that has seen nothing move keeps the old half hour.
+    static func staleDate(_ card: LiveActivityCard, now: Date) -> Date {
+        guard card.reading != .question, let moved = card.brief?.moved else {
+            return now.addingTimeInterval(staleAfter)
+        }
+        let quiet = moved.addingTimeInterval(quietAfter)
+        return min(max(quiet, now.addingTimeInterval(1)), now.addingTimeInterval(staleAfter))
+    }
+
+    /// Whether the brief may carry everything it fits in its own budget, or nothing past the pulse
+    /// and the model because even that would not leave the push under what APNs takes.
+    enum BriefParts: CaseIterable {
+        case fitted, bare
+    }
+
+    /// The push's body, with as much of the brief as fits in what APNs takes.
+    static func body(
+        _ card: LiveActivityCard, event: String, now: Date, dismissal: Date?, alert: String?,
+        ultra: Bool = false
+    ) -> Data? {
+        var last: Data?
+        for parts in BriefParts.allCases {
+            let object = payload(
+                card, event: event, now: now, dismissal: dismissal, alert: alert, ultra: ultra,
+                briefParts: parts)
+            guard let data = try? JSONSerialization.data(withJSONObject: object) else { continue }
+            last = data
+            if data.count <= payloadLimit { return data }
+        }
+        return last
     }
 
     /// Sends in order, one conversation at a time: an update that raced ahead of the one before it
     /// would leave the phone showing the older of the two.
     private func push(
         _ card: LiveActivityCard, event: String, priority: String, now: Date,
-        dismissal: Date? = nil
+        dismissal: Date? = nil, alert: String? = nil
     ) {
         guard let transport,
-            let body = try? JSONSerialization.data(
-                withJSONObject: Self.payload(card, event: event, now: now, dismissal: dismissal))
+            let body = Self.body(
+                card, event: event, now: now, dismissal: dismissal, alert: alert,
+                ultra: ultracode[card.sessionID] == true)
         else { return }
         let sessionID = card.sessionID
         let registration = card.registration
