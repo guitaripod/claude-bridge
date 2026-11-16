@@ -4,6 +4,11 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.30.0 — 2026-11-16
+
+- A turn you start anywhere gets a Live Activity on your phone. A message sent from a desktop, drained from a queue, run on a schedule or begun by Claude Code itself starts a card on every phone and tablet that follows turns started elsewhere, a few seconds in, even while the phone is locked, as the Tailscode build that follows this release asks; the card is then kept current like one the phone opened itself. Muted chats and phones that turned it off get none, and a phone that already has the card is never given a second.
+- A conversation followed on two devices keeps both cards current, each opening its island at the ending the way that device chose.
+
 ## 1.29.0 — 2026-11-16
 
 - A Live Activity the bridge pushes to a locked phone shows the whole tile, as the app's Agents wall does: the agent's latest steps in plain words, its plan, the files and lines it changed, the last minute of its pulse, the model answering, ultracode, and the question it stopped on; once the turn ends, what the agent said last. Only facts travel, so the phone writes the words in its own language.
