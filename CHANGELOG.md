@@ -4,6 +4,12 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.29.0 — 2026-11-16
+
+- A Live Activity the bridge pushes to a locked phone shows the whole tile, as the app's Agents wall does: the agent's latest steps in plain words, its plan, the files and lines it changed, the last minute of its pulse, the model answering, ultracode, and the question it stopped on; once the turn ends, what the agent said last. Only facts travel, so the phone writes the words in its own language.
+- A card whose agent has gone quiet for 45 seconds says so on the Lock Screen, counting how long, instead of looking busy.
+- When a turn ends the Dynamic Island can open on how it ended, silently or with a sound, as chosen in the Tailscode build that follows this release; older apps ask for nothing and their cards settle in place as before.
+
 ## 1.28.1 — 2026-11-15
 
 - The quick calls that name your conversations no longer flash up in the session list as conversations of their own while they run: they save no session at all.
