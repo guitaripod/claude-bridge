@@ -406,6 +406,14 @@ actor LiveActivityPusher {
     private var started: [String: (turn: Date, devices: Set<String>)] = [:]
     private let startDelay: TimeInterval
     private let desks: DeskRegistry?
+    /// Each installation's wish to stay quiet at a desk and its patience, from the rules it last
+    /// registered with, whether or not this bridge can start its cards.
+    private var deskRules: [String: DeskRule]
+
+    struct DeskRule: Codable, Sendable, Equatable {
+        var quiet: Bool
+        var awayAfter: Int?
+    }
 
     init(client: APNSClient?, activitiesURL: URL? = nil, desks: DeskRegistry? = nil) {
         self.init(transport: client, activitiesURL: activitiesURL, desks: desks)
@@ -421,6 +429,7 @@ actor LiveActivityPusher {
         self.desks = desks
         cards = Self.load(from: activitiesURL)
         starters = Self.loadStarters(from: activitiesURL.map(Self.startersURL))
+        deskRules = Self.loadDeskRules(from: activitiesURL.map(Self.deskRulesURL))
     }
 
     static func startersURL(_ activitiesURL: URL) -> URL {
@@ -429,14 +438,41 @@ actor LiveActivityPusher {
 
     func starter(_ deviceID: String) -> LiveActivityStarter? { starters[deviceID] }
 
-    /// Whether the installation asked to stay quiet while its person is at a desk, and they are:
-    /// no card is started on it and an ending updates its card without opening the island.
+    static func deskRulesURL(_ activitiesURL: URL) -> URL {
+        activitiesURL.deletingLastPathComponent().appendingPathComponent("live-activity-desk.json")
+    }
+
+    /// The device's rules as it last registered them, kept by its installation id.
+    func noteDeskRules(deviceID: String, rules: DeviceRules?) {
+        let rule = DeskRule(quiet: rules?.quietAtDesk == true, awayAfter: rules?.awayAfter)
+        guard deskRules[deviceID] != rule else { return }
+        deskRules[deviceID] = rule
+        persistDeskRules()
+    }
+
+    /// Whether the installation asked to stay quiet while its person is at a desk, and they are
+    /// (or this bridge has not listened long enough to know they are not): no card is started on
+    /// it and an ending updates its card without opening the island.
     func quietAtDesk(_ deviceID: String?, now: Date = Date()) -> Bool {
-        guard let deviceID, let starter = starters[deviceID], starter.quietAtDesk == true,
-            let desks
-        else { return false }
-        let patience = starter.awayAfter.map { TimeInterval(max(1, $0)) } ?? DeskRegistry.defaultAwayAfter
-        return desks.occupied(awayAfter: patience, now: now) != nil
+        guard let deviceID, let desks else { return false }
+        let rule =
+            deskRules[deviceID]
+            ?? starters[deviceID].map { DeskRule(quiet: $0.quietAtDesk == true, awayAfter: $0.awayAfter) }
+        guard let rule, rule.quiet else { return false }
+        let patience = rule.awayAfter.map { TimeInterval(max(1, $0)) } ?? DeskRegistry.defaultAwayAfter
+        return desks.mayBeOccupied(awayAfter: patience, now: now)
+    }
+
+    private static func loadDeskRules(from url: URL?) -> [String: DeskRule] {
+        guard let url, let data = try? Data(contentsOf: url),
+            let rules = try? JSONCoding.decoder.decode([String: DeskRule].self, from: data)
+        else { return [:] }
+        return rules
+    }
+
+    private func persistDeskRules() {
+        guard let activitiesURL, let data = try? JSONCoding.encoder.encode(deskRules) else { return }
+        try? data.write(to: Self.deskRulesURL(activitiesURL), options: .atomic)
     }
 
     /// A device handed over how this bridge may start its cards.

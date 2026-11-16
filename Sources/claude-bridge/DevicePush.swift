@@ -119,6 +119,8 @@ struct DeviceRegisterRequest: Codable, Sendable {
     var token: String
     var environment: String
     var rules: DeviceRules?
+    /// The installation, as its Live Activity registrations name it; absent from older apps.
+    var deviceID: String?
     /// How this bridge may start the device's Live Activities itself; absent from a device that
     /// cannot, or that predates it.
     var liveActivity: LiveActivityStarter?
@@ -132,6 +134,22 @@ struct HeldPush: Codable, Sendable, Equatable {
     var body: Data
     var collapseID: String?
     var heldAt: Date
+    /// A notice the device raised itself about a conversation this bridge does not hold: only a
+    /// desk having it on screen says it is no longer news.
+    var foreign: Bool?
+}
+
+/// A notice a device raised itself while its person was at a desk, handed here to go out through
+/// APNs once they leave: the shape CodingAgentKit's `DeskHeldNotice` writes.
+struct HeldNoticeRequest: Codable, Sendable {
+    var token: String
+    var identifier: String
+    var title: String
+    var body: String
+    var sessionID: String?
+    var threadID: String?
+    var category: String?
+    var userInfo: String?
 }
 
 struct PushUsage: Codable, Sendable {
@@ -153,7 +171,11 @@ actor DevicePusher {
     /// conversation replaces an earlier one, as the collapse id would on the phone.
     private var held: [String: [String: HeldPush]]
     private var newsCheck: (@Sendable (String, NoticePush.Kind, Date) async -> Bool)?
+    /// Notices taken out to be sent and not yet answered, kept on disk with the held ones so a
+    /// restart mid-release loses nothing.
+    private var sending: [String: HeldPush] = [:]
     private static let heldMaxAge: TimeInterval = 7 * 86400
+    private static let heldPerDevice = 50
 
     private static let silentInterval: TimeInterval = 300
     private static let registrationMaxAge: TimeInterval = 30 * 86400
@@ -190,7 +212,7 @@ actor DevicePusher {
         _ device: DeviceRegistration, desks: DeskRegistry?, now: Date
     ) -> Bool {
         guard let patience = (device.rules ?? .standard).deskPatience, let desks else { return false }
-        return desks.occupied(awayAfter: patience, now: now) != nil
+        return desks.mayBeOccupied(awayAfter: patience, now: now)
     }
 
     /// Whether this bridge holds an APNs client at all, so a registering client can tell a real
@@ -267,8 +289,9 @@ actor DevicePusher {
         if let notice { payload = NoticePush.fitted(NoticePush.merged(payload, with: notice)) }
         let collapseID = Self.truncated("done:\(sessionID)", toBytes: 64)
         let now = Date()
-        let quiet = targets.filter { Self.isQuiet($0, desks: desks, now: now) }
-        let loud = targets.filter { !Self.isQuiet($0, desks: desks, now: now) }
+        let judged = targets.map { ($0, Self.isQuiet($0, desks: desks, now: now)) }
+        let quiet = judged.filter(\.1).map(\.0)
+        let loud = judged.filter { !$0.1 }.map(\.0)
         if !quiet.isEmpty, let body = try? JSONSerialization.data(withJSONObject: payload) {
             hold(
                 body: body, kind: kind, sessionID: sessionID, collapseID: collapseID, for: quiet,
@@ -285,13 +308,74 @@ actor DevicePusher {
         for targets: [DeviceRegistration], now: Date
     ) {
         for device in targets {
-            held[device.token, default: [:]][sessionID] = HeldPush(
-                token: device.token, sessionID: sessionID, kind: kind.rawValue, body: body,
-                collapseID: collapseID, heldAt: now)
+            keep(
+                HeldPush(
+                    token: device.token, sessionID: sessionID, kind: kind.rawValue, body: body,
+                    collapseID: collapseID, heldAt: now))
         }
         persistHeld()
         let desk = desks?.occupied(awayAfter: .infinity, now: now)?.name ?? "a desk"
         log("\(kind.rawValue) for \(sessionID) held for \(targets.count) device(s) while at \(desk)")
+    }
+
+    /// Holds a notice the device raised itself, to go out once its person leaves the desk. Taken
+    /// only from a device this bridge pushes to; one that is not at a desk any more hears it at the
+    /// next sweep.
+    func holdForeign(_ request: HeldNoticeRequest, now: Date = Date()) -> Bool {
+        guard client != nil, devices[request.token] != nil,
+            let body = Self.foreignBody(request)
+        else { return false }
+        let key = request.sessionID ?? request.identifier
+        keep(
+            HeldPush(
+                token: request.token, sessionID: key, kind: NoticePush.Kind.done.rawValue,
+                body: body, collapseID: Self.truncated(request.identifier, toBytes: 64),
+                heldAt: now, foreign: true))
+        persistHeld()
+        log("a device's own notice \(request.identifier) held until its person leaves the desk")
+        return true
+    }
+
+    /// Holds one notice, a later one for the same conversation in its place, and no more than
+    /// `heldPerDevice` for a device: the oldest goes first.
+    private func keep(_ push: HeldPush) {
+        var pushes = held[push.token] ?? [:]
+        pushes[push.sessionID] = push
+        while pushes.count > Self.heldPerDevice,
+            let oldest = pushes.values.min(by: { $0.heldAt < $1.heldAt })
+        {
+            pushes[oldest.sessionID] = nil
+            log("held \(oldest.kind) for \(oldest.sessionID) dropped: too many held for one device")
+        }
+        held[push.token] = pushes
+    }
+
+    /// The alert a device's own notice becomes: its words, its thread and category, and the fields
+    /// a tap reads, cut back to the ones that route a tap when the whole would not fit in a push.
+    static func foreignBody(_ request: HeldNoticeRequest) -> Data? {
+        var aps: [String: Any] = [
+            "alert": [
+                "title": String(request.title.prefix(200)), "body": String(request.body.prefix(1000)),
+            ],
+            "sound": "default",
+            "mutable-content": 1,
+            "interruption-level": "active",
+        ]
+        if let thread = request.threadID ?? request.sessionID { aps["thread-id"] = thread }
+        if let category = request.category, !category.isEmpty { aps["category"] = category }
+        var payload: [String: Any] = [:]
+        if let raw = request.userInfo?.data(using: .utf8),
+            let fields = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any]
+        {
+            payload = fields.filter { $0.key != "aps" }
+        }
+        if let sessionID = request.sessionID { payload["sessionID"] = sessionID }
+        payload["aps"] = aps
+        if let data = try? JSONSerialization.data(withJSONObject: payload), data.count <= 4000 {
+            return data
+        }
+        let kept = payload.filter { ["aps", "sessionID", "profileID", "route"].contains($0.key) }
+        return try? JSONSerialization.data(withJSONObject: kept)
     }
 
     /// Sends what was held for every device whose person has left the desk, by that device's own
@@ -300,34 +384,48 @@ actor DevicePusher {
     /// unregistered, or that stopped asking to be quiet, goes too. Taken out of the store before
     /// anything is awaited, so two sweeps at once can never send one notice twice.
     func releaseHeld(now: Date = Date()) async {
-        guard !held.isEmpty else { return }
+        guard !held.isEmpty || !sending.isEmpty else { return }
         var due: [(DeviceRegistration, HeldPush)] = []
+        var changed = false
         for (token, pushes) in held {
             guard let device = devices[token] else {
                 held[token] = nil
+                changed = true
                 continue
             }
             guard !Self.isQuiet(device, desks: desks, now: now) else { continue }
             held[token] = nil
-            due += pushes.values.sorted { $0.heldAt < $1.heldAt }.map { (device, $0) }
-        }
-        persistHeld()
-        guard let client, !due.isEmpty else { return }
-        for (device, push) in due {
-            guard await isStillNews(push, now: now) else {
-                log("held \(push.kind) for \(push.sessionID) dropped: already seen or moved on")
-                continue
+            changed = true
+            for push in pushes.values.sorted(by: { $0.heldAt < $1.heldAt }) {
+                sending[Self.sendingKey(push)] = push
+                due.append((device, push))
             }
-            await fanOut(
-                body: push.body, topic: client.bundleTopic, pushType: "alert", priority: "10",
-                collapseID: push.collapseID, label: "held alert", to: [device])
+        }
+        if changed { persistHeld() }
+        guard let client else {
+            sending = [:]
+            persistHeld()
+            return
+        }
+        for (device, push) in due {
+            if await isStillNews(push, now: now) {
+                await fanOut(
+                    body: push.body, topic: client.bundleTopic, pushType: "alert", priority: "10",
+                    collapseID: push.collapseID, label: "held alert", to: [device])
+            } else {
+                log("held \(push.kind) for \(push.sessionID) dropped: already seen or moved on")
+            }
+            sending[Self.sendingKey(push)] = nil
+            persistHeld()
         }
     }
+
+    private static func sendingKey(_ push: HeldPush) -> String { "\(push.token)|\(push.sessionID)" }
 
     private func isStillNews(_ push: HeldPush, now: Date) async -> Bool {
         if let desks, desks.looked(push.sessionID, since: push.heldAt) { return false }
         guard now.timeIntervalSince(push.heldAt) < Self.heldMaxAge else { return false }
-        guard let newsCheck else { return true }
+        guard push.foreign != true, let newsCheck else { return true }
         let kind = NoticePush.Kind(rawValue: push.kind) ?? .done
         return await newsCheck(push.sessionID, kind, push.heldAt)
     }
@@ -429,7 +527,7 @@ actor DevicePusher {
         return pruneReasons.contains(reason)
     }
 
-    private static func truncated(_ value: String, toBytes limit: Int) -> String {
+    static func truncated(_ value: String, toBytes limit: Int) -> String {
         guard value.utf8.count > limit else { return value }
         return String(decoding: Array(value.utf8.prefix(limit)), as: UTF8.self)
     }
@@ -458,7 +556,8 @@ actor DevicePusher {
     private func persistHeld() {
         guard let devicesURL else { return }
         let url = Self.heldURL(devicesURL)
-        let all = held.values.flatMap(\.values).sorted { ($0.token, $0.sessionID) < ($1.token, $1.sessionID) }
+        let all = (held.values.flatMap(\.values) + sending.values)
+            .sorted { ($0.token, $0.sessionID) < ($1.token, $1.sessionID) }
         guard !all.isEmpty else {
             try? FileManager.default.removeItem(at: url)
             return

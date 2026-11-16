@@ -7,16 +7,20 @@ import NIOCore
 /// `DeskReport` writes. Every field but the desk's own id may be missing from a newer or older
 /// client and reads as the quiet default.
 struct DeskReportBody: Codable, Sendable, Equatable {
+    static let interval: TimeInterval = 30
+
     var desk: String
     var name: String
     var idle: Int?
     var locked: Bool
     var leaving: Bool
     var looked: [String]
+    /// Seconds before the report each look happened; absent from a desk that predates it.
+    var lookedAgo: [String: Int]?
 
     init(
         desk: String, name: String, idle: Int?, locked: Bool = false, leaving: Bool = false,
-        looked: [String] = []
+        looked: [String] = [], lookedAgo: [String: Int]? = nil
     ) {
         self.desk = desk
         self.name = name
@@ -24,10 +28,11 @@ struct DeskReportBody: Codable, Sendable, Equatable {
         self.locked = locked
         self.leaving = leaving
         self.looked = looked
+        self.lookedAgo = lookedAgo
     }
 
     private enum CodingKeys: String, CodingKey {
-        case desk, name, idle, locked, leaving, looked
+        case desk, name, idle, locked, leaving, looked, lookedAgo
     }
 
     init(from decoder: Decoder) throws {
@@ -38,6 +43,7 @@ struct DeskReportBody: Codable, Sendable, Equatable {
         locked = (try? values.decodeIfPresent(Bool.self, forKey: .locked)) ?? false
         leaving = (try? values.decodeIfPresent(Bool.self, forKey: .leaving)) ?? false
         looked = (try? values.decodeIfPresent([String].self, forKey: .looked)) ?? []
+        lookedAgo = try? values.decodeIfPresent([String: Int].self, forKey: .lookedAgo)
     }
 }
 
@@ -60,10 +66,12 @@ struct DeskPresenceBody: Codable, Sendable, Equatable {
 
 /// The desks reporting to this bridge, and the conversations they had on screen.
 ///
-/// Nothing here is persisted: a desk reports every 30 s, so one this process has not heard from
-/// since it started is a desk nobody is at. A desk silent for `staleAfter` is gone (the app quit,
-/// the machine slept, the network dropped), and one that says it is leaving is gone at once.
-/// Locked so a push, a card and a route can all ask without crossing an actor.
+/// Nothing here is persisted: a desk reports every 30 s, so within `staleAfter` of starting this
+/// process has heard from every desk that is there. Until then it cannot tell a desk nobody is at
+/// from one that has not spoken yet, and says so (`warming`), so a restart never lets a held
+/// notice out at a desk. A desk silent for `staleAfter` is gone (the app quit, the machine slept,
+/// the network dropped), and one that says it is leaving is gone at once. Locked so a push, a card
+/// and a route can all ask without crossing an actor.
 final class DeskRegistry: @unchecked Sendable {
     struct Entry: Sendable, Equatable {
         var report: DeskReportBody
@@ -77,10 +85,29 @@ final class DeskRegistry: @unchecked Sendable {
     static let deskLimit = 32
     static let lookedPerReport = 64
     static let textLimit = 200
+    /// A year of seconds: anything longer is a desk nobody is at, and no sum of it may overflow.
+    static let idleLimit = 366 * 86_400
 
     private let lock = NSLock()
     private var entries: [String: Entry] = [:]
     private var looks: [String: Date] = [:]
+    private let startedAt: Date
+
+    init(startedAt: Date = Date()) {
+        self.startedAt = startedAt
+    }
+
+    /// Whether this process has not yet listened long enough to have heard every desk that is
+    /// there.
+    func warming(now: Date = Date()) -> Bool {
+        now.timeIntervalSince(startedAt) < Self.staleAfter
+    }
+
+    /// Whether a device with this patience must still be treated as having its person at a desk:
+    /// one is, or this process cannot tell yet.
+    func mayBeOccupied(awayAfter: TimeInterval, now: Date = Date()) -> Bool {
+        warming(now: now) || occupied(awayAfter: awayAfter, now: now) != nil
+    }
 
     /// Takes a report, trimmed to what a well-behaved desk ever sends. Returns false for one
     /// that names no desk.
@@ -91,12 +118,21 @@ final class DeskRegistry: @unchecked Sendable {
         var report = report
         report.desk = id
         report.name = String(report.name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(Self.textLimit))
-        report.idle = report.idle.map { max(0, $0) }
+        report.idle = report.idle.map { min(max(0, $0), Self.idleLimit) }
         let looked = report.looked.prefix(Self.lookedPerReport)
             .filter { !$0.isEmpty && $0.count <= Self.textLimit }
+        let ago = report.lookedAgo ?? [:]
         report.looked = []
+        report.lookedAgo = nil
         lock.withLock {
-            for sessionID in looked { looks[sessionID] = now }
+            let windowStart =
+                entries[id]?.heardAt ?? now.addingTimeInterval(-DeskReportBody.interval)
+            for sessionID in looked {
+                let seen =
+                    ago[sessionID].map { now.addingTimeInterval(-TimeInterval(min(max(0, $0), 3600))) }
+                    ?? windowStart
+                looks[sessionID] = max(looks[sessionID] ?? .distantPast, seen)
+            }
             if report.leaving {
                 entries[id] = nil
             } else {
@@ -175,6 +211,23 @@ func registerDeskRoutes(
         return jsonResponse(["ok": true])
     }
 
+    router.post("push/hold") { request, _ in
+        guard hasAuth else {
+            return jsonResponse(
+                ["error": "holding a notice requires an authenticated bridge (BRIDGE_PASSWORD or a tailnet)"],
+                status: .forbidden)
+        }
+        guard let body = try? await decodeBody(HeldNoticeRequest.self, request, limit: 64 * 1024),
+            !body.token.isEmpty, body.token.count <= 200, body.token.allSatisfy(\.isHexDigit),
+            !body.identifier.isEmpty, body.identifier.count <= DeskRegistry.textLimit
+        else {
+            return jsonResponse(["error": "bad request"], status: .badRequest)
+        }
+        let held = await devices.holdForeign(body)
+        if held { Task { await devices.releaseHeld() } }
+        return jsonResponse(["ok": true, "held": held])
+    }
+
     router.get("presence") { _, _ in
         jsonResponse(desks.presence())
     }
@@ -200,7 +253,7 @@ func registerDeskRoutes(
             var lastHeartbeat = Date()
             while true {
                 let now = Date()
-                if desks.occupied(awayAfter: awayAfter, now: now) == nil {
+                if !desks.mayBeOccupied(awayAfter: awayAfter, now: now) {
                     return try await send(desks.presence(now: now, away: true))
                 }
                 if now >= deadline {

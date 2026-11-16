@@ -799,6 +799,11 @@ func registerRoutes(
         }
         await store.devicePusher.register(
             token: body.token, environment: body.environment, rules: body.rules)
+        if let deviceID = body.deviceID ?? body.liveActivity?.deviceID, !deviceID.isEmpty,
+            deviceID.count <= DeskRegistry.textLimit
+        {
+            await store.pusher.noteDeskRules(deviceID: deviceID, rules: body.rules)
+        }
         var startsCards = false
         if var starter = body.liveActivity, !starter.token.isEmpty, !starter.deviceID.isEmpty {
             starter.environment = body.environment
