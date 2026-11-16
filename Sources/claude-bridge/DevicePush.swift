@@ -174,6 +174,11 @@ actor DevicePusher {
     /// Notices taken out to be sent and not yet answered, kept on disk with the held ones so a
     /// restart mid-release loses nothing.
     private var sending: [String: HeldPush] = [:]
+    /// The chats each device has an alert standing for, and when it was sent, so a chat read
+    /// anywhere takes its alert down on every device that still shows it. Not kept across a
+    /// restart: the phone's own check against the read mark is the backstop.
+    private var alerted: [String: [String: Date]] = [:]
+    private static let alertedPerDevice = 200
     private static let heldMaxAge: TimeInterval = 7 * 86400
     private static let heldPerDevice = 50
 
@@ -250,6 +255,7 @@ actor DevicePusher {
     }
 
     func unregister(token: String) {
+        alerted[token] = nil
         if held.removeValue(forKey: token) != nil { persistHeld() }
         guard devices.removeValue(forKey: token) != nil else {
             log("unregister ignored for unknown device …\(token.suffix(8))")
@@ -300,8 +306,33 @@ actor DevicePusher {
         guard !loud.isEmpty else { return }
         await fanOut(
             payload: payload, topic: client.bundleTopic, pushType: "alert", priority: "10",
-            collapseID: collapseID, label: "alert", to: loud)
+            collapseID: collapseID, label: "alert", to: loud, about: sessionID)
     }
+
+    /// The chats were read, or looked at on a desk: every device still showing an alert about
+    /// one of them is told, with one silent push naming them all, so it takes the alert down.
+    /// An alert sent after `now` is about news the look did not see, and stays.
+    func withdraw(_ sessionIDs: Set<String>, now: Date = Date()) async {
+        guard let client, !sessionIDs.isEmpty, !alerted.isEmpty else { return }
+        var due: [(DeviceRegistration, [String])] = []
+        for (token, sessions) in alerted {
+            let read = sessions.filter { sessionIDs.contains($0.key) && $0.value <= now }.map(\.key)
+            guard !read.isEmpty else { continue }
+            for id in read { alerted[token]?[id] = nil }
+            if alerted[token]?.isEmpty == true { alerted[token] = nil }
+            guard let device = devices[token] else { continue }
+            due.append((device, read.sorted()))
+        }
+        for (device, read) in due {
+            let payload: [String: Any] = ["aps": ["content-available": 1], "withdraw": read]
+            await fanOut(
+                payload: payload, topic: client.bundleTopic, pushType: "background", priority: "5",
+                collapseID: nil, label: "withdraw", to: [device])
+        }
+    }
+
+    /// The chats each device is still being shown an alert about — for a test.
+    func standingAlerts(for token: String) -> Set<String> { Set((alerted[token] ?? [:]).keys) }
 
     private func hold(
         body: Data, kind: NoticePush.Kind, sessionID: String, collapseID: String,
@@ -411,7 +442,8 @@ actor DevicePusher {
             if await isStillNews(push, now: now) {
                 await fanOut(
                     body: push.body, topic: client.bundleTopic, pushType: "alert", priority: "10",
-                    collapseID: push.collapseID, label: "held alert", to: [device])
+                    collapseID: push.collapseID, label: "held alert", to: [device],
+                    about: push.sessionID)
             } else {
                 log("held \(push.kind) for \(push.sessionID) dropped: already seen or moved on")
             }
@@ -450,17 +482,19 @@ actor DevicePusher {
 
     private func fanOut(
         payload: [String: Any], topic: String, pushType: String, priority: String,
-        collapseID: String?, label: String, to chosen: [DeviceRegistration]? = nil
+        collapseID: String?, label: String, to chosen: [DeviceRegistration]? = nil,
+        about sessionID: String? = nil
     ) async {
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return }
         await fanOut(
             body: body, topic: topic, pushType: pushType, priority: priority,
-            collapseID: collapseID, label: label, to: chosen)
+            collapseID: collapseID, label: label, to: chosen, about: sessionID)
     }
 
     private func fanOut(
         body: Data, topic: String, pushType: String, priority: String,
-        collapseID: String?, label: String, to chosen: [DeviceRegistration]? = nil
+        collapseID: String?, label: String, to chosen: [DeviceRegistration]? = nil,
+        about sessionID: String? = nil
     ) async {
         guard let client else { return }
         let targets = chosen ?? Array(devices.values)
@@ -471,6 +505,7 @@ actor DevicePusher {
                 topic: topic, pushType: pushType, priority: priority, collapseID: collapseID)
             if status == 200 {
                 sent += 1
+                if let sessionID { noteAlerted(device.token, sessionID) }
                 continue
             }
             log("\(label) push failed \(status) for …\(device.token.suffix(8)): \(reason ?? "no reason")")
@@ -481,6 +516,17 @@ actor DevicePusher {
             }
         }
         log("\(label) push sent to \(sent)/\(targets.count) device(s)")
+    }
+
+    private func noteAlerted(_ token: String, _ sessionID: String, now: Date = Date()) {
+        var sessions = alerted[token] ?? [:]
+        sessions[sessionID] = now
+        while sessions.count > Self.alertedPerDevice,
+            let oldest = sessions.min(by: { $0.value < $1.value })
+        {
+            sessions[oldest.key] = nil
+        }
+        alerted[token] = sessions
     }
 
     /// {"claude": snapshot?, "grok": snapshot?} with each key present only if

@@ -873,6 +873,13 @@ func registerRoutes(
         }
         await store.applyMarks(
             id, body.marks, updatedAt: await observer.summary(for: id)?.updatedAt)
+        if body.read == .seen {
+            let now = Date()
+            Task {
+                await store.devicePusher.withdraw([id], now: now)
+                await store.pusher.seen(sessionID: id, now: now)
+            }
+        }
         guard let title = body.cleanTitle else { return jsonResponse(["ok": true]) }
         await adoptIfNeeded(id)
         guard await store.rename(id, title: title) else {

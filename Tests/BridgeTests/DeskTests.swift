@@ -5,17 +5,24 @@ import Testing
 
 private actor AlertRecorder: DevicePushTransport {
     nonisolated var bundleTopic: String { "com.example.app" }
-    private var sent: [(token: String, body: Data)] = []
+    private var sent: [(token: String, body: Data, type: String)] = []
 
     func send(
         body: Data, token: String, environment: String,
         topic: String, pushType: String, priority: String, collapseID: String?
     ) async -> (status: Int, reason: String?) {
-        sent.append((token, body))
+        sent.append((token, body, pushType))
         return (200, nil)
     }
 
-    func tokens() -> [String] { sent.map(\.token) }
+    func tokens() -> [String] { sent.filter { $0.type == "alert" }.map(\.token) }
+
+    func withdrawals() -> [(token: String, sessions: [String])] {
+        sent.filter { $0.type == "background" }.map { entry in
+            let object = (try? JSONSerialization.jsonObject(with: entry.body)) as? [String: Any]
+            return (entry.token, object?["withdraw"] as? [String] ?? [])
+        }
+    }
 }
 
 private actor LiveRecorder: LiveActivityTransport {
@@ -65,7 +72,7 @@ struct DeskTests {
 
         desks.record(report("blind", idle: nil), now: at(120))
         #expect(desks.occupied(awayAfter: 600, now: at(120)) == nil, "a desk that cannot tell is nobody")
-        #expect(!desks.record(report("", idle: 0), now: at(120)))
+        #expect(desks.record(report("", idle: 0), now: at(120)) == nil)
     }
 
     @Test("A look is dated when it happened, or to the start of its window when the desk cannot say")
@@ -222,6 +229,45 @@ struct DeskTests {
         #expect(aps["thread-id"] as? String == "s")
         #expect(aps["bad"] == nil)
         #expect(object["profileID"] as? String == "p")
+    }
+
+    @Test("A chat read anywhere takes its alert down on every device still showing it, once")
+    func withdrawOnRead() async {
+        let recorder = AlertRecorder()
+        let desks = DeskRegistry(startedAt: .distantPast)
+        let pusher = await pusher(recorder, desks: desks)
+        await finish(pusher, "s1")
+        await finish(pusher, "s2")
+        #expect(await recorder.tokens().sorted() == ["aa", "aa", "bb", "bb"])
+        #expect(await pusher.standingAlerts(for: "aa") == ["s1", "s2"])
+        await pusher.withdraw(["s1", "other"], now: Date().addingTimeInterval(-60))
+        #expect(await recorder.withdrawals().isEmpty, "a look from before an alert does not take it down")
+        await pusher.withdraw(["s1", "other"])
+        let sent = await recorder.withdrawals()
+        #expect(sent.map(\.token).sorted() == ["aa", "bb"])
+        #expect(sent.allSatisfy { $0.sessions == ["s1"] })
+        await pusher.withdraw(["s1"])
+        #expect(await recorder.withdrawals().count == 2, "a withdrawn alert is not withdrawn twice")
+        #expect(await pusher.standingAlerts(for: "aa") == ["s2"])
+    }
+
+    @Test("A settled card ends when its chat is read; a running one stays")
+    func cardEndsOnRead() async throws {
+        let recorder = LiveRecorder()
+        let pusher = LiveActivityPusher(transport: recorder, startDelay: 3600)
+        await pusher.register(
+            LiveActivityRegistration(
+                token: "card", environment: "production", startedAt: t0, title: "t", deviceID: "phone"),
+            sessionID: "s", turnOpen: true)
+        await pusher.seen(sessionID: "s", now: at(5))
+        #expect(await pusher.card("s") != nil, "a turn still running keeps its card")
+        await pusher.endTurn(sessionID: "s", toolCount: 1, ending: .finished, now: at(30))
+        await pusher.seen(sessionID: "s", now: at(40))
+        await pusher.settled()
+        #expect(await pusher.card("s") == nil)
+        let last = try #require(await recorder.all().last)
+        let aps = try #require((try JSONSerialization.jsonObject(with: last.body) as? [String: Any])?["aps"] as? [String: Any])
+        #expect(aps["event"] as? String == "end")
     }
 
     @Test("Held notices survive a restart, and an unregistered phone's are dropped")

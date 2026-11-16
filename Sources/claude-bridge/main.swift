@@ -212,7 +212,7 @@ await store.devicePusher.setNewsCheck { id, kind, since in
     await store.stillNews(id, kind: kind, since: since)
 }
 registerDeskRoutes(
-    router, desks: desks, devices: store.devicePusher,
+    router, desks: desks, devices: store.devicePusher, cards: store.pusher,
     hasAuth: !password.isEmpty || tailnetGate != nil,
     waitMax: Double(env("BRIDGE_WAIT_MAX", "10800")) ?? 10800)
 startHeldSweep(devices: store.devicePusher)

@@ -111,10 +111,12 @@ final class DeskRegistry: @unchecked Sendable {
 
     /// Takes a report, trimmed to what a well-behaved desk ever sends. Returns false for one
     /// that names no desk.
+    /// Takes a report, trimmed to what a well-behaved desk ever sends, and answers the chats it
+    /// says were looked at; nil for one that names no desk.
     @discardableResult
-    func record(_ report: DeskReportBody, now: Date = Date()) -> Bool {
+    func record(_ report: DeskReportBody, now: Date = Date()) -> Set<String>? {
         let id = String(report.desk.prefix(Self.textLimit))
-        guard !id.isEmpty else { return false }
+        guard !id.isEmpty else { return nil }
         var report = report
         report.desk = id
         report.name = String(report.name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(Self.textLimit))
@@ -140,7 +142,7 @@ final class DeskRegistry: @unchecked Sendable {
             }
             prune(now: now)
         }
-        return true
+        return Set(looked)
     }
 
     /// Every desk still worth reading, idle as of `now`.
@@ -194,7 +196,7 @@ final class DeskRegistry: @unchecked Sendable {
 /// `waitMax` has passed so the caller simply asks again.
 func registerDeskRoutes(
     _ router: Router<BridgeRequestContext>, desks: DeskRegistry, devices: DevicePusher,
-    hasAuth: Bool, waitMax: TimeInterval
+    cards: LiveActivityPusher, hasAuth: Bool, waitMax: TimeInterval
 ) {
     router.post("presence") { request, _ in
         guard hasAuth else {
@@ -202,12 +204,18 @@ func registerDeskRoutes(
                 ["error": "desk reports require an authenticated bridge (BRIDGE_PASSWORD or a tailnet)"],
                 status: .forbidden)
         }
+        let now = Date()
         guard let body = try? await decodeBody(DeskReportBody.self, request, limit: 64 * 1024),
-            desks.record(body)
+            let looked = desks.record(body, now: now)
         else {
             return jsonResponse(["error": "bad request"], status: .badRequest)
         }
-        Task { await devices.releaseHeld() }
+        Task {
+            await devices.releaseHeld()
+            guard !looked.isEmpty else { return }
+            await devices.withdraw(looked, now: now)
+            for sessionID in looked { await cards.seen(sessionID: sessionID, now: now) }
+        }
         return jsonResponse(["ok": true])
     }
 

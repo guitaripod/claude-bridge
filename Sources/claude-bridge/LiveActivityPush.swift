@@ -688,6 +688,18 @@ actor LiveActivityPusher {
         push(card, event: "update", priority: "10", now: now, alerts: true)
     }
 
+    /// The conversation was read somewhere: a card that has settled is news nobody needs any
+    /// more, so it ends on every device at once. A card whose turn is still running stays.
+    func seen(sessionID: String, now: Date = Date()) {
+        guard transport != nil, let card = cards[sessionID], card.isSettled,
+            let ended = card.endedAt, ended <= now
+        else { return }
+        cards[sessionID] = nil
+        persist()
+        push(card, event: "end", priority: "5", now: now, dismissal: now)
+        log("card ended for \(sessionID): read elsewhere")
+    }
+
     /// The conversation has a better name than the card started with.
     func retitle(sessionID: String, title: String, now: Date = Date()) {
         guard transport != nil, !title.isEmpty, var card = cards[sessionID], card.title != title
