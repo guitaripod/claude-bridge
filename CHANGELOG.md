@@ -4,6 +4,11 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.33.0 — 2026-11-16
+
+- Notices the phone raises itself (opencode, Oh My Pi) follow you too: while you're at your computer the phone hands them to this bridge, which sends them through Apple's push once you leave, unless you opened the chat at the computer meanwhile.
+- A restart never lets a held notice out while you're still at your desk, a look at a chat is dated to when it happened, and a quiet phone's Live Activity ends without opening the island even when this bridge cannot start its cards.
+
 ## 1.32.0 — 2026-11-16
 
 - Your phone stays quiet while you're at your computer: a desktop Tailscode tells this bridge whether you're in front of it, and a phone that asked to be quiet there has its notices held, gets no new Live Activity and no island opening at the ending; once you've been away for the time it chose, or lock the screen, it gets every held notice you have not already read.
