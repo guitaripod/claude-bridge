@@ -342,6 +342,20 @@ struct ExpertGuardTests {
         #expect(run.output?.contains("hello") == true)
     }
 
+    @Test("A program runs in its folder with the environment it was given, and its exit code is read")
+    func environmentAndFolder() async throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let result = await CommandRunner.run(
+            "/bin/sh", ["-c", "pwd; echo \"$EXPERT_PROBE\"; exit 7"], directory: root.path, timeout: 30,
+            environment: ["EXPERT_PROBE": "seen"])
+        #expect(result.exitCode == 7)
+        #expect(result.output.contains("seen"))
+        #expect(result.output.contains(root.lastPathComponent))
+        let killed = await CommandRunner.run("/bin/sh", ["-c", "kill -9 $$"], directory: nil, timeout: 30)
+        #expect(killed.exitCode == 137)
+    }
+
     @Test("A command past its time is stopped and counted as failed")
     func timeout() async {
         let started = Date()

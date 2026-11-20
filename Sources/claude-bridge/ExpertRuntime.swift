@@ -37,59 +37,100 @@ enum CommandRunner {
     ) async -> CommandResult {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: executable)
-                process.arguments = arguments
-                if let directory {
-                    guard FileManager.default.fileExists(atPath: directory) else {
-                        continuation.resume(
-                            returning: CommandResult(
-                                exitCode: -1, output: "The folder \(directory) is not on this machine.", seconds: 0,
-                                timedOut: false, launched: false))
-                        return
-                    }
-                    process.currentDirectoryURL = URL(fileURLWithPath: directory)
-                }
-                var merged = ProcessInfo.processInfo.environment
-                for (key, value) in environment { merged[key] = value }
-                process.environment = merged
-                process.standardInput = FileHandle.nullDevice
-                let started = Date()
-                let capture = FileManager.default.temporaryDirectory
-                    .appendingPathComponent("bridge-run-\(UUID().uuidString).log")
-                defer { try? FileManager.default.removeItem(at: capture) }
-                do {
-                    try Spawning.serialized {
-                        FileManager.default.createFile(atPath: capture.path, contents: nil)
-                        let sink = try FileHandle(forWritingTo: capture)
-                        process.standardOutput = sink
-                        process.standardError = sink
-                        defer { try? sink.close() }
-                        try process.runAllowingBusyExecutable()
-                    }
-                } catch {
-                    continuation.resume(
-                        returning: CommandResult(
-                            exitCode: -1, output: error.localizedDescription, seconds: 0, timedOut: false,
-                            launched: false))
-                    return
-                }
-                let pid = process.processIdentifier
-                let timedOut = TimeoutFlag()
-                let killer = DispatchWorkItem {
-                    timedOut.set()
-                    ProcessTree.stop(pid)
-                }
-                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
-                process.waitUntilExit()
-                killer.cancel()
-                let data = (try? Data(contentsOf: capture)) ?? Data()
                 continuation.resume(
-                    returning: CommandResult(
-                        exitCode: process.terminationStatus,
-                        output: String(decoding: data, as: UTF8.self),
-                        seconds: Date().timeIntervalSince(started), timedOut: timedOut.value, launched: true))
+                    returning: runBlocking(
+                        executable, arguments, directory: directory, timeout: timeout, environment: environment))
             }
+        }
+    }
+
+    /// Spawns the command in a process group of its own, with stdin from `/dev/null`, stdout and
+    /// stderr into one file and no other descriptor of the bridge's, and waits on the command
+    /// itself. Foundation's `Process` learns of an exit through a descriptor a grandchild inherits
+    /// on Linux, so a command that left something running in the background was never seen to end;
+    /// a group lets the deadline stop everything the command started, and whatever it left behind
+    /// is stopped once it ends, so a guard never leaves processes on the machine.
+    private static func runBlocking(
+        _ executable: String, _ arguments: [String], directory: String?, timeout: TimeInterval,
+        environment: [String: String]
+    ) -> CommandResult {
+        if let directory, !FileManager.default.fileExists(atPath: directory) {
+            return CommandResult(
+                exitCode: -1, output: "The folder \(directory) is not on this machine.", seconds: 0, timedOut: false,
+                launched: false)
+        }
+        let capture = FileManager.default.temporaryDirectory.appendingPathComponent("bridge-run-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: capture) }
+        var merged = ProcessInfo.processInfo.environment
+        for (key, value) in environment { merged[key] = value }
+        let argv = ([executable] + arguments).map { strdup($0) } + [nil]
+        let envp = merged.map { strdup("\($0.key)=\($0.value)") } + [nil]
+        defer {
+            argv.forEach { free($0) }
+            envp.forEach { free($0) }
+        }
+        #if os(macOS)
+            var actions: posix_spawn_file_actions_t?
+            var attributes: posix_spawnattr_t?
+        #else
+            var actions = posix_spawn_file_actions_t()
+            var attributes = posix_spawnattr_t()
+        #endif
+        posix_spawn_file_actions_init(&actions)
+        posix_spawnattr_init(&attributes)
+        defer {
+            posix_spawn_file_actions_destroy(&actions)
+            posix_spawnattr_destroy(&attributes)
+        }
+        posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
+        posix_spawn_file_actions_addopen(&actions, 1, capture.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
+        posix_spawn_file_actions_adddup2(&actions, 1, 2)
+        if let directory { posix_spawn_file_actions_addchdir_np(&actions, directory) }
+        #if os(macOS)
+            posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT))
+        #else
+            posix_spawn_file_actions_addclosefrom_np(&actions, 3)
+            posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP))
+        #endif
+        posix_spawnattr_setpgroup(&attributes, 0)
+        var pid: pid_t = 0
+        let started = Date()
+        let spawned = Spawning.serialized { posix_spawn(&pid, executable, &actions, &attributes, argv, envp) }
+        guard spawned == 0 else {
+            return CommandResult(
+                exitCode: -1, output: String(cString: strerror(spawned)), seconds: 0, timedOut: false, launched: false)
+        }
+        let timedOut = TimeoutFlag()
+        let group = pid
+        let killer = DispatchWorkItem {
+            timedOut.set()
+            stopGroup(group)
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
+        var status: Int32 = 0
+        var reaped = waitpid(pid, &status, 0)
+        while reaped == -1, errno == EINTR { reaped = waitpid(pid, &status, 0) }
+        killer.cancel()
+        stopGroup(group)
+        let data = (try? Data(contentsOf: capture)) ?? Data()
+        return CommandResult(
+            exitCode: reaped == pid ? exitCode(status) : -1, output: String(decoding: data, as: UTF8.self),
+            seconds: Date().timeIntervalSince(started), timedOut: timedOut.value, launched: true)
+    }
+
+    /// The exit status `waitpid` reports, as a shell would: the code a command exited with, or 128
+    /// plus the signal that ended it.
+    static func exitCode(_ status: Int32) -> Int32 {
+        let signal = status & 0x7f
+        return signal == 0 ? (status >> 8) & 0xff : 128 + signal
+    }
+
+    /// SIGTERM to every process in the group, SIGKILL five seconds later for any still there.
+    private static func stopGroup(_ group: pid_t) {
+        guard kill(-group, 0) == 0 else { return }
+        kill(-group, SIGTERM)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
+            if kill(-group, 0) == 0 { kill(-group, SIGKILL) }
         }
     }
 
@@ -116,9 +157,8 @@ private final class TimeoutFlag: @unchecked Sendable {
     }
 }
 
-/// The machine's process table, read with `ps`: who started whom, so a command that overran is
-/// stopped with everything it started, and a lock is traced back to the conversation whose
-/// process tree holds it.
+/// The machine's process table, read with `ps`: who started whom, so a lock is traced back to the
+/// conversation whose process tree holds it.
 enum ProcessTree {
     static func parents() -> [Int32: Int32] {
         let ps = Process()
@@ -147,18 +187,6 @@ enum ProcessTree {
         return table
     }
 
-    static func descendants(of root: Int32, in table: [Int32: Int32]) -> [Int32] {
-        var children: [Int32: [Int32]] = [:]
-        for (pid, parent) in table { children[parent, default: []].append(pid) }
-        var found: [Int32] = []
-        var queue = children[root] ?? []
-        while let next = queue.popLast(), found.count < 4_000 {
-            found.append(next)
-            queue.append(contentsOf: children[next] ?? [])
-        }
-        return found
-    }
-
     /// `pid` and every process above it, nearest first.
     static func ancestors(of pid: Int32, in table: [Int32: Int32]) -> [Int32] {
         var chain: [Int32] = [pid]
@@ -168,16 +196,6 @@ enum ProcessTree {
             cursor = parent
         }
         return chain
-    }
-
-    /// SIGTERM to the process and everything under it, SIGKILL five seconds later for whatever
-    /// is still there.
-    static func stop(_ pid: Int32) {
-        let all = [pid] + descendants(of: pid, in: parents())
-        for member in all { kill(member, SIGTERM) }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 5) {
-            for member in all where kill(member, 0) == 0 { kill(member, SIGKILL) }
-        }
     }
 
     /// The processes that have `path` open — on macOS through `lsof`, on Linux by reading every
