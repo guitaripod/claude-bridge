@@ -469,26 +469,32 @@ actor ExpertStore {
         }
         let previous = readDebrief(sessionID)
         if let previous, previous.state != "failed", previous.state != "drafting",
-            previous.coveredTurns >= task.userTurns || previous.pending > 0
+            previous.coveredTurns >= task.userTurns
         {
             return previous
         }
+        let carried = previous?.state == "open" ? previous?.proposals.filter { $0.state == "pending" } ?? [] : []
         drafting.insert(sessionID)
         let record = Debrief(
             sessionID: sessionID, expertID: expert.id, at: now(), coveredTurns: task.userTurns, state: "drafting",
-            failure: nil, journal: nil, proposals: [])
+            failure: nil, journal: previous?.journal, proposals: carried)
         writeDebrief(record)
         changed()
         guard wait else {
-            Task { await self.draftDebrief(record, task: task, claudeID: claudeID, expert: expert) }
+            Task { await self.draftDebrief(record, carried: carried, previous: previous, task: task, claudeID: claudeID, expert: expert) }
             return record
         }
-        return await draftDebrief(record, task: task, claudeID: claudeID, expert: expert)
+        return await draftDebrief(record, carried: carried, previous: previous, task: task, claudeID: claudeID, expert: expert)
     }
 
-    private func draftDebrief(_ started: Debrief, task: ExpertTaskInfo, claudeID: String, expert: Expert) async
-        -> Debrief
-    {
+    /// Asks for the debrief and writes it. Proposals an earlier debrief of the same task still had
+    /// waiting are carried into this one, after the new ones and without repeating a title, so a
+    /// task that went on never loses what the person had not yet decided; if the new debrief
+    /// cannot be written, the earlier one stands as it was.
+    private func draftDebrief(
+        _ started: Debrief, carried: [Proposal], previous: Debrief?, task: ExpertTaskInfo, claudeID: String,
+        expert: Expert
+    ) async -> Debrief {
         var record = started
         let sessionID = started.sessionID
         let book = notebook(for: expert)
@@ -500,7 +506,15 @@ actor ExpertStore {
         if answer.answer == nil { answer = await ask(request) }
         drafting.remove(sessionID)
         guard let object = answer.answer else {
+            if let previous, !carried.isEmpty {
+                var kept = previous
+                kept.failure = answer.failure ?? "The debrief could not be read."
+                writeDebrief(kept)
+                changed()
+                return kept
+            }
             record.state = "failed"
+            record.proposals = []
             record.failure = answer.failure ?? "The debrief could not be read."
             writeDebrief(record)
             changed()
@@ -509,9 +523,10 @@ actor ExpertStore {
         let parsed = Self.readDebrief(
             object, sessionID: sessionID, at: now(), notes: Set(book.notes().map(\.id)),
             fallbackTitle: task.title.nilIfEmpty ?? "Task")
-        record.journal = parsed.journal
-        record.proposals = parsed.proposals
-        record.state = parsed.proposals.isEmpty ? "settled" : "open"
+        let fresh = Set(parsed.proposals.map { $0.title.lowercased() })
+        record.journal = parsed.journal ?? previous?.journal
+        record.proposals = parsed.proposals + carried.filter { !fresh.contains($0.title.lowercased()) }
+        record.state = record.proposals.isEmpty ? "settled" : "open"
         record.at = now()
         if let entry = parsed.journal { keepJournal(entry, expert: expert.id) }
         writeDebrief(record)
@@ -575,7 +590,7 @@ actor ExpertStore {
             guard !task.active, task.claudeSessionID != nil, task.userTurns > 0 else { return false }
             guard let record = readDebrief(task.sessionID) else { return true }
             if record.state == "drafting" { return !drafting.contains(task.sessionID) }
-            return record.pending == 0 && record.coveredTurns < task.userTurns
+            return record.coveredTurns < task.userTurns
         }
     }
 

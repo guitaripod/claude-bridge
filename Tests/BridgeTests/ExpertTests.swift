@@ -575,6 +575,53 @@ struct ExpertStoreTests {
         #expect(asked.value == 1)
     }
 
+    @Test("A task that went on is debriefed again, and what was still waiting is carried, not lost")
+    func wentOn() async throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = makeStore(root)
+        let failing = FlipCounter()
+        let experts = ExpertStore(
+            root: root.appendingPathComponent("experts"), store: sessions, claudePath: "/usr/bin/false",
+            now: { november },
+            ask: { _ in
+                if failing.value > 0 { return (nil, "Overloaded") }
+                return (
+                    [
+                        "journal": ["title": "Went on", "outcome": "More.", "measured": [], "commits": []],
+                        "proposals": [
+                            ["op": "add", "note": "", "title": "New fact", "summary": "s", "body": "b", "reason": "r"],
+                            ["op": "add", "note": "", "title": "Old fact", "summary": "s", "body": "b", "reason": "r"],
+                        ],
+                    ], nil
+                )
+            })
+        let made = try await experts.create(ExpertDraft(name: "iPadOS"))
+        let session = await task(sessions, expert: made.id, turns: 2)
+        let earlier = Debrief(
+            sessionID: session, expertID: made.id, at: november, coveredTurns: 1, state: "open", failure: nil,
+            journal: nil,
+            proposals: [
+                Proposal(id: "p-old", op: "add", note: nil, title: "Old fact", summary: "s", body: "b", reason: "r", state: "pending"),
+                Proposal(id: "p-kept", op: "add", note: nil, title: "Waiting fact", summary: "s", body: "b", reason: "r", state: "pending"),
+            ])
+        let folder = root.appendingPathComponent("experts").appendingPathComponent(made.id).appendingPathComponent("debriefs")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try AgentJSON.encoder.encode(earlier).write(to: folder.appendingPathComponent("\(session).json"))
+        let redone = try await experts.debrief(session)
+        #expect(redone.state == "open")
+        #expect(redone.coveredTurns == 2)
+        #expect(redone.proposals.map(\.title) == ["New fact", "Old fact", "Waiting fact"])
+        #expect(redone.proposals.contains { $0.id == "p-kept" })
+
+        try AgentJSON.encoder.encode(earlier).write(to: folder.appendingPathComponent("\(session).json"))
+        failing.increment()
+        let kept = try await experts.debrief(session)
+        #expect(kept.state == "open")
+        #expect(kept.proposals.map(\.id) == ["p-old", "p-kept"])
+        #expect(kept.failure == "Overloaded")
+    }
+
     @Test("A deleted expert's task keeps the brief it started with")
     func briefOutlivesTheExpert() async throws {
         let root = try scratch()

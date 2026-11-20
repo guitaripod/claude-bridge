@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.37.2 — 2026-11-20
+
+- A task you went on with after its debrief is debriefed again when you finish it, and the notebook changes you had not yet decided are carried into the new debrief instead of being lost or blocking it.
+
 ## 1.37.1 — 2026-11-20
 
 - Builds on the Linux release image: the spawn extensions an expert's commands use are found when the bridge runs, so 1.37.0, which never published, ships as this release.
