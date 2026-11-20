@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.37.0 — 2026-11-20
+
+- Experts: a machine now keeps standing roles you give work to. Each task is a fresh conversation that starts with the expert's brief — its charter, the skills it loads first, its notebook, its latest journal entries, the devices it works with as the machine just found them (connected, locked, or held by another task) and any guard that is failing — so nothing depends on one long chat surviving. Finishing a task, or starting the expert's next one, writes a journal entry and proposes notebook changes that you accept or skip in Tailscode; nothing is written until you do, and a retired note keeps its reason. A notebook can be a memory folder you already keep, and guards are commands that must keep passing, checked on their own clock. The next Tailscode release on every platform shows them.
+
 ## 1.36.0 — 2026-11-20
 
 - Claude is told that Tailscode now shows only the pictures it names: a screenshot it reads to check its own work stays out of your chat, and one it wants you to see it reads and names by its file. Takes effect in new chats and after a chat compacts.
