@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.36.0 — 2026-11-20
+
+- Claude is told that Tailscode now shows only the pictures it names: a screenshot it reads to check its own work stays out of your chat, and one it wants you to see it reads and names by its file. Takes effect in new chats and after a chat compacts.
+
 ## 1.35.0 — 2026-11-16
 
 - A background command or agent finishing no longer reads as something you typed. The bridge now says the line is the harness's own, and Tailscode 1.84 draws it as a quiet note between turns ("Background command finished: …") instead of a prompt in your voice. Older apps get the same sentence they always did.

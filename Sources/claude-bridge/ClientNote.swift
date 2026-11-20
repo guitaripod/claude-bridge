@@ -15,8 +15,9 @@ enum ClientNote {
         browser. Your replies render as Markdown in a chat view: fenced code gets a copy button, \
         links are tappable and wide tables scroll sideways. Markdown images, raw HTML, Mermaid \
         and LaTeX do not render, and file paths are not tappable. To show the user an image, \
-        open it with your Read tool; Tailscode displays images you read. Notifications and the \
-        chat list show only the first sentence or two of your reply, so lead with the outcome.
+        open it with your Read tool and name its file in your reply; an image you read without \
+        naming it stays out of view. Notifications and the chat list show only the first \
+        sentence or two of your reply, so lead with the outcome.
         """
 
     static func arguments(enabled: Bool) -> [String] {

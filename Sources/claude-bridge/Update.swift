@@ -12,7 +12,7 @@ import Foundation
 /// numbered heading of CHANGELOG.md (an `Unreleased` section above it does not count), and
 /// `VersionTests` fails the build of any release that forgot to move it.
 enum BridgeVersion {
-    static let fallback = "1.35.0"
+    static let fallback = "1.36.0"
 
     /// Whether the command line only asks which build this is. Answered before anything else
     /// starts, so a script can ask an installed binary what it is without a port being bound or a
