@@ -63,7 +63,15 @@ enum CommandRunner {
         defer { try? FileManager.default.removeItem(at: capture) }
         var merged = ProcessInfo.processInfo.environment
         for (key, value) in environment { merged[key] = value }
-        let argv = ([executable] + arguments).map { strdup($0) } + [nil]
+        var program = executable
+        var words = [executable] + arguments
+        #if !os(macOS)
+            if let directory, LinuxSpawn.addChdir == nil {
+                program = "/bin/sh"
+                words = ["/bin/sh", "-c", "cd -- \"$0\" && exec \"$@\"", directory] + words
+            }
+        #endif
+        let argv = words.map { strdup($0) } + [nil]
         let envp = merged.map { strdup("\($0.key)=\($0.value)") } + [nil]
         defer {
             argv.forEach { free($0) }
@@ -85,17 +93,18 @@ enum CommandRunner {
         posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
         posix_spawn_file_actions_addopen(&actions, 1, capture.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
         posix_spawn_file_actions_adddup2(&actions, 1, 2)
-        if let directory { posix_spawn_file_actions_addchdir_np(&actions, directory) }
         #if os(macOS)
+            if let directory { posix_spawn_file_actions_addchdir_np(&actions, directory) }
             posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_CLOEXEC_DEFAULT))
         #else
-            posix_spawn_file_actions_addclosefrom_np(&actions, 3)
+            if let directory, let addChdir = LinuxSpawn.addChdir { _ = addChdir(&actions, directory) }
+            if let closeFrom = LinuxSpawn.closeFrom { _ = closeFrom(&actions, 3) }
             posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP))
         #endif
         posix_spawnattr_setpgroup(&attributes, 0)
         var pid: pid_t = 0
         let started = Date()
-        let spawned = Spawning.serialized { posix_spawn(&pid, executable, &actions, &attributes, argv, envp) }
+        let spawned = Spawning.serialized { posix_spawn(&pid, program, &actions, &attributes, argv, envp) }
         guard spawned == 0 else {
             return CommandResult(
                 exitCode: -1, output: String(cString: strerror(spawned)), seconds: 0, timedOut: false, launched: false)
@@ -141,6 +150,26 @@ enum CommandRunner {
         return String(decoding: kept.utf8.suffix(bytes), as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
+
+#if !os(macOS)
+    /// glibc's spawn actions that change folder and close every other descriptor in the child,
+    /// found at run time: Swift's Glibc module shows them only where the headers were read with
+    /// GNU extensions on, and they are missing from a glibc older than 2.34. Without the first the
+    /// command is started through `sh -c 'cd …'`; without the second it inherits what the bridge
+    /// has open, as a Foundation `Process` child would.
+    enum LinuxSpawn {
+        typealias AddChdir = @convention(c) (UnsafeMutablePointer<posix_spawn_file_actions_t>, UnsafePointer<CChar>) -> Int32
+        typealias CloseFrom = @convention(c) (UnsafeMutablePointer<posix_spawn_file_actions_t>, Int32) -> Int32
+
+        static let addChdir: AddChdir? = symbol("posix_spawn_file_actions_addchdir_np")
+        static let closeFrom: CloseFrom? = symbol("posix_spawn_file_actions_addclosefrom_np")
+
+        private static func symbol<T>(_ name: String) -> T? {
+            guard let found = dlsym(UnsafeMutableRawPointer(bitPattern: 0), name) else { return nil }
+            return unsafeBitCast(found, to: T.self)
+        }
+    }
+#endif
 
 private final class TimeoutFlag: @unchecked Sendable {
     private let lock = NSLock()
