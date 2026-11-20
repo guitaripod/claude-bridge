@@ -24,6 +24,9 @@ actor ExpertStore {
     private let now: @Sendable () -> Date
     private var experts: [String: Expert] = [:]
     private var benchCache: [String: [BenchItem]] = [:]
+    /// Bumped whenever an expert's bench is redescribed, so a proof that began before the change
+    /// is thrown away instead of writing the old items back.
+    private var benchGeneration: [String: Int] = [:]
     private var guardRuns: [String: GuardBook] = [:]
     private var runningGuards: [String: Set<String>] = [:]
     private var drafting: Set<String> = []
@@ -123,16 +126,16 @@ actor ExpertStore {
     private func view(_ expert: Expert) async -> ExpertView {
         let tasks = await store.expertTasks(expert.id)
         var refs: [ExpertTaskRef] = []
+        var running: ExpertTaskRef?
         var pending = 0
         for task in tasks {
             let debrief = readDebrief(task.sessionID)
             pending += debrief?.pending ?? 0
-            if refs.count < Self.tasksShown {
-                refs.append(
-                    ExpertTaskRef(
-                        sessionID: task.sessionID, title: task.title, updatedAt: task.updatedAt, active: task.active,
-                        debrief: debrief?.state))
-            }
+            let ref = ExpertTaskRef(
+                sessionID: task.sessionID, title: task.title, updatedAt: task.updatedAt, active: task.active,
+                debrief: debrief?.state)
+            if refs.count < Self.tasksShown { refs.append(ref) }
+            if running == nil, task.active { running = ref }
         }
         let book = notebook(for: expert)
         let bench = benchCache[expert.id] ?? expert.bench.map(\.described)
@@ -148,7 +151,7 @@ actor ExpertStore {
             skills: expert.skills, notebookPath: expert.notebookPath, bench: bench, guards: guards,
             guardRule: expert.guardRule, guardNext: nextGuardRun(expert), timeZone: expert.timeZone,
             createdAt: expert.createdAt, updatedAt: expert.updatedAt, notebook: book.facts(now: now()),
-            journal: Array(journal.prefix(ExpertBrief.journalShown)), task: refs.first { $0.active }, tasks: refs,
+            journal: Array(journal.prefix(ExpertBrief.journalShown)), task: running, tasks: refs,
             pending: pending, briefTokens: ExpertBrief.tokens(brief), watches: await watchesFor?(expert.id) ?? [])
     }
 
@@ -188,8 +191,6 @@ actor ExpertStore {
                 notebookPath: draft.notebookPath, bench: draft.bench ?? [], guards: draft.guards ?? []),
             to: &expert)
         if let rule = expert.guardRule, let problem = rule.problem() { throw ExpertError.invalid(problem) }
-        experts[expert.id] = expert
-        try save(expert)
         let book = notebook(for: expert)
         try? FileManager.default.createDirectory(at: book.folder, withIntermediateDirectories: true)
         for note in draft.notes ?? [] where note.lasting != false {
@@ -197,6 +198,8 @@ actor ExpertStore {
                 title: note.title, summary: note.summary, body: note.body, type: note.type,
                 source: "tailscode-expert:\(expert.id):made", now: moment)
         }
+        experts[expert.id] = expert
+        try save(expert)
         changed()
         return expert
     }
@@ -229,6 +232,7 @@ actor ExpertStore {
         if let bench = patch.bench {
             let ids = Set(bench.map(\.id))
             benchCache[id] = benchCache[id]?.filter { ids.contains($0.id) }
+            benchGeneration[id, default: 0] += 1
         }
         expert.updatedAt = now()
         experts[id] = expert
@@ -358,6 +362,10 @@ actor ExpertStore {
         let session = await store.createExpertTask(
             expertID: id, title: request.title?.nilIfEmpty, directory: request.directory?.nilIfEmpty ?? expert.directory,
             model: request.model?.nilIfEmpty ?? expert.model, effort: request.effort?.nilIfEmpty ?? expert.effort)
+        guard experts[id] != nil else {
+            await store.delete(session.id)
+            throw ExpertError.unknown
+        }
         writeBrief(brief, expert: id, session: session.id)
         let outcome = await store.sendExpertTask(
             session.id, text: request.text, model: request.model?.nilIfEmpty ?? expert.model,
@@ -376,10 +384,23 @@ actor ExpertStore {
     func briefFor(session: String, expertID: String) async -> String? {
         let file = folder(expertID).appendingPathComponent("briefs").appendingPathComponent("\(session).md")
         if let text = try? String(contentsOf: file, encoding: .utf8) { return text }
-        guard let expert = experts[expertID] else { return nil }
+        guard let expert = experts[expertID] else { return deletedBrief(session: session, expertID: expertID) }
         let text = await brief(for: expert, prove: true)
         writeBrief(text, expert: expertID, session: session)
         return text
+    }
+
+    /// The brief a task of a deleted expert started with, from the folder the expert was set aside
+    /// in, so the task's later processes keep the brief its first one had.
+    private func deletedBrief(session: String, expertID: String) -> String? {
+        let gone = root.appendingPathComponent(".deleted")
+        let folders = ((try? FileManager.default.contentsOfDirectory(atPath: gone.path)) ?? [])
+            .filter { $0.hasPrefix("\(expertID)-") }.sorted().reversed()
+        for name in folders {
+            let file = gone.appendingPathComponent(name).appendingPathComponent("briefs").appendingPathComponent("\(session).md")
+            if let text = try? String(contentsOf: file, encoding: .utf8) { return text }
+        }
+        return nil
     }
 
     func preview(_ id: String) async throws -> ExpertBriefPreview {
@@ -399,6 +420,7 @@ actor ExpertStore {
     }
 
     private func writeBrief(_ text: String, expert: String, session: String) {
+        guard experts[expert] != nil else { return }
         let directory = folder(expert).appendingPathComponent("briefs")
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let file = directory.appendingPathComponent("\(session).md")
@@ -411,11 +433,13 @@ actor ExpertStore {
     @discardableResult
     func proveBench(_ id: String) async -> [BenchItem]? {
         guard let expert = experts[id] else { return nil }
+        let generation = benchGeneration[id] ?? 0
         let store = self.store
         let proven = await BenchProver.prove(expert.bench, now: now()) { pids in
             await store.sessionHolding(pids: pids)
         }
         guard experts[id] != nil else { return nil }
+        guard (benchGeneration[id] ?? 0) == generation else { return await proveBench(id) }
         let changedState = benchCache[id].map { old in
             zip(old, proven).contains { $0.state != $1.state || $0.holder != $1.holder } || old.count != proven.count
         } ?? true
@@ -434,7 +458,7 @@ actor ExpertStore {
         guard let task = await store.expertTask(sessionID), let expert = experts[task.expertID] else {
             throw ExpertError.unknownSession
         }
-        if let existing = readDebrief(sessionID), existing.state == "drafting" || drafting.contains(sessionID) {
+        if drafting.contains(sessionID), let existing = readDebrief(sessionID) {
             return existing
         }
         guard let claudeID = task.claudeSessionID else {
@@ -444,7 +468,9 @@ actor ExpertStore {
             throw ExpertError.busy("The task is still running. It can be finished once its turn ends.")
         }
         let previous = readDebrief(sessionID)
-        if let previous, previous.state != "failed", previous.coveredTurns >= task.userTurns {
+        if let previous, previous.state != "failed", previous.state != "drafting",
+            previous.coveredTurns >= task.userTurns || previous.pending > 0
+        {
             return previous
         }
         drafting.insert(sessionID)
@@ -480,16 +506,14 @@ actor ExpertStore {
             changed()
             return record
         }
-        let parsed = Self.readDebrief(object, sessionID: sessionID, at: now(), notes: Set(book.notes().map(\.id)))
+        let parsed = Self.readDebrief(
+            object, sessionID: sessionID, at: now(), notes: Set(book.notes().map(\.id)),
+            fallbackTitle: task.title.nilIfEmpty ?? "Task")
         record.journal = parsed.journal
         record.proposals = parsed.proposals
         record.state = parsed.proposals.isEmpty ? "settled" : "open"
         record.at = now()
-        if let entry = parsed.journal {
-            var journal = readJournal(expert.id).filter { $0.sessionID != sessionID }
-            journal.insert(entry, at: 0)
-            writeJournal(expert.id, journal)
-        }
+        if let entry = parsed.journal { keepJournal(entry, expert: expert.id) }
         writeDebrief(record)
         changed()
         return record
@@ -550,7 +574,8 @@ actor ExpertStore {
         await store.expertTasks(expertID).filter { task in
             guard !task.active, task.claudeSessionID != nil, task.userTurns > 0 else { return false }
             guard let record = readDebrief(task.sessionID) else { return true }
-            return record.state != "drafting" && record.coveredTurns < task.userTurns
+            if record.state == "drafting" { return !drafting.contains(task.sessionID) }
+            return record.pending == 0 && record.coveredTurns < task.userTurns
         }
     }
 
@@ -589,11 +614,12 @@ actor ExpertStore {
             """
     }
 
-    static func readDebrief(_ object: [String: Any], sessionID: String, at: Date, notes: Set<String>)
-        -> (journal: JournalEntry?, proposals: [Proposal])
-    {
+    static func readDebrief(
+        _ object: [String: Any], sessionID: String, at: Date, notes: Set<String>, fallbackTitle: String = "Task"
+    ) -> (journal: JournalEntry?, proposals: [Proposal]) {
         var journal: JournalEntry?
-        if let entry = object["journal"] as? [String: Any], let title = (entry["title"] as? String)?.nilIfEmpty {
+        if let entry = object["journal"] as? [String: Any] {
+            let title = (entry["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? fallbackTitle
             journal = JournalEntry(
                 id: UUID().uuidString, sessionID: sessionID, title: String(title.prefix(80)), at: at,
                 outcome: String(((entry["outcome"] as? String) ?? "").prefix(600)),
@@ -833,16 +859,30 @@ actor ExpertStore {
         }.sorted { $0.at > $1.at }
     }
 
-    private func writeJournal(_ id: String, _ entries: [JournalEntry]) {
+    /// Writes a task's journal entry in place of any earlier one for the same task. Lines are kept
+    /// as they were written, so one this build cannot read — a newer bridge's, or one edited by
+    /// hand — survives instead of being dropped by the rewrite.
+    private func keepJournal(_ entry: JournalEntry, expert id: String) {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let lines = entries.prefix(Self.journalKept).reversed().compactMap { entry in
-            (try? encoder.encode(entry)).map { String(decoding: $0, as: UTF8.self) }
+        guard let encoded = try? encoder.encode(entry) else { return }
+        let url = folder(id).appendingPathComponent("journal.jsonl")
+        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        var lines = existing.split(separator: "\n", omittingEmptySubsequences: true).map(String.init).filter { line in
+            guard let decoded = try? AgentJSON.decoder.decode(JournalEntry.self, from: Data(line.utf8)) else { return true }
+            return decoded.sessionID == nil || decoded.sessionID != entry.sessionID
+        }
+        lines.append(String(decoding: encoded, as: UTF8.self))
+        let readable = lines.indices.filter {
+            (try? AgentJSON.decoder.decode(JournalEntry.self, from: Data(lines[$0].utf8))) != nil
+        }
+        if readable.count > Self.journalKept {
+            let dropped = Set(readable.prefix(readable.count - Self.journalKept))
+            lines = lines.indices.filter { !dropped.contains($0) }.map { lines[$0] }
         }
         try? FileManager.default.createDirectory(at: folder(id), withIntermediateDirectories: true)
-        try? Data((lines.joined(separator: "\n") + "\n").utf8)
-            .write(to: folder(id).appendingPathComponent("journal.jsonl"), options: .atomic)
+        try? Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
     }
 
     private func debriefURL(_ sessionID: String, expert: String) -> URL {

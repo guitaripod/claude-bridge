@@ -14,7 +14,9 @@ struct CommandResult: Sendable {
 }
 
 /// Runs a command to its end, with stdout and stderr in one stream and a deadline after which the
-/// command and everything it started are stopped.
+/// command and everything it started are stopped. The stream goes to a file rather than a pipe,
+/// so a background process the command left behind holding its output cannot keep the run from
+/// ever ending.
 enum CommandRunner {
     /// The person's login shell, so a guard finds the tools their terminal finds.
     static var loginShell: String {
@@ -38,7 +40,14 @@ enum CommandRunner {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: executable)
                 process.arguments = arguments
-                if let directory, FileManager.default.fileExists(atPath: directory) {
+                if let directory {
+                    guard FileManager.default.fileExists(atPath: directory) else {
+                        continuation.resume(
+                            returning: CommandResult(
+                                exitCode: -1, output: "The folder \(directory) is not on this machine.", seconds: 0,
+                                timedOut: false, launched: false))
+                        return
+                    }
                     process.currentDirectoryURL = URL(fileURLWithPath: directory)
                 }
                 var merged = ProcessInfo.processInfo.environment
@@ -46,14 +55,17 @@ enum CommandRunner {
                 process.environment = merged
                 process.standardInput = FileHandle.nullDevice
                 let started = Date()
-                let output: Pipe
+                let capture = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("bridge-run-\(UUID().uuidString).log")
+                defer { try? FileManager.default.removeItem(at: capture) }
                 do {
-                    output = try Spawning.serialized {
-                        let pipe = Pipe()
-                        process.standardOutput = pipe
-                        process.standardError = pipe
+                    try Spawning.serialized {
+                        FileManager.default.createFile(atPath: capture.path, contents: nil)
+                        let sink = try FileHandle(forWritingTo: capture)
+                        process.standardOutput = sink
+                        process.standardError = sink
+                        defer { try? sink.close() }
                         try process.runAllowingBusyExecutable()
-                        return pipe
                     }
                 } catch {
                     continuation.resume(
@@ -69,9 +81,9 @@ enum CommandRunner {
                     ProcessTree.stop(pid)
                 }
                 DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
-                let data = output.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
                 killer.cancel()
+                let data = (try? Data(contentsOf: capture)) ?? Data()
                 continuation.resume(
                     returning: CommandResult(
                         exitCode: process.terminationStatus,
@@ -220,6 +232,7 @@ enum BenchProver {
         var state: String
         var transport: String?
         var coreDeviceID: String?
+        var udid: String? = nil
     }
 
     static func prove(
@@ -277,6 +290,12 @@ enum BenchProver {
             if device.state == "ready", let id = device.coreDeviceID, await isLocked(id) == true {
                 item.state = "locked"
             }
+        #else
+            if device.state == "ready", let udid = device.udid, let locked = await isLocked(udid: udid) {
+                if locked { item.state = "locked" }
+            } else if device.state == "ready" {
+                item.state = "unknown"
+            }
         #endif
     }
 
@@ -296,7 +315,11 @@ enum BenchProver {
             item.state = "unknown"
             return
         }
-        item.state = PortProbe.open(host: item.host ?? "127.0.0.1", port: port, timeout: 2) ? "ready" : "absent"
+        switch PortProbe.open(host: item.host ?? "127.0.0.1", port: port, timeout: 2) {
+        case true?: item.state = "ready"
+        case false?: item.state = "absent"
+        case nil: item.state = "unknown"
+        }
     }
 
     /// The Apple devices this machine can reach: devicectl on a Mac, pymobiledevice3 elsewhere.
@@ -364,7 +387,7 @@ enum BenchProver {
                 model: device["ProductType"] as? String, platform: nil,
                 osVersion: device["ProductVersion"] as? String, state: "ready",
                 transport: connection == "USB" ? "usb" : connection == "Network" ? "network" : nil,
-                coreDeviceID: nil)
+                coreDeviceID: nil, udid: udid)
         }
     }
 
@@ -385,6 +408,20 @@ enum BenchProver {
         }
     #endif
 
+    #if !os(macOS)
+        /// Whether a device on USB is locked right now, from its lockdown record; nil when it did
+        /// not answer, so an unproven lock is never read as unlocked.
+        private static func isLocked(udid: String) async -> Bool? {
+            guard let tool = pymobiledevice3() else { return nil }
+            let result = await CommandRunner.run(tool, ["lockdown", "info", "--udid", udid], directory: nil, timeout: 12)
+            guard result.exitCode == 0,
+                let start = result.output.firstIndex(of: "{"),
+                let object = try? JSONSerialization.jsonObject(with: Data(result.output[start...].utf8)) as? [String: Any]
+            else { return nil }
+            return object["PasswordProtected"] as? Bool
+        }
+    #endif
+
     static func pymobiledevice3() -> String? {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let candidates =
@@ -394,42 +431,88 @@ enum BenchProver {
     }
 }
 
-/// Whether something is listening on a TCP port, asked with a plain connect and a deadline.
+/// Whether something is listening on a TCP port, asked with a plain connect, the name resolved
+/// and every address tried inside one deadline. Nil when the name could not be resolved in time,
+/// which is not knowing rather than nothing listening.
 enum PortProbe {
-    static func open(host: String, port: Int, timeout: TimeInterval) -> Bool {
-        var hints = addrinfo()
-        hints.ai_family = AF_UNSPEC
-        #if os(macOS)
-            hints.ai_socktype = SOCK_STREAM
-        #else
-            hints.ai_socktype = Int32(SOCK_STREAM.rawValue)
-        #endif
-        var info: UnsafeMutablePointer<addrinfo>?
-        guard getaddrinfo(host, String(port), &hints, &info) == 0, let first = info else { return false }
-        defer { freeaddrinfo(info) }
-        var cursor: UnsafeMutablePointer<addrinfo>? = first
-        while let entry = cursor {
-            let fd = socket(entry.pointee.ai_family, entry.pointee.ai_socktype, entry.pointee.ai_protocol)
-            if fd >= 0 {
-                let flags = fcntl(fd, F_GETFL, 0)
-                _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
-                let result = connect(fd, entry.pointee.ai_addr, entry.pointee.ai_addrlen)
-                var reached = result == 0
-                if !reached, errno == EINPROGRESS {
-                    var poller = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
-                    if poll(&poller, 1, Int32(timeout * 1000)) == 1 {
-                        var error: Int32 = 0
-                        var length = socklen_t(MemoryLayout<Int32>.size)
-                        getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length)
-                        reached = error == 0
-                    }
-                }
-                close(fd)
-                if reached { return true }
-            }
-            cursor = entry.pointee.ai_next
+    static func open(host: String, port: Int, timeout: TimeInterval) -> Bool? {
+        let deadline = Date().addingTimeInterval(timeout)
+        guard let addresses = resolve(host: host, port: port, timeout: timeout) else { return nil }
+        for address in addresses {
+            let left = deadline.timeIntervalSinceNow
+            guard left > 0 else { return false }
+            if connects(address, timeout: left) { return true }
         }
         return false
+    }
+
+    private struct Address {
+        var family: Int32
+        var type: Int32
+        var proto: Int32
+        var bytes: [UInt8]
+    }
+
+    private final class Resolution: @unchecked Sendable {
+        let lock = NSLock()
+        var addresses: [Address]?
+    }
+
+    private static func resolve(host: String, port: Int, timeout: TimeInterval) -> [Address]? {
+        let box = Resolution()
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            var hints = addrinfo()
+            hints.ai_family = AF_UNSPEC
+            #if os(macOS)
+                hints.ai_socktype = SOCK_STREAM
+            #else
+                hints.ai_socktype = Int32(SOCK_STREAM.rawValue)
+            #endif
+            var info: UnsafeMutablePointer<addrinfo>?
+            var found: [Address] = []
+            if getaddrinfo(host, String(port), &hints, &info) == 0 {
+                var cursor = info
+                while let entry = cursor {
+                    if let raw = entry.pointee.ai_addr {
+                        let bytes = Array(UnsafeRawBufferPointer(start: raw, count: Int(entry.pointee.ai_addrlen)))
+                        found.append(
+                            Address(
+                                family: entry.pointee.ai_family, type: entry.pointee.ai_socktype,
+                                proto: entry.pointee.ai_protocol, bytes: bytes))
+                    }
+                    cursor = entry.pointee.ai_next
+                }
+                freeaddrinfo(info)
+            }
+            box.lock.lock()
+            box.addresses = found
+            box.lock.unlock()
+            done.signal()
+        }
+        guard done.wait(timeout: .now() + timeout) == .success else { return nil }
+        box.lock.lock()
+        defer { box.lock.unlock() }
+        return box.addresses
+    }
+
+    private static func connects(_ address: Address, timeout: TimeInterval) -> Bool {
+        let fd = socket(address.family, address.type, address.proto)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        let result = address.bytes.withUnsafeBytes { raw in
+            connect(fd, raw.baseAddress!.assumingMemoryBound(to: sockaddr.self), socklen_t(address.bytes.count))
+        }
+        if result == 0 { return true }
+        guard errno == EINPROGRESS else { return false }
+        var poller = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
+        guard poll(&poller, 1, Int32(max(1, timeout * 1000))) == 1 else { return false }
+        var error: Int32 = 0
+        var length = socklen_t(MemoryLayout<Int32>.size)
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length)
+        return error == 0
     }
 }
 
@@ -479,7 +562,8 @@ enum GuardRunner {
         guard let match = expression.matches(in: output, range: range).last else { return nil }
         let group = match.numberOfRanges > 1 ? match.range(at: 1) : match.range
         guard let swiftRange = Range(group, in: output) else { return nil }
-        return Double(output[swiftRange].replacingOccurrences(of: ",", with: "."))
+        guard let number = Double(output[swiftRange]), number.isFinite else { return nil }
+        return number
     }
 }
 

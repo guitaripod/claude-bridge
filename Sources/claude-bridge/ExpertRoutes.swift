@@ -93,7 +93,8 @@ func registerExpertRoutes(_ router: Router<BridgeRequestContext>, experts: Exper
 
     router.get("experts/:id/notebook/:note") { _, context in
         do {
-            guard let note = try await experts.note(id(context), context.parameters.get("note") ?? "") else {
+            let raw = context.parameters.get("note") ?? ""
+            guard let note = try await experts.note(id(context), raw.removingPercentEncoding ?? raw) else {
                 return jsonResponse(["error": "There is no such note."], status: .notFound)
             }
             return jsonResponse(note)

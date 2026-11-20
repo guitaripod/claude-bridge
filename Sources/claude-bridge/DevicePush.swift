@@ -309,6 +309,32 @@ actor DevicePusher {
             collapseID: collapseID, label: "alert", to: loud, about: sessionID)
     }
 
+    /// A guard an expert keeps started failing: news, since nothing else will say so until somebody
+    /// looks. Sent to every device that hears failures, except one whose person is at a desk.
+    func pushGuardFlip(expertID: String, expertName: String, guardName: String) async {
+        guard let client, !devices.isEmpty else { return }
+        let thread = "expert:\(expertID)"
+        let targets = devices.values.filter {
+            ($0.rules ?? .standard).admits(failed: true, length: 0, sessionID: thread)
+        }
+        let now = Date()
+        let loud = targets.filter { !Self.isQuiet($0, desks: desks, now: now) }
+        guard !loud.isEmpty else { return }
+        let payload: [String: Any] = [
+            "aps": [
+                "alert": ["title": expertName, "body": "Guard failing: \(guardName)"],
+                "sound": "default",
+                "thread-id": thread,
+                "interruption-level": "active",
+            ],
+            "expertID": expertID,
+            "guard": guardName,
+        ]
+        await fanOut(
+            payload: payload, topic: client.bundleTopic, pushType: "alert", priority: "10",
+            collapseID: Self.truncated("guard:\(expertID):\(guardName)", toBytes: 64), label: "guard", to: loud)
+    }
+
     /// The chats were read, or looked at on a desk: every device still showing an alert about
     /// one of them is told, with one silent push naming them all, so it takes the alert down.
     /// An alert sent after `now` is about news the look did not see, and stays.

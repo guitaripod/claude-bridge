@@ -62,6 +62,7 @@ struct Notebook: Sendable {
     private func read(_ url: URL, titles: [String: String], withBody: Bool, retired: Bool, now: Date) -> Note? {
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
         let parsed = FrontMatter(text)
+        guard parsed.hasFence else { return nil }
         let id = url.lastPathComponent
         let modified = (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
         let written = parsed.date("written") ?? parsed.date("modified") ?? modified
@@ -93,12 +94,12 @@ struct Notebook: Sendable {
     }
 
     static func indexLink(_ line: String) -> (title: String, file: String)? {
-        guard let open = line.firstIndex(of: "["), let close = line[open...].firstIndex(of: "]"),
-            line.index(after: close) < line.endIndex, line[line.index(after: close)] == "(",
-            let end = line[close...].firstIndex(of: ")")
+        guard let open = line.firstIndex(of: "["),
+            let separator = line.range(of: "](", range: open..<line.endIndex),
+            let end = line[separator.upperBound...].firstIndex(of: ")")
         else { return nil }
-        let title = String(line[line.index(after: open)..<close])
-        let file = String(line[line.index(close, offsetBy: 2)..<end])
+        let title = String(line[line.index(after: open)..<separator.lowerBound])
+        let file = String(line[separator.upperBound..<end])
         guard file.hasSuffix(".md"), !file.contains("/") else { return nil }
         return (title, file)
     }
@@ -137,6 +138,7 @@ struct Notebook: Sendable {
             throw ExpertError.invalid("The note \(name) is not in the notebook any more.")
         }
         var parsed = FrontMatter(text)
+        guard parsed.hasFence else { throw ExpertError.invalid("\(name) has no front matter, so it is not a note.") }
         parsed.set("description", FrontMatter.quoted(summary))
         parsed.setMetadata("confirmed", FrontMatter.day(now))
         parsed.setMetadata("source", FrontMatter.quoted(source))
@@ -153,6 +155,7 @@ struct Notebook: Sendable {
             throw ExpertError.invalid("The note \(name) is not in the notebook any more.")
         }
         var parsed = FrontMatter(text)
+        guard parsed.hasFence else { throw ExpertError.invalid("\(name) has no front matter, so it is not a note.") }
         parsed.setMetadata("retired", FrontMatter.day(now))
         parsed.setMetadata("reason", FrontMatter.quoted(reason))
         try FileManager.default.createDirectory(at: retiredURL, withIntermediateDirectories: true)
@@ -244,7 +247,8 @@ struct Notebook: Sendable {
     }
 
     private static func flat(_ text: String) -> String {
-        text.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespaces)
+        text.replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "](", with: "] (")
+            .trimmingCharacters(in: .whitespaces)
     }
 }
 
@@ -298,6 +302,7 @@ struct FrontMatter: Sendable {
     mutating func set(_ key: String, _ value: String) {
         if let index = lines.firstIndex(where: { $0.hasPrefix("\(key):") }) {
             lines[index] = "\(key): \(value)"
+            dropContinuation(after: index, indent: 0)
         } else if let metadata = lines.firstIndex(where: { $0.hasPrefix("metadata:") }) {
             lines.insert("\(key): \(value)", at: metadata)
         } else {
@@ -315,11 +320,25 @@ struct FrontMatter: Sendable {
         while index < lines.count, lines[index].hasPrefix(" ") {
             if lines[index].trimmingCharacters(in: .whitespaces).hasPrefix("\(key):") {
                 lines[index] = "  \(key): \(value)"
+                dropContinuation(after: index, indent: 2)
                 return
             }
             index += 1
         }
         lines.insert("  \(key): \(value)", at: index)
+    }
+
+    /// Removes the lines a replaced value continued on — a folded or literal block, or a list —
+    /// which sit deeper than the key itself, so a rewrite never leaves an old value hanging.
+    private mutating func dropContinuation(after index: Int, indent: Int) {
+        var next = index + 1
+        while next < lines.count {
+            let line = lines[next]
+            let leading = line.prefix { $0 == " " }.count
+            guard !line.trimmingCharacters(in: .whitespaces).isEmpty, leading > indent else { break }
+            lines.remove(at: next)
+        }
+        _ = next
     }
 
     var rendered: String {

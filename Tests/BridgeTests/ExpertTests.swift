@@ -92,6 +92,37 @@ struct NotebookTests {
         #expect(book.note(again)?.retired != nil)
     }
 
+    @Test("A title with brackets keeps its index line readable, and a file without front matter is no note")
+    func bracketsAndPlainFiles() throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let book = Notebook(folder: root, adopted: true)
+        try "# Project instructions\n\nKeep this.".write(
+            to: root.appendingPathComponent("CLAUDE.md"), atomically: true, encoding: .utf8)
+        let name = try book.add(
+            title: "Flaccy [iOS 27] layout", summary: "s", body: "b", type: nil, source: "s", now: november)
+        #expect(book.indexTitles()[name] == "Flaccy [iOS 27] layout")
+        try book.change(name, title: "Flaccy [iOS 27] layouts", summary: "t", body: "c", source: "s", now: november)
+        let index = try String(contentsOf: root.appendingPathComponent("MEMORY.md"), encoding: .utf8)
+        #expect(index.components(separatedBy: name).count == 2)
+        #expect(book.notes(now: november).map(\.id) == [name])
+        #expect(throws: ExpertError.self) {
+            try book.change("CLAUDE.md", title: "x", summary: "y", body: "z", source: "s", now: november)
+        }
+        #expect(try String(contentsOf: root.appendingPathComponent("CLAUDE.md"), encoding: .utf8).contains("Keep this."))
+    }
+
+    @Test("Rewriting a folded description leaves no old continuation lines behind")
+    func foldedDescription() {
+        var parsed = FrontMatter("---\nname: n\ndescription: >-\n  first line\n  second line\nmetadata:\n  type: user\n  note: >\n    folded\n  modified: x\n---\n\nbody")
+        parsed.set("description", FrontMatter.quoted("new"))
+        parsed.setMetadata("note", "plain")
+        #expect(parsed.rendered.contains("description: \"new\"\nmetadata:"))
+        #expect(!parsed.rendered.contains("first line"))
+        #expect(parsed.rendered.contains("  note: plain\n  modified: x"))
+        #expect(parsed.value("type") == "user")
+    }
+
     @Test("A note id never reaches outside the notebook")
     func refusesPathsOutside() {
         #expect(Notebook.safeName("../secrets") == nil)
@@ -274,6 +305,34 @@ struct ExpertGuardTests {
         #expect(timeout.failure == "timeout")
     }
 
+    @Test("A number that is not finite, or written with a thousands separator, is not a measurement")
+    func strangeNumbers() {
+        let item = GuardItem(
+            id: "g", name: "Throughput", command: "b",
+            metric: GuardMetric(pattern: #"value: (\S+) ms"#, atMost: 100, atLeast: nil, unit: "ms"))
+        #expect(GuardRunner.verdict(item, result("value: nan ms"), at: november).failure == "missing")
+        #expect(GuardRunner.verdict(item, result("value: inf ms"), at: november).failure == "missing")
+        let comma = GuardRunner.verdict(item, result("value: 1,234 ms"), at: november)
+        #expect(!comma.passed && comma.failure == "missing")
+    }
+
+    @Test("A guard whose folder is gone fails saying so instead of running somewhere else")
+    func missingFolder() async {
+        let run = await GuardRunner.run(
+            GuardItem(id: "g", name: "Pwd", command: "pwd", directory: "/no/such/folder"), fallbackDirectory: nil)
+        #expect(!run.passed)
+        #expect(run.output?.contains("/no/such/folder") == true)
+    }
+
+    @Test("A command that leaves a background process holding its output still ends")
+    func backgroundHolder() async {
+        let started = Date()
+        let result = await CommandRunner.shell("(sleep 20 &) ; echo done", directory: nil, timeout: 30)
+        #expect(result.exitCode == 0)
+        #expect(result.output.contains("done"))
+        #expect(Date().timeIntervalSince(started) < 10)
+    }
+
     @Test("A real command runs in the person's shell and its exit decides the guard")
     func shell() async {
         let item = GuardItem(id: "g", name: "Echo", command: "echo hello && exit 3")
@@ -347,7 +406,7 @@ struct ExpertGuardTests {
 
     @Test("A port probe tells a listening port from a closed one")
     func ports() {
-        #expect(!PortProbe.open(host: "127.0.0.1", port: 1, timeout: 1))
+        #expect(PortProbe.open(host: "127.0.0.1", port: 1, timeout: 1) == false)
     }
 }
 
@@ -465,6 +524,53 @@ struct ExpertStoreTests {
         await #expect(throws: ExpertError.self) {
             try await experts.decide(session, DebriefDecision(accepted: [], skipped: nil, edits: nil))
         }
+    }
+
+    @Test("A debrief a restart cut off is written again, with the task's title when the answer gives none")
+    func interruptedAndContinued() async throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let sessions = makeStore(root)
+        let asked = FlipCounter()
+        let answer: @Sendable (ExpertAsk.Request) async -> (answer: [String: Any]?, failure: String?) = { _ in
+            asked.increment()
+            return (
+                [
+                    "journal": ["title": "", "outcome": "Done.", "measured": [], "commits": []],
+                    "proposals": [["op": "add", "note": "", "title": "Keep", "summary": "s", "body": "b", "reason": "r"]],
+                ], nil
+            )
+        }
+        let experts = ExpertStore(
+            root: root.appendingPathComponent("experts"), store: sessions, claudePath: "/usr/bin/false",
+            now: { november }, ask: answer)
+        let made = try await experts.create(ExpertDraft(name: "iPadOS"))
+        let session = await task(sessions, expert: made.id, turns: 2)
+        let stale = Debrief(
+            sessionID: session, expertID: made.id, at: november, coveredTurns: 2, state: "drafting", failure: nil,
+            journal: nil, proposals: [])
+        let folder = root.appendingPathComponent("experts").appendingPathComponent(made.id).appendingPathComponent("debriefs")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try AgentJSON.encoder.encode(stale).write(to: folder.appendingPathComponent("\(session).json"))
+        let redone = try await experts.debrief(session)
+        #expect(redone.state == "open")
+        #expect(redone.journal?.title == "Unrager posts")
+        #expect(asked.value == 1)
+        let again = try await experts.debrief(session)
+        #expect(again.proposals.map(\.id) == redone.proposals.map(\.id))
+        #expect(asked.value == 1)
+    }
+
+    @Test("A deleted expert's task keeps the brief it started with")
+    func briefOutlivesTheExpert() async throws {
+        let root = try scratch()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let experts = ExpertStore(
+            root: root.appendingPathComponent("experts"), store: makeStore(root), claudePath: "/usr/bin/false")
+        let made = try await experts.create(ExpertDraft(name: "iPadOS", charter: "Kept charter."))
+        let first = await experts.briefFor(session: "s1", expertID: made.id)
+        #expect(await experts.delete(made.id))
+        #expect(await experts.briefFor(session: "s1", expertID: made.id) == first)
     }
 
     @Test("A debrief that cannot be read says so and can be asked again")

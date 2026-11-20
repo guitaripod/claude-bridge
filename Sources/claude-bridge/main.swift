@@ -203,6 +203,9 @@ registerMachineRoutes(router, agents: agentService, scheduler: scheduler)
 let expertStore = ExpertStore(
     root: stateDirectory.appendingPathComponent("experts"), store: store, claudePath: claudePath)
 await expertStore.observe { Task { await hub.publish(.machine(topic: "experts")) } }
+await expertStore.observeGuardFlips { expert, item, _ in
+    await store.devicePusher.pushGuardFlip(expertID: expert.id, expertName: expert.name, guardName: item.name)
+}
 await store.observeTurnEnds { id, note in
     await scheduler.turnEnded(id, note)
     await expertStore.turnEnded(id)
