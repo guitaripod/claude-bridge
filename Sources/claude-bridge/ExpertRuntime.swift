@@ -459,32 +459,11 @@ enum PortProbe {
     }
 
     private static func resolve(host: String, port: Int, timeout: TimeInterval) -> [Address]? {
+        if let literal = lookup(host: host, port: port, numericOnly: true), !literal.isEmpty { return literal }
         let box = Resolution()
         let done = DispatchSemaphore(value: 0)
         DispatchQueue.global(qos: .utility).async {
-            var hints = addrinfo()
-            hints.ai_family = AF_UNSPEC
-            #if os(macOS)
-                hints.ai_socktype = SOCK_STREAM
-            #else
-                hints.ai_socktype = Int32(SOCK_STREAM.rawValue)
-            #endif
-            var info: UnsafeMutablePointer<addrinfo>?
-            var found: [Address] = []
-            if getaddrinfo(host, String(port), &hints, &info) == 0 {
-                var cursor = info
-                while let entry = cursor {
-                    if let raw = entry.pointee.ai_addr {
-                        let bytes = Array(UnsafeRawBufferPointer(start: raw, count: Int(entry.pointee.ai_addrlen)))
-                        found.append(
-                            Address(
-                                family: entry.pointee.ai_family, type: entry.pointee.ai_socktype,
-                                proto: entry.pointee.ai_protocol, bytes: bytes))
-                    }
-                    cursor = entry.pointee.ai_next
-                }
-                freeaddrinfo(info)
-            }
+            let found = lookup(host: host, port: port, numericOnly: false) ?? []
             box.lock.lock()
             box.addresses = found
             box.lock.unlock()
@@ -494,6 +473,35 @@ enum PortProbe {
         box.lock.lock()
         defer { box.lock.unlock() }
         return box.addresses
+    }
+
+    /// The addresses `host` names. With `numericOnly` only an address written out answers, at once
+    /// and without asking a resolver.
+    private static func lookup(host: String, port: Int, numericOnly: Bool) -> [Address]? {
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        hints.ai_flags = numericOnly ? AI_NUMERICHOST : 0
+        #if os(macOS)
+            hints.ai_socktype = SOCK_STREAM
+        #else
+            hints.ai_socktype = Int32(SOCK_STREAM.rawValue)
+        #endif
+        var info: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, String(port), &hints, &info) == 0 else { return nil }
+        defer { freeaddrinfo(info) }
+        var found: [Address] = []
+        var cursor = info
+        while let entry = cursor {
+            if let raw = entry.pointee.ai_addr {
+                let bytes = Array(UnsafeRawBufferPointer(start: raw, count: Int(entry.pointee.ai_addrlen)))
+                found.append(
+                    Address(
+                        family: entry.pointee.ai_family, type: entry.pointee.ai_socktype,
+                        proto: entry.pointee.ai_protocol, bytes: bytes))
+            }
+            cursor = entry.pointee.ai_next
+        }
+        return found
     }
 
     private static func connects(_ address: Address, timeout: TimeInterval) -> Bool {

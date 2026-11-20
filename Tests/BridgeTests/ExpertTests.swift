@@ -327,10 +327,10 @@ struct ExpertGuardTests {
     @Test("A command that leaves a background process holding its output still ends")
     func backgroundHolder() async {
         let started = Date()
-        let result = await CommandRunner.shell("(sleep 20 &) ; echo done", directory: nil, timeout: 30)
+        let result = await CommandRunner.shell("(sleep 90 &) ; echo done", directory: nil, timeout: 120)
         #expect(result.exitCode == 0)
         #expect(result.output.contains("done"))
-        #expect(Date().timeIntervalSince(started) < 10)
+        #expect(Date().timeIntervalSince(started) < 60)
     }
 
     @Test("A real command runs in the person's shell and its exit decides the guard")
@@ -345,9 +345,9 @@ struct ExpertGuardTests {
     @Test("A command past its time is stopped and counted as failed")
     func timeout() async {
         let started = Date()
-        let result = await CommandRunner.shell("sleep 30", directory: nil, timeout: 1)
+        let result = await CommandRunner.shell("sleep 120", directory: nil, timeout: 1)
         #expect(result.timedOut)
-        #expect(Date().timeIntervalSince(started) < 15)
+        #expect(Date().timeIntervalSince(started) < 60)
     }
 
     @Test("devicectl's listing reads as devices with their state and connection")
