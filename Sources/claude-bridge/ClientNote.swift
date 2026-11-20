@@ -20,7 +20,10 @@ enum ClientNote {
         sentence or two of your reply, so lead with the outcome.
         """
 
-    static func arguments(enabled: Bool) -> [String] {
-        enabled ? ["--append-system-prompt", text] : []
+    /// The one `--append-system-prompt` a launch carries: the note, then an expert's brief when the
+    /// conversation is a task of one. The CLI keeps one appended prompt, so both ride in it.
+    static func arguments(enabled: Bool, appendix: String? = nil) -> [String] {
+        let parts = [enabled ? text : nil, appendix?.isEmpty == false ? appendix : nil].compactMap { $0 }
+        return parts.isEmpty ? [] : ["--append-system-prompt", parts.joined(separator: "\n\n")]
     }
 }

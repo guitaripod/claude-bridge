@@ -198,10 +198,25 @@ await agentService.observe { Task { await hub.publish(.machine(topic: "agents"))
 await store.attach(agents: agentService)
 let scheduler = Scheduler(
     url: stateDirectory.appendingPathComponent("schedules.json"), store: store)
-await scheduler.observe { Task { await hub.publish(.machine(topic: "schedules")) } }
-await store.observeTurnEnds { id, note in await scheduler.turnEnded(id, note) }
 await scheduler.start()
 registerMachineRoutes(router, agents: agentService, scheduler: scheduler)
+let expertStore = ExpertStore(
+    root: stateDirectory.appendingPathComponent("experts"), store: store, claudePath: claudePath)
+await expertStore.observe { Task { await hub.publish(.machine(topic: "experts")) } }
+await store.observeTurnEnds { id, note in
+    await scheduler.turnEnded(id, note)
+    await expertStore.turnEnded(id)
+}
+await expertStore.watches { id in await scheduler.watches(of: id) }
+await store.attach(briefs: { session, expert in await expertStore.briefFor(session: session, expertID: expert) })
+await scheduler.observe {
+    Task {
+        await hub.publish(.machine(topic: "schedules"))
+        await hub.publish(.machine(topic: "experts"))
+    }
+}
+await expertStore.start()
+registerExpertRoutes(router, experts: expertStore)
 registerRoutes(
     router, store: store, index: index, watcher: watcher, updater: updater, auth: auth,
     permissions: permissions, hub: hub, observer: observer, defaults: machineDefaults, hasAuth: !password.isEmpty || tailnetGate != nil,

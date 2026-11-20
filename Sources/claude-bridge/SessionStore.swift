@@ -194,6 +194,8 @@ actor SessionStore {
     private var agentChoices: [String: (model: String?, effort: String?)] = [:]
     /// Told when a turn ends, with the session and how it ended: the scheduler's ear.
     private var turnEndObserver: (@Sendable (String, TurnEndNote) async -> Void)?
+    /// The brief an expert's conversation starts every process with, asked of the expert store.
+    private var briefProvider: (@Sendable (String, String) async -> String?)?
     private var openTurns: [String: OpenTurn] = [:]
     private let processTTL: TimeInterval
     /// How many idle processes are kept at once. Each is a whole CLI in memory; past this the
@@ -726,6 +728,7 @@ actor SessionStore {
         retrying: Bool = false
     ) async {
         guard openTurns[id] != nil else { return }
+        let launch = await withBrief(launch, for: id)
         let process: ClaudeProcess
         do {
             process = try await self.process(for: id, launch: launch, model: model, effort: effort)
@@ -981,9 +984,11 @@ actor SessionStore {
             let model = session.model.isEmpty ? defaults.model() : session.model
             let requested = session.effort.isEmpty ? defaults.effort() : session.effort
             let effort = requested == Self.ultracodeEffort ? Self.ultracodeRunsAs : requested
-            let launch = ClaudeLaunch(
-                resume: resume, fork: false, directory: session.directory ?? runner.workdir,
-                ultracode: requested == Self.ultracodeEffort)
+            let launch = await withBrief(
+                ClaudeLaunch(
+                    resume: resume, fork: false, directory: session.directory ?? runner.workdir,
+                    ultracode: requested == Self.ultracodeEffort),
+                for: id)
             guard let started = try? await self.process(for: id, launch: launch, model: model, effort: effort)
             else { return nil }
             process = started
@@ -1473,17 +1478,103 @@ actor SessionStore {
         answer in this conversation, reply with exactly NOTHING NEW and nothing else.)
         """
 
-    /// Makes a conversation for a schedule, titled by it and marked as its own.
-    func createScheduled(title: String, directory: String?, model: String?, effort: String?, scheduleID: String)
-        -> Session
-    {
+    /// Makes a conversation for a schedule, titled by it and marked as its own — and, for a watch
+    /// an expert keeps, as that expert's, so its runs start with the expert's brief.
+    func createScheduled(
+        title: String, directory: String?, model: String?, effort: String?, scheduleID: String,
+        expertID: String? = nil
+    ) -> Session {
         var session = create(
             CreateRequest(title: title, directory: directory, model: model, effort: effort))
         session.scheduleID = scheduleID
+        session.expertID = expertID
         session.customTitle = true
         sessions[session.id] = session
         persistNow()
         return session
+    }
+
+    // MARK: - Expert tasks
+
+    func attach(briefs: @escaping @Sendable (String, String) async -> String?) {
+        briefProvider = briefs
+    }
+
+    /// The launch with the expert's brief added, for a conversation that is an expert's task.
+    private func withBrief(_ launch: ClaudeLaunch, for id: String) async -> ClaudeLaunch {
+        guard launch.appendix == nil, let expert = sessions[id]?.expertID, let provider = briefProvider else {
+            return launch
+        }
+        var briefed = launch
+        briefed.appendix = await provider(id, expert)
+        return briefed
+    }
+
+    /// Makes the conversation an expert's task runs in. Titled by its first words like any chat,
+    /// unless the person named it.
+    func createExpertTask(expertID: String, title: String?, directory: String?, model: String?, effort: String?)
+        -> Session
+    {
+        var session = create(CreateRequest(title: title, directory: directory, model: model, effort: effort))
+        session.expertID = expertID
+        if title != nil { session.customTitle = true }
+        sessions[session.id] = session
+        persistNow()
+        return session
+    }
+
+    func sendExpertTask(_ id: String, text: String, model: String?, effort: String?) -> SendOutcome {
+        guard sessions[id] != nil else { return .unknownSession }
+        return accept(id, display: text, runnerPrompt: text, files: [], model: model, effort: effort)
+    }
+
+    func summary(_ id: String) -> SessionSummary? {
+        guard sessions[id] != nil else { return nil }
+        return list().first { $0.id == id }
+    }
+
+    /// Every conversation that is a task of `expertID`, newest first.
+    func expertTasks(_ expertID: String) -> [ExpertTaskInfo] {
+        sessions.values.filter { $0.expertID == expertID }
+            .map(taskInfo)
+            .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    func expertTask(_ id: String) -> ExpertTaskInfo? {
+        guard let session = sessions[id], session.expertID != nil else { return nil }
+        return taskInfo(session)
+    }
+
+    /// What a draft is made from: any conversation this bridge holds, expert or not.
+    func draftSource(_ id: String) -> ExpertTaskInfo? {
+        guard let session = sessions[id] else { return nil }
+        return taskInfo(session)
+    }
+
+    private func taskInfo(_ session: Session) -> ExpertTaskInfo {
+        ExpertTaskInfo(
+            sessionID: session.id, expertID: session.expertID ?? "", title: session.title,
+            updatedAt: session.updatedAt, active: isWorking(session.id),
+            claudeSessionID: session.claudeSessionID, directory: session.directory ?? runner.workdir,
+            model: session.model, userTurns: session.messages.filter { $0.role == .user }.count)
+    }
+
+    /// The conversation whose process tree holds one of `pids`: the process the bridge started for
+    /// it, or anything that process started.
+    func sessionHolding(pids: [Int32]) async -> BenchHolder? {
+        var owners: [Int32: String] = [:]
+        for (id, process) in processes { owners[await process.pid] = id }
+        for (id, pid) in turnProcessIDs { owners[pid] = id }
+        guard !owners.isEmpty else { return nil }
+        let table = ProcessTree.parents()
+        for pid in pids {
+            for ancestor in ProcessTree.ancestors(of: pid, in: table) {
+                if let id = owners[ancestor] {
+                    return BenchHolder(sessionID: id, title: sessions[id]?.title, pid: pid)
+                }
+            }
+        }
+        return nil
     }
 
     // MARK: - Agent turns

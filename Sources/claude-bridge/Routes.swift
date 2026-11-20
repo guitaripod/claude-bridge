@@ -177,6 +177,9 @@ struct BridgeStatus: Encodable {
     var presence = 1
     /// Protocol version of the schedules this machine keeps and asks (`/schedules`).
     var schedules = 1
+    /// Protocol version of the experts this machine keeps (`/experts`): roles whose tasks start
+    /// with a brief, end with a debrief, and carry a notebook, a bench and guards.
+    var experts = 1
     /// Protocol version of the session read's sidecar: `GET /sessions/:id` answers the goal, the
     /// cut-off turn and the provider wait as the whole word on each, so a client refreshing a
     /// conversation asks for none of them separately.

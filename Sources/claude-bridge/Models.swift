@@ -253,6 +253,8 @@ struct Session: Codable, Sendable, Equatable {
     var agentSessionID: String? = nil
     /// The schedule this conversation runs for, when a schedule made it.
     var scheduleID: String? = nil
+    /// The expert this conversation is a task of. Its processes start with the expert's brief.
+    var expertID: String? = nil
     /// Stamped when a session is served, never stored: the open turn is waiting on Anthropic
     /// between attempts, and why.
     var retry: RetryWait? = nil
@@ -261,7 +263,7 @@ struct Session: Codable, Sendable, Equatable {
         SessionSummary(
             id: id, title: title, directory: directory, model: model, effort: effort,
             createdAt: createdAt, updatedAt: updatedAt, agent: agent, agentName: agentName,
-            scheduled: scheduleID == nil ? nil : true)
+            scheduled: scheduleID == nil ? nil : true, expert: expertID)
     }
 }
 
@@ -361,6 +363,8 @@ struct SessionSummary: Codable, Sendable, Equatable {
     var agentName: String? = nil
     /// A schedule made this conversation and runs into it.
     var scheduled: Bool? = nil
+    /// The expert this conversation is a task of, by id.
+    var expert: String? = nil
     /// The first words of the answer that closed the last turn, for a row nobody has read yet.
     /// Absent while a turn is open, once the chat has been read, and on a chat that has not moved
     /// in ``LastWords/window``: a list shows it only on an unread row, so it rides on no other.

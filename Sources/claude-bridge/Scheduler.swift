@@ -115,6 +115,8 @@ struct Schedule: Codable, Sendable, Equatable {
     var createdAt: Date
     var createdBy: String?
     var runs: [ScheduleRun]
+    /// The expert this schedule is a watch of: its runs start with that expert's brief.
+    var expertID: String? = nil
 }
 
 struct ScheduleDraft: Codable, Sendable {
@@ -129,6 +131,7 @@ struct ScheduleDraft: Codable, Sendable {
     var quiet: Bool?
     var sessionID: String?
     var createdBy: String?
+    var expertID: String?
 }
 
 struct SchedulePatch: Codable, Sendable {
@@ -193,6 +196,11 @@ actor Scheduler {
 
     func schedule(_ id: String) -> Schedule? { schedules.first { $0.id == id } }
 
+    /// The schedules that are watches of one expert.
+    func watches(of expertID: String) -> [String] {
+        schedules.filter { $0.expertID == expertID }.map(\.id)
+    }
+
     func create(_ draft: ScheduleDraft) throws -> Schedule {
         guard schedules.count < Self.limit else {
             throw ScheduleError.invalid("This machine keeps at most \(Self.limit) schedules.")
@@ -210,7 +218,7 @@ actor Scheduler {
             directory: draft.directory, rule: draft.rule, timeZone: zone.identifier, next: nil,
             paused: false, thread: draft.thread == "fresh" ? "fresh" : "continue",
             quiet: draft.quiet ?? draft.rule.isRepeating, sessionID: draft.sessionID,
-            createdAt: moment, createdBy: draft.createdBy, runs: [])
+            createdAt: moment, createdBy: draft.createdBy, runs: [], expertID: draft.expertID?.nilIfEmpty)
         schedule.next = schedule.rule.next(after: moment, calendar: Self.calendar(zone))
         guard schedule.next != nil else {
             throw ScheduleError.invalid("That time has already passed.")
@@ -374,7 +382,7 @@ actor Scheduler {
         if sessionID == nil {
             let made = await store.createScheduled(
                 title: schedule.title, directory: schedule.directory, model: schedule.model,
-                effort: schedule.effort, scheduleID: schedule.id)
+                effort: schedule.effort, scheduleID: schedule.id, expertID: schedule.expertID)
             sessionID = made.id
         }
         guard let sessionID else { return }

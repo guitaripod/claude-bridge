@@ -8,6 +8,8 @@ struct ClaudeLaunch: Equatable, Sendable {
     var fork: Bool
     var directory: String
     var ultracode: Bool
+    /// What is appended to Claude Code's system prompt besides the client note: an expert's brief.
+    var appendix: String? = nil
 }
 
 /// One long-lived `claude -p --input-format stream-json` for one conversation.
@@ -542,6 +544,7 @@ actor ClaudeProcess {
     func serves(_ wanted: ClaudeLaunch) -> Bool {
         guard isRunning, wanted.directory == launch.directory else { return false }
         guard !wanted.ultracode || launch.ultracode else { return false }
+        guard wanted.appendix == launch.appendix else { return false }
         return wanted.resume == currentSessionID
     }
 
@@ -573,7 +576,7 @@ actor ClaudeProcess {
         if launch.ultracode {
             arguments += ["--settings", #"{"ultracode":true}"#]
         }
-        arguments += ClientNote.arguments(enabled: clientNote)
+        arguments += ClientNote.arguments(enabled: clientNote, appendix: launch.appendix)
         if let resume = launch.resume {
             arguments += ["--resume", resume]
             if launch.fork { arguments.append("--fork-session") }
