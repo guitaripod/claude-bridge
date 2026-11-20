@@ -106,9 +106,13 @@ enum ExpertBrief {
         let failing = inputs.guards.filter { $0.last.map { !$0.passed } ?? false }
         if !inputs.guards.isEmpty {
             var lines = "## Guards"
-            if failing.isEmpty {
-                let checked = inputs.guards.compactMap { $0.last?.at }.max()
-                lines += "\nAll \(inputs.guards.count) guards passed"
+            let ran = inputs.guards.filter { $0.last != nil }
+            if ran.isEmpty {
+                lines += inputs.guards.count == 1
+                    ? "\nThe guard has not run yet." : "\nThe \(inputs.guards.count) guards have not run yet."
+            } else if failing.isEmpty {
+                let checked = ran.compactMap { $0.last?.at }.max()
+                lines += "\n\(ran.count == inputs.guards.count ? "All \(ran.count)" : "\(ran.count) of \(inputs.guards.count)") guards passed"
                 if let checked { lines += " when last run (\(moment(checked, inputs.timeZone)))" }
                 lines += "."
             } else {
@@ -126,7 +130,7 @@ enum ExpertBrief {
                     }
                     lines += "\n\(line)"
                 }
-                let passing = inputs.guards.count - failing.count
+                let passing = inputs.guards.filter { $0.last?.passed == true }.count
                 if passing > 0 { lines += "\n\(passing) other guards pass." }
             }
             parts.append(lines)
@@ -140,6 +144,11 @@ enum ExpertBrief {
             line += " (\(identifier))"
         }
         switch item.state {
+        case "ready" where item.kind == "command":
+            line += ": there"
+            if let output = item.facts?["output"], !output.isEmpty { line += " (\(output))" }
+        case "ready" where item.kind == "port":
+            line += ": listening"
         case "ready":
             var words = ["available"]
             if let transport = item.facts?["transport"] {

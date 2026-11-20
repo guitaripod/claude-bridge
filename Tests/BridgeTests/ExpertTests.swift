@@ -155,6 +155,18 @@ struct ExpertBriefTests {
         #expect(text.contains("2 tests failed"))
     }
 
+    @Test("Guards that never ran are not said to pass, and a probe says what it found")
+    func unrunGuards() {
+        let text = ExpertBrief.text(
+            ExpertBrief.Inputs(
+                expert: expert(), notebookPath: "/notes", notes: [], journal: [],
+                bench: [BenchItem(id: "p", name: "Probe", kind: "command", command: "echo ok", state: "ready", facts: ["output": "ok"])],
+                guards: [GuardItem(id: "g", name: "Never ran", command: "true")], timeZone: TimeZone(identifier: "UTC")!))
+        #expect(text.contains("The guard has not run yet."))
+        #expect(!text.contains("passed"))
+        #expect(text.contains("- Probe: there (ok). Proved by `echo ok`."))
+    }
+
     @Test("A big notebook drops summaries before titles and says how many more there are")
     func budget() {
         let many = (0..<800).map { note($0) }
