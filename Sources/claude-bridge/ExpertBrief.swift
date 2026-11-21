@@ -49,7 +49,7 @@ enum ExpertBrief {
     private static func render(_ inputs: Inputs, journal: [JournalEntry], summaries: Bool, noteLimit: Int) -> String {
         let expert = inputs.expert
         var parts: [String] = []
-        var opening = "You are working as \"\(expert.name)\", an expert kept on this machine by Tailscode."
+        var opening = "You are working as \"\(expert.name)\", a master kept on this machine by Tailscode."
         if !expert.purpose.isEmpty { opening += " \(expert.purpose)" }
         opening += " Each task you are given is a fresh conversation; what carries over between tasks is this brief, your notebook and your journal."
         parts.append(opening)

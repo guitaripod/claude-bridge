@@ -172,11 +172,11 @@ actor ExpertStore {
 
     func create(_ draft: ExpertDraft) throws -> Expert {
         guard experts.count < Self.limit else {
-            throw ExpertError.invalid("This machine keeps at most \(Self.limit) experts.")
+            throw ExpertError.invalid("This machine keeps at most \(Self.limit) masters.")
         }
         let moment = now()
         let name = draft.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, name.count <= 40 else { throw ExpertError.invalid("An expert needs a name of at most 40 characters.") }
+        guard !name.isEmpty, name.count <= 40 else { throw ExpertError.invalid("A master needs a name of at most 40 characters.") }
         var expert = Expert(
             id: UUID().uuidString, name: name, glyph: Self.glyph(draft.glyph, name: name),
             hue: Expert.hues.contains(draft.hue ?? "") ? draft.hue! : Self.hue(for: name),
@@ -209,7 +209,7 @@ actor ExpertStore {
         try apply(patch, to: &expert)
         if let name = patch.name?.trimmingCharacters(in: .whitespacesAndNewlines) {
             guard !name.isEmpty, name.count <= 40 else {
-                throw ExpertError.invalid("An expert needs a name of at most 40 characters.")
+                throw ExpertError.invalid("A master needs a name of at most 40 characters.")
             }
             expert.name = name
         }
@@ -265,7 +265,7 @@ actor ExpertStore {
         if let skills = patch.skills {
             let cleaned = skills.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
             guard cleaned.count <= Self.skillLimit else {
-                throw ExpertError.invalid("An expert loads at most \(Self.skillLimit) skills.")
+                throw ExpertError.invalid("A master loads at most \(Self.skillLimit) skills.")
             }
             var seen: Set<String> = []
             expert.skills = cleaned.filter { seen.insert($0).inserted }
@@ -305,7 +305,7 @@ actor ExpertStore {
         }
         if let guards = patch.guards {
             guard guards.count <= Self.guardLimit else {
-                throw ExpertError.invalid("An expert keeps at most \(Self.guardLimit) guards.")
+                throw ExpertError.invalid("A master keeps at most \(Self.guardLimit) guards.")
             }
             var cleaned: [GuardItem] = []
             for item in guards {
@@ -602,7 +602,7 @@ actor ExpertStore {
         var index = notes.map { "- \($0.id): \($0.title) — \($0.summary)" }.joined(separator: "\n")
         if index.isEmpty { index = "(the notebook is empty)" }
         return """
-            The task in this conversation is finished. You are the expert "\(expert.name)". Write its \
+            The task in this conversation is finished. You are the master "\(expert.name)". Write its \
             debrief: a journal entry, and the changes you propose to your notebook. Answer only with the \
             JSON the schema asks for; do not edit any file.
 
@@ -670,7 +670,7 @@ actor ExpertStore {
     func draft(_ request: ExpertDraftRequest) async throws -> ExpertDraft {
         if let sessionID = request.session?.nilIfEmpty {
             guard let info = await store.draftSource(sessionID), let claudeID = info.claudeSessionID else {
-                throw ExpertError.invalid("That conversation has nothing to draft an expert from yet.")
+                throw ExpertError.invalid("That conversation has nothing to draft a master from yet.")
             }
             let answer = await ask(
                 ExpertAsk.Request(
@@ -712,7 +712,7 @@ actor ExpertStore {
 
     static func draftPrompt(skill: String?) -> String {
         let source =
-            skill.map { "the skill below, which the expert will load first:\n\n\($0)\n\n" }
+            skill.map { "the skill below, which the master will load first:\n\n\($0)\n\n" }
             ?? "this conversation. "
         return """
             Draft a Tailscode expert from \(source)An expert is a standing role on this machine: every task \
@@ -734,7 +734,7 @@ actor ExpertStore {
     }
 
     static func readDraft(_ object: [String: Any]) -> ExpertDraft {
-        let name = ((object["name"] as? String)?.nilIfEmpty ?? "Expert").prefix(40)
+        let name = ((object["name"] as? String)?.nilIfEmpty ?? "Master").prefix(40)
         let notes = (object["notes"] as? [[String: Any]] ?? []).prefix(8).compactMap { raw -> DraftNote? in
             guard let title = (raw["title"] as? String)?.nilIfEmpty else { return nil }
             return DraftNote(

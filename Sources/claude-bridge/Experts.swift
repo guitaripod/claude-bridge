@@ -321,8 +321,8 @@ enum ExpertError: Error, CustomStringConvertible, Sendable {
     var description: String {
         switch self {
         case .invalid(let why): return why
-        case .unknown: return "There is no such expert on this machine."
-        case .unknownSession: return "That conversation is not one of this machine's expert tasks."
+        case .unknown: return "There is no such master on this machine."
+        case .unknownSession: return "That conversation is not a task of one of this machine's masters."
         case .busy(let why): return why
         }
     }
