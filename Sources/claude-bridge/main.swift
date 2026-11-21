@@ -1,5 +1,6 @@
 import Foundation
 import Hummingbird
+import TerminalHost
 
 func env(_ key: String, _ fallback: String) -> String {
     ProcessInfo.processInfo.environment[key].flatMap { $0.isEmpty ? nil : $0 } ?? fallback
@@ -176,6 +177,9 @@ await store.recoverJournaledTurns()
 await store.pusher.restore(journaled: journaled)
 Task { await store.pusher.runClock(inFlight: { await store.sessionsInFlight() }) }
 let updater = UpdateService(stateDirectory: storeURL.deletingLastPathComponent())
+var terminalPolicy = TerminalHall.Policy()
+terminalPolicy.secrets = ["BRIDGE_PASSWORD", "BRIDGE_APNS_KEY", "BRIDGE_APNS_KEY_ID", "BRIDGE_APNS_TEAM_ID"]
+let terminalHall = TerminalHall(policy: terminalPolicy)
 let auth = AuthService(claudePath: claudePath, workdir: workdir)
 let permissions = MachinePermissionService(home: home)
 // What a restart would destroy, and what has to reach disk before one. Composed here because no
@@ -187,7 +191,8 @@ await updater.attach(
             turns: await store.turnsInFlight(
                 activeClaudeIDs: await index.activeIDs(within: TranscriptIndex.activityWindow)),
             signingIn: await auth.isSigningIn(),
-            swept: await observer.hasSwept)
+            swept: await observer.hasSwept,
+            commands: terminalHall.busyCount())
     },
     settle: { await store.flush() })
 await updater.resume()
@@ -220,6 +225,10 @@ await scheduler.observe {
 }
 await expertStore.start()
 registerExpertRoutes(router, experts: expertStore)
+registerTerminalRoutes(router, hall: terminalHall) { id in
+    if let directory = await store.get(id)?.directory { return directory }
+    return await index.session(id)?.directory
+}
 registerRoutes(
     router, store: store, index: index, watcher: watcher, updater: updater, auth: auth,
     permissions: permissions, hub: hub, observer: observer, defaults: machineDefaults, hasAuth: !password.isEmpty || tailnetGate != nil,

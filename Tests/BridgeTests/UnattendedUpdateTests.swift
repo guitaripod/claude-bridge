@@ -24,6 +24,18 @@ import Testing
         #expect(signing.reason?.contains("signing") == true)
     }
 
+    @Test func aCommandInATerminalHoldsARestartLikeATurn() {
+        let one = MachineQuiet.read(turns: 0, signingIn: false, swept: true, commands: 1)
+        #expect(!one.quiet)
+        #expect(one.reason == "A command is running in a terminal on that machine.")
+        #expect(
+            MachineQuiet.read(turns: 0, signingIn: false, swept: true, commands: 2).reason?.hasPrefix("2") == true)
+        #expect(
+            MachineQuiet.read(turns: 1, signingIn: false, swept: true, commands: 2).reason
+                == "A turn is running on that machine.")
+        #expect(MachineQuiet.read(turns: 0, signingIn: false, swept: true, commands: 0).quiet)
+    }
+
     @Test func aRunningTurnCountsItselfInWords() {
         let one = MachineQuiet.read(turns: 1, signingIn: false, swept: true)
         #expect(!one.quiet)

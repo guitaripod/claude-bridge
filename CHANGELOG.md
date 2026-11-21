@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.38.0 — 2026-11-21
+
+- A terminal on this machine, from any Tailscode: the bridge now opens your login shell on a pseudo-terminal of its own, in the folder the chat works in, and keeps it. Close the app, lose the connection or pick up another device and the same shell is there with its folder, its scrollback and whatever was running. That is also what gives the App Store's Mac build and the phone a terminal, since they cannot start a shell of their own. A split aimed at the terminal now starts its chat on this machine in the folder the shell stands in. A command running in a terminal holds a restart or an update the way a running turn does; a shell left idle at its prompt with nobody reading is closed after twelve hours. It is the same reach the bridge already gives, behind the same password or tailnet identity. It shows in the Tailscode builds that follow this release; older apps never ask.
+
 ## 1.37.2 — 2026-11-20
 
 - A task you went on with after its debrief is debriefed again when you finish it, and the notebook changes you had not yet decided are carried into the new debrief instead of being lost or blocking it.

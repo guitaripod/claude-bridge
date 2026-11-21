@@ -187,6 +187,9 @@ struct BridgeStatus: Encodable {
     /// Protocol version of chapters: a session read carries `chapters` and `chaptersRevision`,
     /// and the session stream a `chapters` frame whenever they change.
     var chapters = 1
+    /// Protocol version of the terminals this bridge holds for its clients (`/terminals`): a shell
+    /// on this machine that outlives the client that opened it.
+    var terminals = 1
 }
 
 struct AuthCodeRequest: Decodable {
