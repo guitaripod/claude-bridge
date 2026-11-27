@@ -399,9 +399,9 @@ actor SessionStore {
         persistHidden()
     }
 
-    func create(_ request: CreateRequest) -> Session {
+    func create(_ request: CreateRequest, features: [String]? = nil) -> Session {
         let now = Date()
-        let session = Session(
+        var session = Session(
             id: UUID().uuidString,
             title: request.title ?? "New chat",
             directory: Self.normalizedDirectory(request.directory),
@@ -410,6 +410,7 @@ actor SessionStore {
             effort: request.effort ?? defaults.effort(),
             createdAt: now, updatedAt: now, messages: [], lastCostUSD: nil, lastTokens: nil,
             pendingFork: nil)
+        session.clientFeatures = features
         sessions[session.id] = session
         order.insert(session.id, at: 0)
         persistNow()
@@ -585,10 +586,13 @@ actor SessionStore {
     /// queue and nowhere else. Both outcomes are accepted (202): a client treats any non-2xx as
     /// message-lost and hands the text back to the composer.
     @discardableResult
-    func send(_ id: String, request: SendRequest) -> SendOutcome {
+    func send(_ id: String, request: SendRequest, features: [String]? = nil) -> SendOutcome {
         autoContinues[id] = 0
         cooldowns[id] = nil
         guard sessions[id] != nil else { return .unknownSession }
+        if let features, sessions[id]?.claudeSessionID == nil, sessions[id]?.clientFeatures == nil {
+            sessions[id]?.clientFeatures = features
+        }
         if pausedQueues.remove(id) != nil { publishQueue(id) }
         guard inFlight.contains(id) else {
             let upload = storeAttachments(for: request, sessionID: id)
@@ -694,7 +698,7 @@ actor SessionStore {
         journal.write(to: journalURL)
         let launch = ClaudeLaunch(
             resume: resume, fork: fork, directory: directory ?? runner.workdir,
-            ultracode: ultracode)
+            ultracode: ultracode, mediaByPath: Self.showsMediaByPath(session))
         // The turn is open from here, before anything is awaited: the row is live and the empty
         // answer is on the wire before the CLI has said a word, exactly as the one-process-per-
         // turn runner did — and a line the process writes in the meantime finds a turn to land
@@ -768,6 +772,13 @@ actor SessionStore {
     /// exit sends — arrives after the map has moved on and is refused as a line from nobody, and
     /// the process taking its place reports only what changes from an empty set, so a count left
     /// standing here is a count nothing can ever take down.
+    /// Whether the app that began a conversation shows the files its replies name.
+    static func showsMediaByPath(_ session: Session) -> Bool {
+        session.clientFeatures?.contains(clientFeatureMediaByPath) == true
+    }
+
+    static let clientFeatureMediaByPath = "media-by-path"
+
     private func process(
         for id: String, launch: ClaudeLaunch, model: String, effort: String
     ) async throws -> ClaudeProcess {
@@ -987,7 +998,8 @@ actor SessionStore {
             let launch = await withBrief(
                 ClaudeLaunch(
                     resume: resume, fork: false, directory: session.directory ?? runner.workdir,
-                    ultracode: requested == Self.ultracodeEffort),
+                    ultracode: requested == Self.ultracodeEffort,
+                    mediaByPath: Self.showsMediaByPath(session)),
                 for: id)
             guard let started = try? await self.process(for: id, launch: launch, model: model, effort: effort)
             else { return nil }

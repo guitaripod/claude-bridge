@@ -471,7 +471,10 @@ func registerRoutes(
 
     router.post("sessions") { request, _ in
         let body = try? await decodeBody(CreateRequest.self, request)
-        return jsonResponse(await store.create(body ?? CreateRequest(title: nil, model: nil, effort: nil)))
+        return jsonResponse(
+            await store.create(
+                body ?? CreateRequest(title: nil, model: nil, effort: nil),
+                features: clientFeatures(request)))
     }
 
     /// Search across every conversation this machine has had. A chat list can only match titles,
@@ -778,9 +781,22 @@ func registerRoutes(
             return jsonResponse(["error": "path required"], status: .badRequest)
         }
         let root = FileManager.default.homeDirectoryForCurrentUser.path
-        let path = FileBrowsing.resolve(body.path, home: root)
-        guard let size = FileBrowsing.readableSize(path, cap: Int.max) else {
+        var path = FileBrowsing.resolve(body.path, home: root)
+        guard var size = FileBrowsing.readableSize(path, cap: Int.max) else {
             return jsonResponse(["error": "not readable"], status: .notFound)
+        }
+        if body.playable == "apple", !MediaConvert.playsOnApple(path) {
+            do {
+                path = try await MediaConvert.shared.playableCopy(of: path, size: size)
+                size = FileBrowsing.readableSize(path, cap: Int.max) ?? size
+            } catch MediaConvert.Failure.noConverter {
+                return jsonResponse(
+                    ["error": "cannot convert", "reason": "ffmpeg is not installed on this machine"],
+                    status: .unprocessableContent)
+            } catch {
+                return jsonResponse(
+                    ["error": "cannot convert", "reason": "\(error)"], status: .unprocessableContent)
+            }
         }
         let ticket = await tickets.issue(path: path)
         return jsonResponse(
@@ -1138,7 +1154,7 @@ func registerRoutes(
                 ],
                 status: .conflict)
         }
-        switch await store.send(id, request: body) {
+        switch await store.send(id, request: body, features: clientFeatures(request)) {
         case .unknownSession:
             return jsonResponse(["error": "not found"], status: .notFound)
         case .started:
@@ -1279,10 +1295,23 @@ func registerRoutes(
 
 struct FileTicketRequest: Decodable {
     let path: String
+    /// `apple` asks for a copy Apple's players read when the file is in a format they do not.
+    let playable: String?
 }
 
 struct FileTicketAnswer: Encodable {
     let url: String
     let size: Int
     let mime: String
+}
+
+/// What the app sending a request says it can show (`X-Client-Features`, comma-separated), nil
+/// for an app that says nothing.
+func clientFeatures(_ request: Request) -> [String]? {
+    guard let name = HTTPField.Name("X-Client-Features"), let raw = request.headers[name] else {
+        return nil
+    }
+    let names = raw.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    return names.isEmpty ? nil : names
 }

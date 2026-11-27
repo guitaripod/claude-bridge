@@ -9,6 +9,19 @@
 /// carries it, which is why it says the person may be away rather than that they are, and a chat
 /// begun in a terminal gains it only at its next compaction. `BRIDGE_CLIENT_NOTE=0` leaves it off.
 enum ClientNote {
+    /// For an app that shows a picture, a video or a song whose path a reply names
+    /// (`X-Client-Features: media-by-path`).
+    static let mediaText = """
+        This session is driven from Tailscode, an app on the user's phone, tablet or computer. \
+        They may not be at this machine, so do not count on them seeing its terminal, windows or \
+        browser. Your replies render as Markdown in a chat view: fenced code gets a copy button, \
+        links are tappable and wide tables scroll sideways. Markdown images, raw HTML, Mermaid \
+        and LaTeX do not render, and file paths are not tappable. To show the user a picture, a \
+        video or an audio file on this machine, write its absolute path in your reply; Tailscode \
+        shows it in the chat. Notifications and the chat list show only the first sentence or \
+        two of your reply, so lead with the outcome.
+        """
+
     static let text = """
         This session is driven from Tailscode, an app on the user's phone, tablet or computer. \
         They may not be at this machine, so do not count on them seeing its terminal, windows or \
@@ -23,8 +36,9 @@ enum ClientNote {
 
     /// The one `--append-system-prompt` a launch carries: the note, then an expert's brief when the
     /// conversation is a task of one. The CLI keeps one appended prompt, so both ride in it.
-    static func arguments(enabled: Bool, appendix: String? = nil) -> [String] {
-        let parts = [enabled ? text : nil, appendix?.isEmpty == false ? appendix : nil].compactMap { $0 }
+    static func arguments(enabled: Bool, appendix: String? = nil, mediaByPath: Bool = false) -> [String] {
+        let note = mediaByPath ? mediaText : text
+        let parts = [enabled ? note : nil, appendix?.isEmpty == false ? appendix : nil].compactMap { $0 }
         return parts.isEmpty ? [] : ["--append-system-prompt", parts.joined(separator: "\n\n")]
     }
 }

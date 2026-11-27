@@ -244,6 +244,10 @@ struct Session: Codable, Sendable, Equatable {
     /// queue itself lives in the journal, so every client reads the same one.
     var queue: [QueuedItem]?
     var queuePaused: Bool?
+    /// What the app that started this conversation said it can show (`X-Client-Features`), kept
+    /// from its first request: the note a conversation starts with is fixed for its whole life,
+    /// so it is written for the app that began it.
+    var clientFeatures: [String]? = nil
     /// The ACP agent this conversation is with, by id, when it is not Claude Code. Bound by the
     /// first turn that names one of the agent's models and kept: one agent cannot take over
     /// another's session.

@@ -10,6 +10,10 @@ struct ClaudeLaunch: Equatable, Sendable {
     var ultracode: Bool
     /// What is appended to Claude Code's system prompt besides the client note: an expert's brief.
     var appendix: String? = nil
+    /// Whether the app that started the conversation shows a file whose path a reply names, which
+    /// is what the note tells Claude to do to show one. Never a reason to replace a process: the
+    /// note is fixed at a conversation's first request.
+    var mediaByPath = false
 }
 
 /// One long-lived `claude -p --input-format stream-json` for one conversation.
@@ -576,7 +580,8 @@ actor ClaudeProcess {
         if launch.ultracode {
             arguments += ["--settings", #"{"ultracode":true}"#]
         }
-        arguments += ClientNote.arguments(enabled: clientNote, appendix: launch.appendix)
+        arguments += ClientNote.arguments(
+            enabled: clientNote, appendix: launch.appendix, mediaByPath: launch.mediaByPath)
         if let resume = launch.resume {
             arguments += ["--resume", resume]
             if launch.fork { arguments.append("--fork-session") }
