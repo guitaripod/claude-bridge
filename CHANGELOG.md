@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.40.1 — 2026-11-27
+
+- A chat whose turn ended while a background agent it launched kept working no longer reads as running until that agent finishes: the agent's own lines no longer open a turn in the parent, so a message you send goes straight to Claude instead of waiting behind the agent.
+
 ## 1.40.0 — 2026-11-27
 
 - A WebM, a Matroska or an Ogg an agent names now plays on an iPhone, an iPad and a Mac: asked for a copy Apple's players read, the bridge converts the file once with ffmpeg (H.264 and AAC, or AAC for a song) and keeps the copy for a week; without ffmpeg it says so and the app says the file cannot play there.

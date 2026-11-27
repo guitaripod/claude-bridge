@@ -882,7 +882,12 @@ actor SessionStore {
     /// closing is.
     /// A `result` on its own is not — a slash command's zero-turn answer that outran its
     /// swallow, say — because a turn opened for it would close at once as an empty message.
-    private static func opensTurn(_ object: [String: Any]) -> Bool {
+    /// Nor is anything a subagent says: the CLI streams a background agent's lines, tagged with
+    /// the `parent_tool_use_id` of the call that launched it, long after the parent's turn has
+    /// closed, and a turn opened for them would hold the conversation busy with no `result` to
+    /// close it until that agent finished.
+    static func opensTurn(_ object: [String: Any]) -> Bool {
+        if object["parent_tool_use_id"] is String { return false }
         switch object["type"] as? String {
         case "assistant", "stream_event":
             return true
