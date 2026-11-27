@@ -154,8 +154,10 @@ let router = Router(context: BridgeRequestContext.self)
 let tailnetGate: TailnetGate? =
     tailnetPolicy == .off || tailscaleCLI == nil
     ? nil : TailnetGate(policy: tailnetPolicy, cli: tailscaleCLI)
+let fileTickets = FileTickets()
 if !password.isEmpty || tailnetGate != nil {
-    router.middlewares.add(AccessMiddleware(password: password, gate: tailnetGate))
+    router.middlewares.add(
+        AccessMiddleware(password: password, gate: tailnetGate, tickets: fileTickets))
 }
 router.middlewares.add(AnswerCompression<BridgeRequestContext>())
 let index = TranscriptIndex(
@@ -232,7 +234,7 @@ registerTerminalRoutes(router, hall: terminalHall) { id in
 registerRoutes(
     router, store: store, index: index, watcher: watcher, updater: updater, auth: auth,
     permissions: permissions, hub: hub, observer: observer, defaults: machineDefaults, hasAuth: !password.isEmpty || tailnetGate != nil,
-    projectsDir: projectsDir,
+    projectsDir: projectsDir, tickets: fileTickets,
     waitMax: Double(env("BRIDGE_WAIT_MAX", "10800")) ?? 10800)
 startExternalIdleSweep(index: index, store: store)
 await store.devicePusher.setNewsCheck { id, kind, since in

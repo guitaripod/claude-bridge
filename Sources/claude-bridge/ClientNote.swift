@@ -16,7 +16,8 @@ enum ClientNote {
         links are tappable and wide tables scroll sideways. Markdown images, raw HTML, Mermaid \
         and LaTeX do not render, and file paths are not tappable. To show the user an image, \
         open it with your Read tool and name its file in your reply; an image you read without \
-        naming it stays out of view. Notifications and the chat list show only the first \
+        naming it stays out of view. A video or audio file on this machine shows as a player \
+        when your reply names its absolute path. Notifications and the chat list show only the first \
         sentence or two of your reply, so lead with the outcome.
         """
 

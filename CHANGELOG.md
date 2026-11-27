@@ -4,6 +4,10 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.39.0 — 2026-11-27
+
+- A video or a song an agent names plays in Tailscode: `/files/raw` now answers byte ranges, and `POST /files/ticket` hands a player a link to that one file that needs no password, good for as long as it is being watched (six idle hours, forgotten on restart). A plain read keeps its size cap. The note Claude starts with now says that writing a video's or a song's absolute path shows it as a player. It shows in the Tailscode builds that follow this release; older apps never ask.
+
 ## 1.38.1 — 2026-11-21
 
 - Experts are now called Masters, as in Tailscode: the brief a task starts with and the bridge's own messages about them say master. Nothing you saved moves or is renamed, and every Tailscode that says Experts keeps working.

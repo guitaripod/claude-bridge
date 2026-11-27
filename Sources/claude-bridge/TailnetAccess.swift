@@ -22,6 +22,7 @@ struct BridgeRequestContext: RequestContext, RemoteAddressRequestContext {
 enum AccessGrant: Encodable, Sendable, Equatable {
     case password
     case tailnet(TailnetPeer)
+    case ticket
     case open
 
     private enum Keys: String, CodingKey { case mode, login, node, os }
@@ -33,6 +34,8 @@ enum AccessGrant: Encodable, Sendable, Equatable {
             try container.encode("password", forKey: .mode)
         case .open:
             try container.encode("open", forKey: .mode)
+        case .ticket:
+            try container.encode("ticket", forKey: .mode)
         case .tailnet(let peer):
             try container.encode("tailnet", forKey: .mode)
             try container.encodeIfPresent(peer.login, forKey: .login)
@@ -241,8 +244,10 @@ struct AccessMiddleware: RouterMiddleware {
 
     private let expected: String?
     private let gate: TailnetGate?
+    private let tickets: FileTickets?
 
-    init(password: String, gate: TailnetGate?) {
+    init(password: String, gate: TailnetGate?, tickets: FileTickets? = nil) {
+        self.tickets = tickets
         if password.isEmpty {
             expected = nil
         } else {
@@ -250,6 +255,13 @@ struct AccessMiddleware: RouterMiddleware {
             expected = "Basic \(raw)"
         }
         self.gate = gate
+    }
+
+    /// The ticket a player's read carries, when it is a read of `/files/raw` and nothing else: a
+    /// ticket admits that one route, never a session, a terminal or a setting.
+    static func ticket(_ request: Request) -> String? {
+        guard request.method == .get, request.uri.path == "/files/raw" else { return nil }
+        return request.uri.queryParameters.get("ticket").map { String($0) }
     }
 
     /// Compares every byte whatever the first difference, so how long a wrong password takes to
@@ -272,6 +284,10 @@ struct AccessMiddleware: RouterMiddleware {
         var context = context
         if let expected, Self.matches(request.headers[.authorization], expected) {
             context.access = .password
+            return try await next(request, context)
+        }
+        if let ticket = Self.ticket(request), let tickets, await tickets.path(for: ticket) != nil {
+            context.access = .ticket
             return try await next(request, context)
         }
         if let gate, let grant = await gate.grant(for: context.remoteAddress, logger: context.logger) {
