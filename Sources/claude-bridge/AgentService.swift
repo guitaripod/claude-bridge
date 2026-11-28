@@ -12,6 +12,9 @@ struct AgentRow: Codable, Sendable, Equatable {
         var name: String
         var url: String?
         var set: Bool
+        /// True when the agent's own sign-in is the usual way in and this key is another way,
+        /// so a client offers it beside the sign-in rather than as a step of its own.
+        var alternative: Bool?
     }
 
     struct Method: Codable, Sendable, Equatable {
@@ -115,16 +118,25 @@ actor AgentService {
     private var brainCache: (at: Date, brains: [LocalBrain])?
     private var probing: Set<String> = []
     private var installing: Set<String> = []
+    private var installs: [String: Task<Void, Error>] = [:]
     private var signIns: [String: AgentSignIn] = [:]
     private var onChange: (@Sendable () -> Void)?
     private let fetchRegistry: @Sendable () async -> Data?
+    private let fetchRelease: @Sendable (String) async -> Data?
+    /// The version each command on PATH reported, by its path, with the file's date it was read
+    /// at, so a command is asked again only after it changed.
+    private var foundVersions: [String: (modified: Date?, version: String?)] = [:]
+    /// Agents whose next proof signs in with a named method before asking for a session: a key
+    /// somebody has just pasted is meant to be used, whatever the agent was signed in with before.
+    private var signInOnProof: [String: String] = [:]
 
     static let registryURL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json"
     static let reproveAfter: TimeInterval = 24 * 3_600
 
     init(
         home: String, stateDirectory: URL,
-        fetchRegistry: @escaping @Sendable () async -> Data? = { await AgentService.download(AgentService.registryURL) }
+        fetchRegistry: @escaping @Sendable () async -> Data? = { await AgentService.download(AgentService.registryURL) },
+        fetchRelease: @escaping @Sendable (String) async -> Data? = { await AgentService.download($0) }
     ) {
         self.home = home
         directory = stateDirectory.appendingPathComponent("agents")
@@ -134,6 +146,7 @@ actor AgentService {
         registryFetchedAt = (try? FileManager.default.attributesOfItem(atPath: cached.path))?[
             .modificationDate] as? Date
         self.fetchRegistry = fetchRegistry
+        self.fetchRelease = fetchRelease
     }
 
     func observe(_ change: @escaping @Sendable () -> Void) { onChange = change }
@@ -145,6 +158,7 @@ actor AgentService {
 
     func report(refreshBrains: Bool = false) async -> AgentsReport {
         await refreshRegistryIfStale()
+        await readFoundVersions()
         reproveStale()
         let brains = await localBrains(refresh: refreshBrains)
         return AgentsReport(agents: listedIDs().compactMap { row($0, brains: brains) }, brains: brains)
@@ -152,6 +166,7 @@ actor AgentService {
 
     func registryRows() async -> [RegistryRow] {
         await refreshRegistryIfStale(force: registry.isEmpty)
+        await readFoundVersions()
         return registry.filter { !AgentRecipes.excludedRegistryIDs.contains($0.id) }.map { agent in
             let runtime = agent.distribution?.runtime
             let missing = runtime.map { !hasRuntime($0) } ?? false
@@ -167,8 +182,9 @@ actor AgentService {
                 id: agent.id, name: agent.name, version: agent.version, description: agent.description,
                 icon: agent.icon, authors: agent.authors, website: agent.website,
                 distribution: agent.distribution?.kindWord,
-                installable: agent.distribution != nil && !missing, runtime: missing ? runtime : nil,
-                here: here)
+                installable: (agent.distribution != nil || AgentRecipes.recipe(agent.id)?.release?.runsHere == true)
+                    && !missing,
+                runtime: missing ? runtime : nil, here: here)
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
@@ -185,9 +201,10 @@ actor AgentService {
             let models = offered.isEmpty
                 ? [AcpSessionFacts.Choice(id: Self.defaultModelID, name: name)] : offered
             return models.map { model in
-                AgentModelRow(
+                let levels = probe.modelEfforts?[model.id] ?? efforts
+                return AgentModelRow(
                     id: model.id, name: prettyModelName(model, agent: id), provider: id,
-                    providerName: name, agent: true, variants: efforts.isEmpty ? nil : efforts,
+                    providerName: name, agent: true, variants: levels.isEmpty ? nil : levels,
                     contextWindow: nil)
             }
         }.flatMap { $0 }
@@ -212,6 +229,24 @@ actor AgentService {
         ledger.probes[id]?.authMethods ?? []
     }
 
+    /// The sign-in the bridge can do for this agent with nobody there: the method a kept key
+    /// answers. Nil for an agent that only a person can sign in.
+    func unattendedSignIn(_ id: String) -> String? {
+        let kept = AgentKeys.read(in: directory, agent: id)
+        return keySpecs(id).first { $0.method != nil && kept[$0.env] != nil }?.method
+    }
+
+    /// A conversation found the agent signed out. Its row says so from now on, so the machine's
+    /// list offers the sign-in and the model pill stops offering models that cannot answer.
+    func noteSignedOut(_ id: String, failure: String) {
+        guard ledger.added.contains(id), var probe = ledger.probes[id], probe.state == "ready" else { return }
+        probe.state = probe.authMethods.isEmpty ? "failed" : "needsSignIn"
+        probe.failure = String(failure.prefix(600))
+        probe.checkedAt = Date()
+        ledger.probes[id] = probe
+        save()
+    }
+
     /// How a conversation with this agent is started, in `directory`.
     func launch(for id: String, directory: String) -> AcpConnection.Launch? {
         guard let base = invocation(id) else { return nil }
@@ -224,6 +259,10 @@ actor AgentService {
 
     func add(_ id: String) async throws -> AgentRow {
         guard knows(id) else { throw AgentServiceError.unknown(id) }
+        await readFoundVersions()
+        if invocation(id) == nil, AgentRecipes.recipe(id)?.release?.runsHere == true {
+            return try await install(id)
+        }
         if !ledger.added.contains(id) { ledger.added.append(id) }
         save()
         await prove(id)
@@ -238,41 +277,76 @@ actor AgentService {
 
     func check(_ id: String) async throws -> AgentRow {
         guard knows(id) else { throw AgentServiceError.unknown(id) }
+        await readFoundVersions()
         await prove(id)
         return currentRow(id)
     }
 
-    /// Puts a registry agent on this machine: an archive is downloaded, checked against the
-    /// registry's sha256 and unpacked under the bridge's own directory; a package run by npx or uvx
+    /// Puts an agent on this machine: an archive is downloaded, checked against the checksum
+    /// published for it and unpacked under the bridge's own directory; a package run by npx or uvx
     /// needs nothing on disk and is fetched by its first run. Either way it is added and proved.
+    ///
+    /// The work belongs to the machine, not to the request that asked for it: a download that
+    /// outlasts the asking device's patience carries on, and asking again while it runs waits for
+    /// the same download rather than starting a second one over it.
     func install(_ id: String) async throws -> AgentRow {
-        await refreshRegistryIfStale(force: registry.isEmpty)
-        guard let agent = registry.first(where: { $0.id == id }), let distribution = agent.distribution
-        else { throw AgentServiceError.unknown(id) }
-        if let runtime = distribution.runtime, !hasRuntime(runtime) {
-            throw AgentServiceError.refused(
-                runtime == "node"
-                    ? "\(agent.name) runs with npx, and Node.js is not installed on this machine."
-                    : "\(agent.name) runs with uvx, and uv is not installed on this machine.")
+        if let running = installs[id] {
+            try await running.value
+            return currentRow(id)
         }
+        let work = Task { try await self.fetchAndProve(id) }
+        installs[id] = work
+        try await work.value
+        return currentRow(id)
+    }
+
+    private func fetchAndProve(_ id: String) async throws {
+        defer { installs[id] = nil }
+        await refreshRegistryIfStale(force: registry.isEmpty)
         installing.insert(id)
         changed()
         defer {
             installing.remove(id)
             changed()
         }
-        if case .binary(let archive, let command, let args, let sha256) = distribution {
+        let source = try await installSource(id)
+        if let runtime = source.distribution.runtime, !hasRuntime(runtime) {
+            throw AgentServiceError.refused(
+                runtime == "node"
+                    ? "\(source.name) runs with npx, and Node.js is not installed on this machine."
+                    : "\(source.name) runs with uvx, and uv is not installed on this machine.")
+        }
+        if case .binary(let archive, let command, let args, let sha256) = source.distribution {
             let installed = try await Self.unpack(
                 archive: archive, command: command, sha256: sha256,
-                into: directory.appendingPathComponent(id).appendingPathComponent(agent.version))
+                into: directory.appendingPathComponent(id).appendingPathComponent(source.version))
             ledger.installed[id] = AgentLedger.Installed(
-                version: agent.version, executable: installed, args: args)
+                version: source.version, executable: installed, args: args)
         }
         if !ledger.added.contains(id) { ledger.added.append(id) }
         save()
         installing.remove(id)
         await prove(id)
-        return currentRow(id)
+    }
+
+    /// What an install downloads: the agent's own newest release when the bridge knows where it
+    /// publishes them, the registry's entry otherwise.
+    private func installSource(_ id: String) async throws
+        -> (name: String, version: String, distribution: AgentDistribution)
+    {
+        if let recipe = AgentRecipes.recipe(id), let release = recipe.release {
+            guard release.runsHere else {
+                throw AgentServiceError.refused("\(recipe.name) publishes no build for this kind of machine.")
+            }
+            guard let data = await fetchRelease(release.address), let resolved = release.resolve(data) else {
+                throw AgentServiceError.refused(
+                    "\(recipe.name)'s newest release could not be read from GitHub. Try again in a minute.")
+            }
+            return (recipe.name, resolved.version, resolved.distribution)
+        }
+        guard let agent = registry.first(where: { $0.id == id }), let distribution = agent.distribution
+        else { throw AgentServiceError.unknown(id) }
+        return (agent.name, agent.version, distribution)
     }
 
     func setKey(_ id: String, env name: String, value: String) async throws -> AgentRow {
@@ -284,6 +358,7 @@ actor AgentService {
         keys[name] = value
         AgentKeys.write(keys, in: directory, agent: id)
         if !ledger.added.contains(id) { ledger.added.append(id) }
+        signInOnProof[id] = keySpecs(id).first { $0.env == name }?.method
         save()
         await prove(id)
         return currentRow(id)
@@ -348,7 +423,7 @@ actor AgentService {
         try? FileManager.default.createDirectory(at: probeDirectory, withIntermediateDirectories: true)
         if chosen.kind == "terminal" {
             try session.start(
-                executable: base.executable, arguments: base.prefix + chosen.args,
+                executable: base.executable, arguments: base.prefix + base.acpArgs + chosen.args,
                 environment: environment(for: id, extra: base.environment.merging(chosen.env) { _, new in new }),
                 directory: probeDirectory.path)
         } else {
@@ -381,8 +456,8 @@ actor AgentService {
         guard !probing.contains(id) else { return }
         guard let base = invocation(id) else {
             ledger.probes[id] = AgentLedger.Probe(
-                state: "missingRuntime", checkedAt: Date(), version: nil, models: [], currentModel: nil,
-                efforts: [], failure: nil, authMethods: [])
+                state: "failed", checkedAt: Date(), version: nil, models: [], currentModel: nil,
+                efforts: [], failure: "\(displayName(id)) is not on this machine any more.", authMethods: [])
             save()
             return
         }
@@ -408,16 +483,20 @@ actor AgentService {
         var probe = AgentLedger.Probe(
             state: "failed", checkedAt: Date(), version: nil, models: [], currentModel: nil, efforts: [],
             failure: nil, authMethods: [])
+        let chosen = signInOnProof.removeValue(forKey: id)
         do {
             try await connection.start()
             facts = try await connection.initialize()
             probe.version = facts.version
             probe.authMethods = facts.authMethods
-            let session = try await connection.newSession(directory: probeDirectory.path)
+            if let chosen { try await connection.authenticate(method: chosen) }
+            let session = try await connection.newSession(
+                directory: probeDirectory.path, signingInWith: unattendedSignIn(id))
             probe.state = "ready"
             probe.models = session.models
             probe.currentModel = session.currentModel
             probe.efforts = session.efforts
+            probe.modelEfforts = session.modelEfforts.isEmpty ? nil : session.modelEfforts
         } catch let failure as AcpFailure {
             probe.authMethods = facts.authMethods
             var text = failure.description
@@ -445,8 +524,10 @@ actor AgentService {
         if failure.isAuthRequired || lowered.contains("api key") || lowered.contains("api_key")
             || lowered.contains("unauthorized") || lowered.contains("401")
         {
+            let signsIn = !facts.authMethods.isEmpty
+            if signsIn, AgentRecipes.recipe(id)?.signInFirst == true { return "needsSignIn" }
             if !unsetKeys.isEmpty { return "needsKey" }
-            if !facts.authMethods.isEmpty { return "needsSignIn" }
+            if signsIn { return "needsSignIn" }
         }
         if case .timedOut = failure { return "failed" }
         return "failed"
@@ -466,7 +547,7 @@ actor AgentService {
         do {
             try await connection.start()
             _ = try await connection.initialize()
-            try await connection.authenticate(method: method)
+            try await connection.authenticate(method: method, attended: true)
             succeeded = true
         } catch {
             session.record(await connection.stderrTail() + "\n" + String(describing: error))
@@ -614,12 +695,37 @@ actor AgentService {
         }
     }
 
+    /// The agent's own command on this machine's PATH. A copy known to be older than the first
+    /// version that speaks ACP is passed over: it is not this agent yet, and the bridge's own
+    /// download is offered in its place.
     private func foundCommand(_ id: String) -> String? {
         guard let recipe = AgentRecipes.recipe(id) else { return nil }
         for command in recipe.commands {
-            if let path = CommandLocator.find(command, home: home) { return path }
+            guard let path = CommandLocator.find(command, home: home) else { continue }
+            if let minimum = recipe.minimumVersion, let version = foundVersions[path]?.version,
+                AgentVersion.isOlder(version, than: minimum)
+            {
+                continue
+            }
+            return path
         }
         return nil
+    }
+
+    /// Asks every command a recipe with a first ACP version names for its version, once per copy:
+    /// a path already asked is asked again only when the file behind it changed.
+    private func readFoundVersions() async {
+        for recipe in AgentRecipes.all where recipe.minimumVersion != nil {
+            for command in recipe.commands {
+                guard let path = CommandLocator.find(command, home: home) else { continue }
+                let modified = (try? FileManager.default.attributesOfItem(
+                    atPath: (path as NSString).resolvingSymlinksInPath))?[.modificationDate] as? Date
+                if let known = foundVersions[path], known.modified == modified { continue }
+                let output = await Self.capture(
+                    path, ["--version"], environment: CommandLocator.environment(home: home, extra: [:]))
+                foundVersions[path] = (modified, output.flatMap { AgentVersion.numbers($0) == nil ? nil : $0 })
+            }
+        }
     }
 
     private func environment(for id: String, extra: [String: String]) -> [String: String] {
@@ -645,16 +751,17 @@ actor AgentService {
     private func keySpecs(_ id: String) -> [AgentKeySpec] { AgentRecipes.recipe(id)?.keys ?? [] }
 
     /// Every agent the machine's list shows: what was added, what is on PATH, and the agents this
-    /// bridge can run without anything installed that are worth naming up front: Hermes, and any
+    /// bridge can run or fetch itself that are worth naming up front: the featured ones, and any
     /// recipe the registry does not carry, whose install press would otherwise be nowhere.
     private func listedIDs() -> [String] {
         var ids = ledger.added
         for recipe in AgentRecipes.all where !ids.contains(recipe.id) {
+            let nowhereElse = recipe.featured || !registry.contains(where: { $0.id == recipe.id })
             if foundCommand(recipe.id) != nil {
                 ids.append(recipe.id)
-            } else if let runtime = recipe.fallback?.runtime, hasRuntime(runtime),
-                recipe.id == "hermes" || !registry.contains(where: { $0.id == recipe.id })
-            {
+            } else if let runtime = recipe.fallback?.runtime, hasRuntime(runtime), nowhereElse {
+                ids.append(recipe.id)
+            } else if recipe.release?.runsHere == true, nowhereElse {
                 ids.append(recipe.id)
             }
         }
@@ -683,7 +790,7 @@ actor AgentService {
         } else if !added {
             state = "notAdded"
         } else if base == nil {
-            state = "missingRuntime"
+            state = probe?.state == "failed" ? "failed" : "checking"
         } else if let runtime = base?.runtime, !hasRuntime(runtime) {
             state = "missingRuntime"
         } else {
@@ -705,13 +812,16 @@ actor AgentService {
             },
             currentModel: probe?.currentModel, efforts: probe?.efforts ?? [],
             keys: keySpecs(id).map {
-                AgentRow.Key(env: $0.env, name: $0.name, url: $0.url, set: keyValues[$0.env] != nil)
+                AgentRow.Key(
+                    env: $0.env, name: $0.name, url: $0.url, set: keyValues[$0.env] != nil,
+                    alternative: recipe?.signInFirst == true ? true : nil)
             },
             signIn: (probe?.authMethods ?? []).map {
                 AgentRow.Method(id: $0.id, name: $0.name, description: $0.description, kind: $0.kind)
             },
             brain: ledger.brains[id], brainStyle: brainStyle(id)?.rawValue,
-            distribution: (recipe?.fallback ?? registryEntry?.distribution)?.kindWord,
+            distribution: recipe?.release != nil
+                ? "download" : (recipe?.fallback ?? registryEntry?.distribution)?.kindWord,
             checkedAt: probe?.checkedAt)
     }
 
@@ -780,6 +890,56 @@ actor AgentService {
                 continuation.resume(returning: -1)
             }
         }
+    }
+
+    /// What a short command printed, for one that answers and exits: a version, a path. Nil when
+    /// it could not be run, failed, or was still going after ten seconds.
+    static func capture(_ executable: String, _ arguments: [String], environment: [String: String]) async
+        -> String?
+    {
+        let process = Process()
+        let output = Spawning.pipe()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        var merged = ProcessInfo.processInfo.environment
+        for (key, value) in environment { merged[key] = value }
+        process.environment = merged
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        let exit = ExitLatch()
+        process.terminationHandler = { finished in
+            finished.releaseFinished()
+            exit.signal()
+        }
+        do {
+            try process.runAllowingBusyExecutable()
+        } catch {
+            return nil
+        }
+        try? output.fileHandleForWriting.close()
+        let finished = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                await exit.wait()
+                return true
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(10))
+                return false
+            }
+            let first = await group.next() ?? false
+            group.cancelAll()
+            return first
+        }
+        guard finished else {
+            kill(process.processIdentifier, SIGKILL)
+            return nil
+        }
+        guard process.terminationStatus == 0,
+            let data = try? output.fileHandleForReading.read(upToCount: 4_096)
+        else { return nil }
+        let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : text
     }
 
     private static func unpack(archive: String, command: String, sha256: String?, into target: URL) async throws

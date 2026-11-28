@@ -1675,36 +1675,55 @@ actor SessionStore {
         guard openTurns[id] != nil else { return }
         do {
             let connection = try await agentConnection(for: id, agent: agent)
-            guard let facts = agentSessionFacts[id] else { throw AcpFailure.notRunning }
+            guard var facts = agentSessionFacts[id] else { throw AcpFailure.notRunning }
             var choice = agentChoices[id] ?? (nil, nil)
             if let model, model != (choice.model ?? facts.currentModel), !facts.models.isEmpty {
-                try? await connection.setModel(model, facts: facts)
+                if let changed = try? await connection.setModel(model, facts: facts) {
+                    facts = changed
+                    choice.effort = nil
+                }
                 choice.model = model
             }
-            if let effort, effort != (choice.effort ?? facts.currentEffort),
-                facts.efforts.contains(where: { $0.id == effort })
+            if let effort,
+                let level = AcpSessionFacts.nearestEffort(effort, in: facts.efforts.map(\.id)),
+                level != (choice.effort ?? facts.currentEffort)
             {
-                try? await connection.setEffort(effort, facts: facts)
-                choice.effort = effort
+                if let changed = try? await connection.setEffort(level, facts: facts) { facts = changed }
+                choice.effort = level
             }
             agentChoices[id] = choice
+            if agentConnections[id] === connection { agentSessionFacts[id] = facts }
             let text = agentPrompt(id, prompt)
             let stop = try await connection.prompt(text)
             finishAgentTurn(id, connection, stopReason: stop, failure: nil)
         } catch {
             let connection = agentConnections[id]
-            let words = (error as? AcpFailure)?.description ?? String(describing: error)
+            var words = (error as? AcpFailure)?.description ?? String(describing: error)
+            if (error as? AcpFailure)?.isAuthRequired == true {
+                let name = sessions[id]?.agentName ?? agent
+                await agentService?.noteSignedOut(agent, failure: words)
+                words = Self.signedOutWords(name)
+            }
             finishAgentTurn(id, connection, stopReason: "end_turn", failure: words)
         }
+    }
+
+    /// What a turn says when its agent turned out to be signed out, in place of the agent's own
+    /// "Authentication required": where the sign-in is, and that the message was not answered.
+    static func signedOutWords(_ name: String) -> String {
+        "\(name) is signed out on this machine. Sign in to it from the machine's Agents list, then send this again."
     }
 
     /// The conversation's agent process, started and greeted, with its session open: picked back
     /// up when the agent can, otherwise begun again and handed a brief of what came before.
     private func agentConnection(for id: String, agent: String) async throws -> AcpConnection {
-        if let existing = agentConnections[id], await existing.isRunning,
-            await existing.sessionID != nil
-        {
-            return existing
+        if let existing = agentConnections[id] {
+            if await existing.isRunning, await existing.sessionID != nil { return existing }
+            if agentConnections[id] === existing {
+                agentConnections[id] = nil
+                agentSessionFacts[id] = nil
+            }
+            Task { await existing.close() }
         }
         guard let service = agentService else {
             throw AcpFailure.rpc(code: -32603, message: "This bridge runs no agents.", detail: nil)
@@ -1729,22 +1748,45 @@ actor SessionStore {
             onExit: { [weak self] connection in await self?.agentExited(id, connection) })
         agentConnections[id] = connection
         agentChoices[id] = nil
+        do {
+            agentSessionFacts[id] = try await openAgentSession(
+                id, on: connection, directory: directory,
+                signingInWith: await service.unattendedSignIn(agent))
+        } catch {
+            if agentConnections[id] === connection { agentConnections[id] = nil }
+            await connection.close()
+            throw error
+        }
+        return connection
+    }
+
+    /// Starts the agent and opens the conversation's session on it: the one it had, picked back
+    /// up, or a new one when the agent no longer has it, which then owes the agent a brief. An
+    /// agent that asks to be signed in is refusing both, so that answer is passed on as it is
+    /// rather than read as a lost conversation.
+    private func openAgentSession(
+        _ id: String, on connection: AcpConnection, directory: String, signingInWith method: String?
+    ) async throws -> AcpSessionFacts {
         try await connection.start()
         _ = try await connection.initialize()
-        var facts: AcpSessionFacts?
         if let prior = sessions[id]?.agentSessionID {
-            facts = try? await connection.reopen(sessionID: prior, directory: directory)
-            if facts == nil { needsBrief.insert(id) }
-        }
-        if facts == nil {
-            facts = try await connection.newSession(directory: directory)
-            if let opened = facts?.sessionID {
-                sessions[id]?.agentSessionID = opened
-                persist()
+            do {
+                return try await connection.reopen(
+                    sessionID: prior, directory: directory, signingInWith: method)
+            } catch let failure as AcpFailure where failure.isAuthRequired {
+                throw failure
+            } catch {
+                needsBrief.insert(id)
             }
         }
-        agentSessionFacts[id] = facts
-        return connection
+        let note = sessions[id].flatMap {
+            ClientNote.forAgent(enabled: runner.appendsClientNote, mediaByPath: Self.showsMediaByPath($0))
+        }
+        let facts = try await connection.newSession(
+            directory: directory, signingInWith: method, note: note)
+        sessions[id]?.agentSessionID = facts.sessionID
+        persist()
+        return facts
     }
 
     /// Conversations whose agent could not pick its session back up, owed a brief on their next
@@ -1816,7 +1858,9 @@ actor SessionStore {
         guard let started = openTurns[id]?.startedAt else { return }
         if let connection, agentConnections[id] !== connection, failure == nil { return }
         var translator = agentTranslators.removeValue(forKey: id) ?? AcpTranslator()
-        for case .object(let object) in translator.closeOpenCalls() { fold(id, object) }
+        if stopReason != "cancelled" {
+            for case .object(let object) in translator.closeOpenCalls() { fold(id, object) }
+        }
         fold(id, translator.result(stopReason: stopReason, failure: failure))
         if openTurns[id]?.startedAt == started { closeTurn(id, fallback: nil) }
     }
@@ -1850,13 +1894,31 @@ actor SessionStore {
         Task { await connection.close() }
     }
 
+    /// Ends agent processes nobody is waiting on: one that exited, one idle past its keep, and,
+    /// among agents that can pick a conversation back up, the longest idle beyond the number of
+    /// processes the machine keeps warm. An agent that cannot reopen a session keeps its process
+    /// for the whole keep, since ending it costs the agent its memory of the conversation.
     private func reapIdleAgents(now: Date) async {
+        var idle: [(id: String, connection: AcpConnection, lastActivityAt: Date, reopens: Bool)] = []
         for (id, connection) in agentConnections where openTurns[id] == nil {
-            let idle = now.timeIntervalSince(await connection.lastActivityAt)
-            let running = await connection.isRunning
-            guard idle > processTTL || !running else { continue }
-            guard openTurns[id] == nil, agentConnections[id] === connection else { continue }
-            dropAgentConnection(id)
+            guard await connection.isRunning else {
+                if openTurns[id] == nil, agentConnections[id] === connection { dropAgentConnection(id) }
+                continue
+            }
+            let facts = await connection.facts
+            idle.append(
+                (id, connection, await connection.lastActivityAt, facts.resumeSession || facts.loadSession))
+        }
+        idle.sort { $0.lastActivityAt < $1.lastActivityAt }
+        let spare = idle.count { $0.reopens } - processPool
+        var ended = 0
+        for entry in idle {
+            let overKeep = now.timeIntervalSince(entry.lastActivityAt) > processTTL
+            let overPool = entry.reopens && ended < spare
+            guard overKeep || overPool else { continue }
+            guard openTurns[entry.id] == nil, agentConnections[entry.id] === entry.connection else { continue }
+            if entry.reopens { ended += 1 }
+            dropAgentConnection(entry.id)
         }
     }
 
@@ -1992,6 +2054,7 @@ actor SessionStore {
         let now = Date()
         toCard { await $0.noteStopped(sessionID: id, now: now) }
         if let connection = agentConnections[id] {
+            agentTranslators[id]?.stopping = true
             let grace = abortGrace
             Task { [weak self] in
                 await connection.cancel()

@@ -19,6 +19,9 @@ struct AcpAgentFacts: Sendable, Equatable {
     var resumeSession = false
     var images = false
     var authMethods: [AuthMethod] = []
+    /// The name an agent files its own extensions under, when one of them is text added to the
+    /// end of its system prompt as a session begins (`_meta.antigravity.systemPrompt.append`).
+    var systemPromptExtension: String?
 }
 
 /// The choices an agent offers for a session, as `session/new` or `session/resume` reported them.
@@ -38,6 +41,28 @@ struct AcpSessionFacts: Sendable, Equatable {
     var efforts: [Choice] = []
     var currentEffort: String?
     var effortOption: String?
+    /// The thinking levels each model takes, when the agent says so by listing every pairing
+    /// under the older `models` key (`gemini-4-neon-xhigh`) beside a model option that names the
+    /// models alone. Empty for an agent whose levels are the same for every model.
+    var modelEfforts: [String: [String]] = [:]
+
+    /// Thinking levels from least to most, as agents spell them.
+    static let effortOrder = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+    /// The level to set when `wanted` was asked for: itself where the agent offers it, the highest
+    /// it offers when more was asked than it has, the lowest when less was. Nil for a word that is
+    /// no level, and for a level the agent merely lacks between two it has: there the agent keeps
+    /// the level it is at, rather than being moved to one nobody chose.
+    static func nearestEffort(_ wanted: String, in offered: [String]) -> String? {
+        if offered.contains(wanted) { return wanted }
+        guard let rank = effortOrder.firstIndex(of: wanted) else { return nil }
+        let ranked = offered.compactMap { level in effortOrder.firstIndex(of: level).map { ($0, level) } }
+            .sorted { $0.0 < $1.0 }
+        guard let lowest = ranked.first, let highest = ranked.last else { return nil }
+        if rank > highest.0 { return highest.1 }
+        if rank < lowest.0 { return lowest.1 }
+        return nil
+    }
 }
 
 /// A failure an agent reported, or the connection failing under it.
@@ -110,6 +135,7 @@ actor AcpConnection {
 
     static let greetTimeout: Duration = .seconds(240)
     static let sessionTimeout: Duration = .seconds(120)
+    static let signInTimeout: Duration = .seconds(900)
     static let settingTimeout: Duration = .seconds(20)
     static let closeGrace: Duration = .seconds(3)
 
@@ -162,7 +188,9 @@ actor AcpConnection {
     }
 
     /// The handshake. Asks for no file system and no terminal of the client's: the agent works with
-    /// its own tools on the machine it is already on.
+    /// its own tools on the machine it is already on. It does say a sign-in can be run in a
+    /// terminal, which is the only kind a person on another device can finish: an agent offers
+    /// its paste-a-code sign-in to a client that says so and its open-a-browser one otherwise.
     func initialize() async throws -> AcpAgentFacts {
         let data = try await request(
             "initialize",
@@ -171,6 +199,7 @@ actor AcpConnection {
                 "clientCapabilities": [
                     "fs": ["readTextFile": false, "writeTextFile": false],
                     "terminal": false,
+                    "auth": ["terminal": true],
                 ],
                 "clientInfo": [
                     "name": "claude-bridge", "title": "Tailscode",
@@ -181,13 +210,30 @@ actor AcpConnection {
         return facts
     }
 
-    func authenticate(method: String) async throws {
-        _ = try await request("authenticate", ["methodId": method], timeout: Self.sessionTimeout)
+    /// Signs in the way the agent runs itself. One a person finishes in a browser is given the
+    /// minutes that takes; one that only reads a key the agent already holds answers at once.
+    func authenticate(method: String, attended: Bool = false) async throws {
+        _ = try await request(
+            "authenticate", ["methodId": method],
+            timeout: attended ? Self.signInTimeout : Self.sessionTimeout)
     }
 
-    func newSession(directory: String) async throws -> AcpSessionFacts {
-        let data = try await request(
-            "session/new", ["cwd": directory, "mcpServers": [Any]()], timeout: Self.sessionTimeout)
+    /// Opens a session. An agent that asks to be signed in first is signed in with `method` when
+    /// one is given (a sign-in that needs nobody, such as a kept key) and asked again.
+    ///
+    /// `note` is added to the end of the agent's system prompt where the agent takes one. It is
+    /// handed over here and nowhere else: the agent keeps it with the conversation through every
+    /// resume, and one handed over again would be said twice.
+    func newSession(directory: String, signingInWith method: String? = nil, note: String? = nil)
+        async throws -> AcpSessionFacts
+    {
+        var params: [String: Any] = ["cwd": directory, "mcpServers": [Any]()]
+        if let note, !note.isEmpty, let own = facts.systemPromptExtension {
+            params["_meta"] = [own: ["systemPrompt": ["append": note]]]
+        }
+        let data = try await signedIn(with: method) {
+            try await self.request("session/new", params, timeout: Self.sessionTimeout)
+        }
         guard let session = Self.sessionFacts(data, id: nil) else {
             throw AcpFailure.rpc(code: -32603, message: "The agent opened no session.", detail: nil)
         }
@@ -198,20 +244,42 @@ actor AcpConnection {
     /// Picks an existing conversation back up: `session/resume` where the agent has it (nothing is
     /// replayed), `session/load` otherwise (the replay is swallowed — the bridge already holds
     /// the transcript).
-    func reopen(sessionID id: String, directory: String) async throws -> AcpSessionFacts {
+    func reopen(sessionID id: String, directory: String, signingInWith method: String? = nil)
+        async throws -> AcpSessionFacts
+    {
         let params: [String: Any] = ["sessionId": id, "cwd": directory, "mcpServers": [Any]()]
         let data: Data
         if facts.resumeSession {
-            data = try await request("session/resume", params, timeout: Self.sessionTimeout)
+            data = try await signedIn(with: method) {
+                try await self.request("session/resume", params, timeout: Self.sessionTimeout)
+            }
         } else if facts.loadSession {
             replaying = id
             defer { replaying = nil }
-            data = try await request("session/load", params, timeout: Self.sessionTimeout)
+            data = try await signedIn(with: method) {
+                try await self.request("session/load", params, timeout: Self.sessionTimeout)
+            }
         } else {
             throw AcpFailure.rpc(code: -32601, message: "The agent cannot reopen a session.", detail: nil)
         }
         sessionID = id
         return Self.sessionFacts(data, id: id) ?? AcpSessionFacts(sessionID: id)
+    }
+
+    /// Runs a request, and when the agent answers that it must be signed in first, signs in with
+    /// `method` and runs it once more. With no method the agent's answer stands.
+    private func signedIn(with method: String?, _ ask: () async throws -> Data) async throws -> Data {
+        do {
+            return try await ask()
+        } catch let failure as AcpFailure where failure.isAuthRequired {
+            guard let method else { throw failure }
+            do {
+                try await authenticate(method: method)
+            } catch {
+                throw failure
+            }
+            return try await ask()
+        }
     }
 
     /// One turn. Answers the stop reason once the agent has finished speaking; every update of the
@@ -231,27 +299,52 @@ actor AcpConnection {
         try? write(["jsonrpc": "2.0", "method": "session/cancel", "params": ["sessionId": sessionID]])
     }
 
-    /// Chooses the model for the session, through whichever door the agent offered.
-    func setModel(_ model: String, facts session: AcpSessionFacts) async throws {
+    /// Chooses the model for the session, through whichever door the agent offered, and answers
+    /// the session's choices as they stand afterwards: an agent whose thinking levels differ by
+    /// model lists the new model's in its reply.
+    @discardableResult
+    func setModel(_ model: String, facts session: AcpSessionFacts) async throws -> AcpSessionFacts {
         guard let sessionID else { throw AcpFailure.notRunning }
-        if let option = session.modelOption {
-            _ = try await request(
-                "session/set_config_option",
-                ["sessionId": sessionID, "configId": option, "value": model],
-                timeout: Self.settingTimeout)
-        } else {
+        guard let option = session.modelOption else {
             _ = try await request(
                 "session/set_model", ["sessionId": sessionID, "modelId": model],
                 timeout: Self.settingTimeout)
+            var updated = session
+            updated.currentModel = model
+            return updated
         }
+        let data = try await request(
+            "session/set_config_option",
+            ["sessionId": sessionID, "configId": option, "value": model],
+            timeout: Self.settingTimeout)
+        return Self.updated(session, by: data)
     }
 
-    func setEffort(_ effort: String, facts session: AcpSessionFacts) async throws {
-        guard let sessionID, let option = session.effortOption else { return }
-        _ = try await request(
+    @discardableResult
+    func setEffort(_ effort: String, facts session: AcpSessionFacts) async throws -> AcpSessionFacts {
+        guard let sessionID, let option = session.effortOption else { return session }
+        let data = try await request(
             "session/set_config_option",
             ["sessionId": sessionID, "configId": option, "value": effort],
             timeout: Self.settingTimeout)
+        return Self.updated(session, by: data)
+    }
+
+    /// A session's choices after a setting changed, read from the reply's config options. A reply
+    /// that lists none leaves them as they were.
+    static func updated(_ session: AcpSessionFacts, by data: Data) -> AcpSessionFacts {
+        guard let fresh = sessionFacts(data, id: session.sessionID), fresh.modelOption != nil || fresh.effortOption != nil
+        else { return session }
+        var updated = session
+        if fresh.modelOption != nil {
+            updated.modelOption = fresh.modelOption
+            updated.models = fresh.models
+            updated.currentModel = fresh.currentModel
+        }
+        updated.effortOption = fresh.effortOption
+        updated.efforts = fresh.efforts
+        updated.currentEffort = fresh.currentEffort
+        return updated
     }
 
     /// The last lines the agent wrote to stderr, for a failure nothing else explains.
@@ -432,6 +525,11 @@ actor AcpConnection {
         facts.resumeSession = session["resume"] != nil
         let prompt = capabilities["promptCapabilities"] as? [String: Any] ?? [:]
         facts.images = prompt["image"] as? Bool ?? false
+        let extensions = capabilities["_meta"] as? [String: Any] ?? [:]
+        facts.systemPromptExtension = extensions.keys.sorted().first { name in
+            let own = extensions[name] as? [String: Any]
+            return (own?["systemPrompt"] as? [String: Any])?["append"] as? Bool == true
+        }
         let methods = object["authMethods"] as? [[String: Any]] ?? []
         facts.authMethods = methods.compactMap { method in
             guard let id = method["id"] as? String else { return nil }
@@ -474,8 +572,31 @@ actor AcpConnection {
                     description: model["description"] as? String)
             }
             facts.currentModel = models["currentModelId"] as? String
+        } else if let models = object["models"] as? [String: Any] {
+            let pairings = (models["availableModels"] as? [[String: Any]] ?? []).compactMap {
+                $0["modelId"] as? String
+            }
+            facts.modelEfforts = Self.modelEfforts(models: facts.models.map(\.id), pairings: pairings)
         }
         return facts
+    }
+
+    /// Which thinking levels each model takes, read from ids that pair a model with a level
+    /// (`gemini-4-neon-xhigh` is `gemini-4-neon` at `xhigh`). Only a level's own word counts as
+    /// one, so a longer model name that merely begins with a shorter one is never taken for it,
+    /// and nothing is answered unless every model was paired with at least one level.
+    static func modelEfforts(models: [String], pairings: [String]) -> [String: [String]] {
+        var levels: [String: [String]] = [:]
+        for model in models {
+            let found = pairings.compactMap { pairing -> String? in
+                guard pairing.hasPrefix(model + "-") else { return nil }
+                let level = String(pairing.dropFirst(model.count + 1))
+                return AcpSessionFacts.effortOrder.contains(level) ? level : nil
+            }
+            guard !found.isEmpty else { return [:] }
+            levels[model] = AcpSessionFacts.effortOrder.filter(found.contains)
+        }
+        return levels
     }
 
     private static func choices(_ option: [String: Any]) -> [AcpSessionFacts.Choice] {

@@ -4,6 +4,13 @@ Each release in a line or two per change, written for the person deciding whethe
 app reads this file from the project's head, so what it shows as new is exactly what is listed
 here above the version a machine is running.
 
+## 1.41.0 — 2026-11-28
+
+- Google Antigravity, from any Tailscode: the machine's Agents list now offers it by name. It uses the `agy` already on the machine when there is one (1.5.0 or newer, the first that speaks ACP; an older copy is passed over), and otherwise adding it downloads Google's CLI from its own releases, checked against the digest published beside it. You sign in from your phone: the machine runs Antigravity's own paste-a-code sign-in, hands you the link and takes the code back. A Gemini API key works as the other way in.
+- An Antigravity chat reads like any other: its commands, edits and web searches are drawn as what they are with a command's own output, its checklist of steps is the task board, a question it asks you is a card you answer with a tap (and the chat reads as waiting on you until you do), each model offers the thinking levels it really takes, and a file it names by its path shows in the chat. When its model refuses a request, out of quota or with a key that no longer works, the turn fails with the service's own message instead of ending as an answer. If it turns out to be signed out mid-conversation, the turn says so, the agent reads as needing sign-in, and the conversation picks up where it was once you have signed in.
+- Signing in to any agent from another device works where it did not: the machine now tells agents it can run a terminal sign-in (so they offer the kind a phone can finish) and runs it as the agent's own command, which is also what Hermes's setup needed. A sign-in's long link is shown as its site, with the button still opening the whole link.
+- An agent download carries on when the device that asked gives up waiting, and asking again waits for the same download. An agent process whose conversation could not be opened is no longer left running, and agents that can pick a conversation back up are kept warm four at a time rather than all for half an hour.
+
 ## 1.40.1 — 2026-11-27
 
 - A chat whose turn ended while a background agent it launched kept working no longer reads as running until that agent finishes: the agent's own lines no longer open a turn in the parent, so a message you send goes straight to Claude instead of waiting behind the agent.

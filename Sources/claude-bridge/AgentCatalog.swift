@@ -44,15 +44,86 @@ struct AgentRecipe: Sendable {
     /// What the found command is run with, for an agent the registry does not describe.
     var args: [String]
     var fallback: AgentDistribution?
+    /// Where a copy comes from when the machine has none and neither npx nor uvx carries one.
+    var release: AgentRelease?
     var keys: [AgentKeySpec] = []
     var brain: AgentBrainStyle?
     var website: String?
+    /// The first version that speaks ACP. A copy on PATH older than this is not this agent yet.
+    var minimumVersion: String?
+    /// Whether the agent's own sign-in is the way in and a key only another way, so an agent that
+    /// asks to be signed in reads as needing a sign-in rather than a key.
+    var signInFirst = false
+    /// Whether the machine's list names this agent before anybody added it.
+    var featured = false
 }
 
 struct AgentKeySpec: Sendable, Codable, Equatable {
     var env: String
     var name: String
     var url: String?
+    /// The agent's own sign-in method this key answers, which the bridge chooses for it whenever
+    /// the agent asks to be signed in and the key is kept.
+    var method: String?
+}
+
+/// The newest release of a GitHub repository, as the place an agent is downloaded from: the
+/// archive named for this machine, checked against the digest GitHub publishes beside it.
+struct AgentRelease: Sendable, Equatable {
+    var repository: String
+    /// The archive's name for each platform the registry would name (`linux-x86_64`, …).
+    var assets: [String: String]
+    /// The executable inside the archive.
+    var command: String
+    var args: [String]
+
+    var address: String { "https://api.github.com/repos/\(repository)/releases/latest" }
+
+    var runsHere: Bool { assets[AgentPlatform.current.key] != nil }
+
+    /// GitHub's answer for the newest release, read into the version and the download for this
+    /// machine. An archive with no published digest is not offered: nothing would prove it arrived
+    /// whole.
+    func resolve(_ data: Data, platform: String = AgentPlatform.current.key)
+        -> (version: String, distribution: AgentDistribution)?
+    {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            let version = object["tag_name"] as? String, !version.isEmpty,
+            let wanted = assets[platform],
+            let asset = (object["assets"] as? [[String: Any]])?.first(where: { $0["name"] as? String == wanted }),
+            let archive = asset["browser_download_url"] as? String,
+            let digest = asset["digest"] as? String, digest.hasPrefix("sha256:")
+        else { return nil }
+        return (
+            version.hasPrefix("v") ? String(version.dropFirst()) : version,
+            .binary(
+                archive: archive, command: command, args: args,
+                sha256: String(digest.dropFirst("sha256:".count)))
+        )
+    }
+}
+
+/// A version as dotted numbers, compared number by number: `1.5.18` is newer than `1.5.2`.
+enum AgentVersion {
+    static func numbers(_ text: String) -> [Int]? {
+        let token = text.split(whereSeparator: { $0.isWhitespace }).first { word in
+            word.first?.isNumber == true || (word.first == "v" && word.dropFirst().first?.isNumber == true)
+        }
+        guard let token else { return nil }
+        let parts = token.drop { $0 == "v" }.prefix { $0.isNumber || $0 == "." }
+            .split(separator: ".").compactMap { Int($0) }
+        return parts.isEmpty ? nil : parts
+    }
+
+    static func isOlder(_ version: String, than minimum: String) -> Bool {
+        guard let have = numbers(version), let need = numbers(minimum) else { return false }
+        for index in 0..<max(have.count, need.count) {
+            let left = index < have.count ? have[index] : 0
+            let right = index < need.count ? need[index] : 0
+            if left != right { return left < right }
+        }
+        return false
+    }
 }
 
 /// One row of the ACP registry, as much of it as this bridge reads.
@@ -191,7 +262,7 @@ enum AgentRecipes {
             description: "Nous Research's agent that remembers, learns skills and runs on any model.",
             commands: ["hermes"], args: ["acp"],
             fallback: .uvx(package: "hermes-agent[acp]", command: "hermes", args: ["acp"], env: [:]),
-            brain: .hermes, website: "https://hermes-agent.nousresearch.com"),
+            brain: .hermes, website: "https://hermes-agent.nousresearch.com", featured: true),
         AgentRecipe(
             id: "gemini", name: "Gemini CLI", commands: ["gemini"], args: ["--acp"],
             fallback: .npx(package: "@google/gemini-cli", args: ["--acp"], env: [:]),
@@ -219,6 +290,26 @@ enum AgentRecipes {
                     url: "https://platform.deepseek.com/api_keys")
             ],
             website: "https://github.com/deepseek-ai/deepseek-harness"),
+        AgentRecipe(
+            id: "antigravity-acp", name: "Antigravity",
+            description: "Google's coding agent on Gemini, with your Google AI plan or a Gemini API key.",
+            commands: ["agy", "antigravity"], args: ["acp"],
+            release: AgentRelease(
+                repository: "google-antigravity/antigravity-cli",
+                assets: [
+                    "linux-x86_64": "agy_cli_linux_x64.tar.gz",
+                    "linux-aarch64": "agy_cli_linux_arm64.tar.gz",
+                    "darwin-aarch64": "agy_cli_mac_arm64.tar.gz",
+                    "darwin-x86_64": "agy_cli_mac_x64.tar.gz",
+                ],
+                command: "./antigravity", args: ["acp"]),
+            keys: [
+                AgentKeySpec(
+                    env: "GEMINI_API_KEY", name: "Gemini API key",
+                    url: "https://aistudio.google.com/apikey", method: "gemini-api-key")
+            ],
+            website: "https://antigravity.google", minimumVersion: "1.5.0", signInFirst: true,
+            featured: true),
         AgentRecipe(id: "goose", name: "goose", commands: ["goose"], args: ["acp"]),
         AgentRecipe(id: "kimi", name: "Kimi CLI", commands: ["kimi"], args: ["acp"]),
         AgentRecipe(
@@ -252,6 +343,9 @@ struct AgentLedger: Codable, Sendable, Equatable {
         var efforts: [AcpSessionFacts.Choice]
         var failure: String?
         var authMethods: [AcpAgentFacts.AuthMethod]
+        /// The thinking levels each model takes, for an agent whose models do not all take the
+        /// same ones. Absent for an agent that offers one list for every model.
+        var modelEfforts: [String: [String]]?
     }
 
     struct Installed: Codable, Sendable, Equatable {

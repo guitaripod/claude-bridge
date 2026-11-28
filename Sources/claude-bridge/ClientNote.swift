@@ -34,6 +34,25 @@ enum ClientNote {
         sentence or two of your reply, so lead with the outcome.
         """
 
+    /// For an agent other than Claude Code, read in an app that shows no file by its path: the
+    /// facts about the screen alone, since the advice about pictures names a tool only Claude
+    /// Code has.
+    static let agentText = """
+        This session is driven from Tailscode, an app on the user's phone, tablet or computer. \
+        They may not be at this machine, so do not count on them seeing its terminal, windows or \
+        browser. Your replies render as Markdown in a chat view: fenced code gets a copy button, \
+        links are tappable and wide tables scroll sideways. Markdown images, raw HTML, Mermaid \
+        and LaTeX do not render, and file paths are not tappable. Notifications and the chat list \
+        show only the first sentence or two of your reply, so lead with the outcome.
+        """
+
+    /// What an agent that takes text at the end of its system prompt is handed as a conversation
+    /// begins: the same facts Claude Code is given, in the form the app that began it can show.
+    static func forAgent(enabled: Bool, mediaByPath: Bool) -> String? {
+        guard enabled else { return nil }
+        return mediaByPath ? mediaText : agentText
+    }
+
     /// The one `--append-system-prompt` a launch carries: the note, then an expert's brief when the
     /// conversation is a task of one. The CLI keeps one appended prompt, so both ride in it.
     static func arguments(enabled: Bool, appendix: String? = nil, mediaByPath: Bool = false) -> [String] {

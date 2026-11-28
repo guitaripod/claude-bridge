@@ -638,7 +638,7 @@ struct Assembler {
                 parts.append(.reasoning(value))
             case .tool(let id):
                 if var call = tools[id] {
-                    if call.status == .running { call.status = .stopped }
+                    if call.status == .running, !Self.awaitsAnswer(call) { call.status = .stopped }
                     parts.append(.tool(call))
                 }
             case .file(let file):
@@ -648,6 +648,14 @@ struct Assembler {
             }
         }
         return parts
+    }
+
+    /// A question put to the person is still being asked when the turn closes: its answer is their
+    /// next message, so the call stays open, which is how every client knows to draw the card and
+    /// how the store knows the turn ended waiting on somebody. Any other call still running when
+    /// its turn closed was cut off.
+    private static func awaitsAnswer(_ call: ToolCall) -> Bool {
+        call.name.caseInsensitiveCompare(AcpTranslator.questionTool) == .orderedSame
     }
 
     private static func hasContent(_ segments: ArraySlice<Segment>) -> Bool {

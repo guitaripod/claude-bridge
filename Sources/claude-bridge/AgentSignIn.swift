@@ -129,10 +129,23 @@ final class AgentSignIn: @unchecked Sendable {
         let end = ended
         lock.unlock()
         let lines = Self.lines(text)
+        let links = Self.links(in: lines)
         return AgentSignInState(
             agent: agent, method: method, state: end?.state ?? "running",
-            lines: Array(lines.suffix(40)), links: Self.links(in: lines), codes: Self.codes(in: lines),
-            exitCode: end?.code, startedAt: startedAt)
+            lines: Array(Self.abridged(lines, links: links).suffix(40)), links: links,
+            codes: Self.codes(in: lines), exitCode: end?.code, startedAt: startedAt)
+    }
+
+    /// The lines as a small screen should read them: a line that is nothing but one long link is
+    /// said as the site it leads to, since the link itself travels whole beside the lines and a
+    /// sign-in address runs to a dozen lines of parameters nobody reads.
+    static func abridged(_ lines: [String], links: [String]) -> [String] {
+        lines.map { line in
+            guard line.count > 96, links.contains(line), let url = URL(string: line), let host = url.host,
+                let scheme = url.scheme
+            else { return line }
+            return "\(scheme)://\(host)/…"
+        }
     }
 
     /// The lines of what was printed, as a person reads them: escape sequences gone, carriage
